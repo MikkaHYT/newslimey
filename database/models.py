@@ -1,5 +1,7 @@
 from sqlalchemy import (
     Column,
+    TypeDecorator,
+    CHAR,
     BigInteger,
     Integer,
     Index,
@@ -17,9 +19,9 @@ from sqlalchemy import (
     DateTime,
     Date,
 )
-from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import declarative_base
 from decimal import Decimal
+from datetime import timezone
 import uuid
 import hashlib
 import json
@@ -30,11 +32,91 @@ import enum
 Base = declarative_base()
 
 
+class UTCDateTime(TypeDecorator):
+    """Timezone-aware ``DateTime`` that behaves the same on SQLite and Postgres.
+
+    SQLAlchemy's SQLite ``DateTime`` parses stored values into *naive*
+    datetimes, whereas PostgreSQL's ``TIMESTAMPTZ`` returns timezone-aware ones.
+    The codebase was written against the Postgres behaviour (using
+    ``discord.utils.utcnow()``), so SQLite's naive values caused
+    ``can't compare offset-naive and offset-aware datetimes`` errors. This type
+    normalises inputs to UTC and always returns aware UTC datetimes.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return value
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+class GUID(TypeDecorator):
+    """Platform-independent UUID column type.
+
+    ``sqlalchemy.Uuid``'s SQLite bind processor calls ``value.hex``, which
+    raises ``AttributeError`` when a plain ``str`` UUID is bound (e.g. the
+    ``f"{wallet.wallet_id}"`` returned by managers or ``str(uuid.uuid4())``
+    transaction ids). This type normalises ``str``/``uuid.UUID`` inputs to a
+    real ``uuid.UUID`` before binding and always returns a ``uuid.UUID``.
+    """
+
+    impl = CHAR
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+
+            return dialect.type_descriptor(PG_UUID(as_uuid=True))
+        return dialect.type_descriptor(CHAR(32))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return value
+        if not isinstance(value, uuid.UUID):
+            value = uuid.UUID(str(value))
+        if dialect.name == "postgresql":
+            return value
+        return value.hex
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return value
+        if not isinstance(value, uuid.UUID):
+            return uuid.UUID(str(value))
+        return value
+
+
 class UserIdentity(Base):
     __tablename__ = "user_identities"
 
     user_hash = Column(String(64), primary_key=True)
     user_id = Column(BigInteger, nullable=False, unique=True)
+
+
+class EconomyIdentity(Base):
+    """Scope-qualified economy user keys -> raw Discord ID.
+
+    ``UserIdentity`` holds one row per user, but a server with its own economy
+    gives the same user a different key in each scope, so those extra keys get
+    their own table. ``user_id`` is deliberately *not* unique here.
+    """
+
+    __tablename__ = "economy_identities"
+
+    user_hash = Column(String(64), primary_key=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
 
 class PunishmentType(enum.Enum):
     BAN = "ban"
@@ -61,8 +143,8 @@ class BotConfig(Base):
     id = Column(Integer, primary_key=True)
     bot_id = Column(BigInteger, nullable=False)
     setup_complete = Column(Boolean, default=False)
-    loaded_cogs = Column(ARRAY(String), nullable=True)
-    unloaded_cogs = Column(ARRAY(String), nullable=True)
+    loaded_cogs = Column(JSON, nullable=True)
+    unloaded_cogs = Column(JSON, nullable=True)
 
 
 class ServerSettings(Base):
@@ -79,7 +161,7 @@ class ServerSettings(Base):
     watchdog_message_tracking = Column(Boolean, default=False)
     watchdog_voice_tracking = Column(Boolean, default=False)
     snipe_enabled = Column(Boolean, default=False)
-    auto_role_ids = Column(ARRAY(BigInteger), nullable=True)
+    auto_role_ids = Column(JSON, nullable=True)
     nuke_msg = Column(String, nullable=True)
     jail_role_id = Column(BigInteger, nullable=True)
     mute_role_id = Column(BigInteger, nullable=True)
@@ -104,7 +186,7 @@ class Punishment(Base):
     type = Column(Enum(PunishmentType), nullable=False)
     reason = Column(String, nullable=False)
     duration = Column(Integer, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (CheckConstraint("case_id >= 0", name="case_id_non_negative"),)
 
@@ -116,7 +198,7 @@ class CaseNote(Base):
     case_id = Column(Integer, ForeignKey("punishments.id"), nullable=False)
     moderator_id = Column(String(64), nullable=False)
     note = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     punishment = relationship("Punishment", back_populates="notes")
 
@@ -133,7 +215,7 @@ class WatchdogLog(Base):
     moderator_id = Column(String(64), nullable=False)
     guild_id = Column(BigInteger, nullable=False)
     punishment_type = Column(Enum(PunishmentType), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
 
 class JailedUser(Base):
@@ -143,8 +225,8 @@ class JailedUser(Base):
     guild_id = Column(BigInteger, nullable=False)
     user_id = Column(String(64), nullable=False)
     jailed_until = Column(TIMESTAMP(timezone=True), nullable=True)
-    roles = Column(ARRAY(BigInteger), nullable=True)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    roles = Column(JSON, nullable=True)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     def __repr__(self):
         return (
@@ -179,7 +261,7 @@ class CommandCooldown(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(64), nullable=False)
     command_name = Column(String, nullable=False)
-    cooldown_expiry = Column(DateTime(timezone=True), nullable=False)
+    cooldown_expiry = Column(UTCDateTime(), nullable=False)
 
     __table_args__ = (
         UniqueConstraint("user_id", "command_name", name="uq_command_cooldowns_user_command"),
@@ -199,7 +281,7 @@ class CommandUsageDaily(Base):
     user_hash = Column(String(64), nullable=True, index=True)
     is_slash = Column(Boolean, default=False, nullable=False)
     count = Column(Integer, default=0, nullable=False)
-    last_used_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    last_used_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -224,7 +306,7 @@ class CommandLatencyDaily(Base):
     is_slash = Column(Boolean, default=False, nullable=False)
     latency_ms_sum = Column(BigInteger, default=0, nullable=False)
     latency_count = Column(Integer, default=0, nullable=False)
-    last_used_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    last_used_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -249,7 +331,7 @@ class CommandErrorDaily(Base):
     is_slash = Column(Boolean, default=False, nullable=False)
     error_type = Column(String, nullable=False)
     count = Column(Integer, default=0, nullable=False)
-    last_seen_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    last_seen_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -271,7 +353,7 @@ class DailyUserExposure(Base):
     bucket_date = Column(Date, nullable=False, index=True)
     guild_id = Column(BigInteger, nullable=True, index=True)
     user_hash = Column(String(64), nullable=False, index=True)
-    first_seen_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    first_seen_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -311,7 +393,7 @@ class BoosterRole(Base):
 class Wallet(Base):
     __tablename__ = "wallets"
 
-    wallet_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    wallet_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     user_id = Column(String(64), nullable=False, unique=True)
     balance = Column(Numeric(precision=38, scale=2), default=Decimal("0.00"))
     bank_balance = Column(Numeric(precision=38, scale=2), default=Decimal("0.00"))
@@ -320,7 +402,7 @@ class Wallet(Base):
     nonce = Column(Integer, default=0)
     server_seed = Column(String(64), nullable=True)  # widened
     previous_server_seed = Column(String(64), nullable=True)  # widened
-    seed_rotated_at = Column(DateTime(timezone=True), server_default=func.now())
+    seed_rotated_at = Column(UTCDateTime(), server_default=func.now())
 
     __table_args__ = (
         CheckConstraint("balance >= 0", name="ck_wallet_balance_non_negative"),
@@ -331,14 +413,14 @@ class Wallet(Base):
 class Transaction(Base):
     __tablename__ = "transactions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     from_user_id = Column(String(64), nullable=True)
     to_user_id = Column(String(64), nullable=True)
     amount = Column(
         Numeric(precision=38, scale=2), nullable=False, default=Decimal("0.00")
     )
     description = Column(String, nullable=True)
-    timestamp = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    timestamp = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     def __repr__(self):
         return (
@@ -481,7 +563,7 @@ class ItemCooldown(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(64), nullable=False, index=True)
     item_name = Column(String, nullable=False)
-    cooldown_expiry = Column(DateTime(timezone=True), nullable=False)
+    cooldown_expiry = Column(UTCDateTime(), nullable=False)
 
     __table_args__ = (
         UniqueConstraint("user_id", "item_name", name="uq_item_cooldown_user_item"),
@@ -501,8 +583,8 @@ class ActiveEffect(Base):
     effect_type = Column(String, nullable=False)
     effect_value = Column(Numeric(10, 4), nullable=False)
     source_item_name = Column(String, nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    expires_at = Column(UTCDateTime(), nullable=False)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (Index("ix_active_effects_user_expires", "user_id", "expires_at"),)
 
@@ -524,8 +606,8 @@ class TradeLog(Base):
     status = Column(
         String, nullable=False, default="pending"
     )  # pending, completed, cancelled
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
-    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
+    completed_at = Column(UTCDateTime(), nullable=True)
 
     def __repr__(self):
         return f"<TradeLog(id={self.id}, from={self.from_user_id}, to={self.to_user_id}, item={self.item_name}, status={self.status})>"
@@ -560,7 +642,7 @@ class Bounty(Base):
         Numeric(precision=38, scale=8), nullable=False, default=Decimal("0.00")
     )
     active = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     def __repr__(self):
         return (
@@ -586,8 +668,8 @@ class Loan(Base):
     amount_paid = Column(
         Numeric(precision=38, scale=2), nullable=False, default=Decimal("0.00")
     )
-    defaulted_date = Column(DateTime(timezone=True), nullable=True)
-    due_date = Column(DateTime(timezone=True), nullable=False)
+    defaulted_date = Column(UTCDateTime(), nullable=True)
+    due_date = Column(UTCDateTime(), nullable=False)
     status = Column(String, nullable=False, default="active")
 
     payments = relationship(
@@ -613,7 +695,7 @@ class LoanPayment(Base):
         Numeric(precision=38, scale=2), nullable=False, default=Decimal("0.00")
     )
     payment_date = Column(
-        DateTime(timezone=True), default=discord.utils.utcnow, nullable=False
+        UTCDateTime(), default=discord.utils.utcnow, nullable=False
     )
     payment_method = Column(String, nullable=True)
     notes = Column(String, nullable=True)
@@ -635,9 +717,9 @@ class Job(Base):
     )
     days_employed = Column(Integer, default=1, nullable=False)
     streak = Column(Integer, default=0, nullable=False)
-    last_worked = Column(DateTime(timezone=True), nullable=True)
+    last_worked = Column(UTCDateTime(), nullable=True)
     hired_at = Column(
-        DateTime(timezone=True), default=discord.utils.utcnow, nullable=False
+        UTCDateTime(), default=discord.utils.utcnow, nullable=False
     )
 
     def __repr__(self):
@@ -649,9 +731,9 @@ class UserRoleHistory(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(64), nullable=False)
-    roles = Column(ARRAY(BigInteger), nullable=False)
+    roles = Column(JSON, nullable=False)
     timestamp = Column(
-        DateTime(timezone=True), default=discord.utils.utcnow, nullable=False
+        UTCDateTime(), default=discord.utils.utcnow, nullable=False
     )
 
     def __repr__(self):
@@ -739,7 +821,7 @@ class Blacklist(Base):
     admin_id = Column(String(64), nullable=False)
     reason = Column(String, nullable=False, default="No reason provided")
     added_at = Column(
-        DateTime(timezone=True), default=discord.utils.utcnow, nullable=False
+        UTCDateTime(), default=discord.utils.utcnow, nullable=False
     )
 
 
@@ -773,7 +855,7 @@ class Block(Base):
     block_hash = Column(String(64), nullable=False, unique=True)
     previous_hash = Column(String(64), nullable=False)
     transactions = Column(JSON, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(UTCDateTime(), server_default=func.now())
 
     validator_id = Column(String(64), nullable=True)
     validator_signature = Column(String, nullable=True)
@@ -804,6 +886,35 @@ class Supply(Base):
     __table_args__ = (
         CheckConstraint("treasury >= 0", name="ck_supply_treasury_non_negative"),
     )
+
+
+class CharityFund(Base):
+    """Donated currency held in trust, plus the rules for claiming from it.
+
+    One row per economy scope, mirroring :class:`Supply`: the shared economy
+    keeps id 1 while a server with its own economy gets a row of its own, so a
+    server's charity pot can't be drained from another server. Money in the pot
+    sits outside the treasury until it is claimed back into a wallet.
+    """
+
+    __tablename__ = "charity_funds"
+
+    id = Column(Integer, primary_key=True)
+    balance = Column(Numeric(precision=38, scale=2), default=Decimal("0.00"))
+    # Master switch: when off, nobody can claim from the fund.
+    enabled = Column(Boolean, default=True, server_default="true")
+    # Net worth (wallet + bank) at or above which a member may no longer claim.
+    claim_threshold = Column(
+        Numeric(precision=38, scale=2), default=Decimal("10000.00")
+    )
+    # Claim bounds: the poorest may take up to ``max_claim``, and the amount
+    # falls in a straight line to ``min_claim`` as net worth nears the threshold.
+    min_claim = Column(Numeric(precision=38, scale=2), default=Decimal("100.00"))
+    max_claim = Column(Numeric(precision=38, scale=2), default=Decimal("1000.00"))
+    # How long a member must wait between claims, in seconds.
+    cooldown_seconds = Column(Integer, default=3600)
+    total_donated = Column(Numeric(precision=38, scale=2), default=Decimal("0.00"))
+    total_claimed = Column(Numeric(precision=38, scale=2), default=Decimal("0.00"))
 
 
 class EconomicMetricsHistory(Base):
@@ -922,7 +1033,7 @@ class GameHistory(Base):
         String(16), nullable=False, default="fairgate", server_default="fairgate"
     )  # 'fairgate' is the only supported provider
     created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        UTCDateTime(), server_default=func.now(), nullable=False
     )
 
     __table_args__ = (
@@ -934,21 +1045,21 @@ class GameHistory(Base):
 class GameSession(Base):
     __tablename__ = "game_sessions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     game_name = Column(String, nullable=False, index=True)
     status = Column(String, nullable=False, default="active")
     guild_id = Column(BigInteger, nullable=True)
     channel_id = Column(BigInteger, nullable=True)
     message_id = Column(BigInteger, nullable=True)
     owner_id = Column(String(64), nullable=True)
-    participants = Column(ARRAY(String(64)), nullable=True)
+    participants = Column(JSON, nullable=True)
     wager_total = Column(Numeric(precision=38, scale=2), nullable=True)
     state = Column(JSON, nullable=True)
     rng = Column(JSON, nullable=True)
     errors = Column(JSON, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(UTCDateTime(), server_default=func.now())
     updated_at = Column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        UTCDateTime(), server_default=func.now(), onupdate=func.now()
     )
 
 
@@ -957,11 +1068,11 @@ class GameSessionEvent(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(
-        UUID(as_uuid=True), ForeignKey("game_sessions.id", ondelete="CASCADE")
+        GUID(), ForeignKey("game_sessions.id", ondelete="CASCADE")
     )
     event_type = Column(String, nullable=False)
     payload = Column(JSON, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(UTCDateTime(), server_default=func.now())
 
 
 class Task(Base):
@@ -988,7 +1099,7 @@ class TempVoiceChannel(Base):
     channel_id = Column(BigInteger, primary_key=True)
     guild_id = Column(BigInteger, nullable=False)
     owner_id = Column(String(64), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
 
 class UserNameHistory(Base):
@@ -1000,7 +1111,7 @@ class UserNameHistory(Base):
     new_name = Column(String, nullable=False)
     change_type = Column(String, nullable=False)
     timestamp = Column(
-        DateTime(timezone=True), default=discord.utils.utcnow, nullable=False
+        UTCDateTime(), default=discord.utils.utcnow, nullable=False
     )
 
     __table_args__ = (
@@ -1019,7 +1130,7 @@ class CryptoAsset(Base):
     symbol = Column(String, nullable=False)
     amount = Column(Numeric(precision=38, scale=8), default=Decimal("0.00000000"))
     purchase_price = Column(Numeric(precision=38, scale=8), default=Decimal("0.00"))
-    purchase_date = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    purchase_date = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     def __repr__(self):
         return f"<CryptoAsset(user_id={self.user_id}, symbol='{self.symbol}', amount={self.amount})>"
@@ -1033,7 +1144,7 @@ class CryptoPrice(Base):
     price = Column(
         Numeric(precision=38, scale=8), nullable=False, default=Decimal("0.00")
     )
-    timestamp = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    timestamp = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     def __repr__(self):
         return f"<CryptoPrice(symbol='{self.symbol}', price={self.price}, timestamp={self.timestamp})>"
@@ -1075,6 +1186,24 @@ class UserAlt(Base):
 
 
 
+class StickyMessage(Base):
+    """A message the bot keeps at the bottom of a channel.
+
+    Every time someone posts in the channel the previous sticky is deleted and
+    a fresh copy is sent, so it always sits last. ``message_id`` is the current
+    copy (NULL while one is not in the channel), so a restart can pick up where
+    it left off.
+    """
+
+    __tablename__ = "sticky_messages"
+
+    channel_id = Column(BigInteger, primary_key=True)
+    guild_id = Column(BigInteger, nullable=False, index=True)
+    message_id = Column(BigInteger, nullable=True)
+    content = Column(Text, nullable=False)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
+
+
 class OwnerAuditLog(Base):
     """Tamper-resistant log of successfully executed owner-only commands."""
 
@@ -1086,7 +1215,7 @@ class OwnerAuditLog(Base):
     guild_id = Column(BigInteger, nullable=True)
     channel_id = Column(BigInteger, nullable=True)
     args = Column(JSON, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (
         Index("ix_owner_audit_user_created", "user_id", "created_at"),
@@ -1101,7 +1230,7 @@ class CommandRoleRestriction(Base):
     guild_id = Column(BigInteger, nullable=False)
     command_name = Column(String, nullable=False)
     role_id = Column(BigInteger, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -1163,7 +1292,7 @@ class RakebackBalance(Base):
 
     user_id = Column(String(64), primary_key=True)
     accumulated = Column(Numeric(38, 2), default=Decimal("0.00"))
-    last_claim = Column(DateTime(timezone=True), nullable=True)
+    last_claim = Column(UTCDateTime(), nullable=True)
     total_claimed = Column(Numeric(38, 2), default=Decimal("0.00"))
 
     def __repr__(self):
@@ -1184,7 +1313,7 @@ class RakebackTransaction(Base):
     rakeback_rate = Column(Numeric(5, 4), nullable=False)
     rakeback_amount = Column(Numeric(38, 2), nullable=False)
     vip_tier_id = Column(Integer, ForeignKey("vip_tiers.id"), nullable=True)
-    created_at = Column(DateTime(timezone=True), default=discord.utils.utcnow)
+    created_at = Column(UTCDateTime(), default=discord.utils.utcnow)
 
     __table_args__ = (Index("ix_rakeback_user_created", "user_id", "created_at"),)
 

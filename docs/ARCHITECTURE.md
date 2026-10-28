@@ -38,6 +38,7 @@ This document explains the internal architecture of TPNEBOT.
 - Custom `LoggingFormatter` adds colored level and logger name fields to console output.
 - Rotating file handler writes to `discord.log` with size based rotation.
 - Structured logs include user, channel, guild context after successful command execution.
+- Developer channel command log: every invocation (prefix and slash, successful or not, including pre-check blocks) is buffered in memory and posted to `DEVELOPER_CHANNEL_ID` as a digest of at most 10 entries — command, user, timestamp, channel and server. Batches flush every 5 seconds or as soon as they fill, which keeps the bot under Discord's per-channel message rate limit; the buffer is capped at 100 entries and reports anything it had to drop. Servers opt out with `!admin logs exclude <id>` (persisted in `bot_settings` under `command_log_excluded_guilds`); every server is logged unless excluded. Unhandled-exception reports stay separate, so the feed shows activity and the embed shows the traceback.
 
 ## Database Model Clusters
 - Moderation: Punishment, CaseNote, WatchdogLog, JailSetting, JailedUser, ImageMuteSetting, ReportSetting, LockdownChannel, UserAlt.

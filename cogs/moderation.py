@@ -7,22 +7,63 @@ import matplotlib.pyplot as plt
 import humanfriendly
 from discord import app_commands
 from discord.ext import commands, tasks
-from datetime import timedelta
+from datetime import datetime, timedelta
 from encodings.aliases import aliases
 from discord.ext.commands import Context
+
+from utils.core.prefixes import render
 from database.models import PunishmentType
 from utils.misc import MiscUtils
 from utils.cooldown import unified_cooldown
 from utils.guardrails import check_slash_guardrails
 from utils.security import resolve_id, resolve_ids
 from utils.embeds import Embeds
-from typing import Optional
+from typing import Any, Optional
 from matplotlib.ticker import MaxNLocator
 
 
 # Suppress noisy matplotlib INFO logging
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logger = logging.getLogger("discord.client")
+
+#: Commands that read an audio attachment off the invoking message and then
+#: take that message back down themselves once the file has been uploaded. The
+#: audio filter has to leave those messages alone: deleting one first would pull
+#: the attachment out from under the command before it could upload anything.
+AUDIO_COMMAND_EXEMPTIONS = frozenset({"upload", "postsong", "bruxvault"})
+
+#: Anything containing a Discord invite link, e.g. ``discord.gg/abc`` or
+#: ``discord.com/invite/abc``. The bare ``discord.gg`` domain is enough to
+#: match, so an invite does not need to be a full URL to be caught.
+INVITE_LINK_PATTERN = re.compile(
+    r"discord\.gg\b|discord(?:app)?\.com/invite\b", re.IGNORECASE
+)
+#: Reason recorded on invite-link jails.
+INVITE_JAIL_REASON = "Posted a Discord invite link"
+
+
+def _bot_admin_or_manage_messages() -> Any:
+    """Allow bot admins anywhere, or anyone with Manage Messages.
+
+    IDs added with ``!admin allow`` (and the application team) can purge
+    without holding Manage Messages in that channel: the messages go away
+    through the bot's own permissions, not the author's.
+    """
+
+    async def predicate(ctx: Context) -> bool:
+        # Stored admin list first, then the bot's is_owner override (which
+        # also covers the application team).
+        admin_ids = getattr(ctx.bot, "bot_admin_ids", None) or set()
+        if ctx.author.id in admin_ids:
+            return True
+        if await ctx.bot.is_owner(ctx.author):
+            return True
+        if ctx.channel.permissions_for(ctx.author).manage_messages:
+            return True
+        raise commands.MissingPermissions(["manage_messages"])
+
+    return commands.check(predicate)
+
 
 class Moderation(commands.Cog, name="Moderation"):
     def __init__(self, bot) -> None:
@@ -626,7 +667,7 @@ class Moderation(commands.Cog, name="Moderation"):
         description="Deletes user messages from a channel",
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_messages=True)
+    @_bot_admin_or_manage_messages()
     @app_commands.default_permissions(manage_messages=True)
     @unified_cooldown(5)
     async def purge(self, ctx: Context, arg1: str, arg2: str = None):
@@ -769,6 +810,172 @@ class Moderation(commands.Cog, name="Moderation"):
             pass
         except discord.NotFound:
             pass
+
+    @staticmethod
+    async def _purge_user_messages(
+        channel: Any, messages: list[discord.Message], bulk_cutoff: datetime
+    ) -> tuple[int, int]:
+        """Delete ``messages`` from ``channel`` and return ``(deleted, failed)``.
+
+        Discord's bulk delete endpoint refuses anything older than 14 days, so
+        older messages fall back to one-by-one deletion.
+        """
+        deleted = failed = 0
+        bulkable = [m for m in messages if m.created_at >= bulk_cutoff]
+        singles = [m for m in messages if m.created_at < bulk_cutoff]
+
+        for start in range(0, len(bulkable), 100):
+            chunk = bulkable[start : start + 100]
+            try:
+                await channel.delete_messages(chunk)
+                deleted += len(chunk)
+            except discord.NotFound:
+                # The messages were already removed (e.g. by another moderator).
+                deleted += len(chunk)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("clearchats: bulk delete failed in %s: %s", channel, exc)
+                failed += len(chunk)
+
+        for message in singles:
+            try:
+                await message.delete()
+                deleted += 1
+            except discord.NotFound:
+                deleted += 1
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "clearchats: could not delete message %s: %s", message.id, exc
+                )
+                failed += 1
+
+        return deleted, failed
+
+    @commands.hybrid_command(
+        name="clearchats",
+        description="Delete every message a user sent within a time frame, in every channel.",
+    )
+    @commands.guild_only()
+    @_bot_admin_or_manage_messages()
+    @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.describe(
+        user="The user whose messages to delete (ID or mention)",
+        timeframe="How far back to look, e.g. 30m, 5h, 2d (default: 1h)",
+    )
+    @unified_cooldown(30)
+    async def clearchats(self, ctx: Context, user: str, timeframe: str = "1h") -> None:
+        """Delete all of a user's messages from the last ``timeframe``, server-wide."""
+        identifier = user.strip()
+        mention = re.fullmatch(r"<@!?(\d+)>", identifier)
+        if mention:
+            user_id = int(mention.group(1))
+        elif identifier.isdigit():
+            user_id = int(identifier)
+        else:
+            return await ctx.send(
+                "Please give me a user ID or mention, e.g. `clearchats 123456789012345678 5h`.",
+                delete_after=10,
+            )
+
+        try:
+            seconds = await self.utils.parse_duration(timeframe)
+        except ValueError as exc:
+            return await ctx.send(str(exc), delete_after=10)
+        if seconds <= 0:
+            return await ctx.send(
+                "The time frame must be longer than zero.", delete_after=10
+            )
+
+        now = discord.utils.utcnow()
+        cutoff = now - timedelta(seconds=seconds)
+        # Bulk delete only works for messages younger than 14 days.
+        bulk_cutoff = now - timedelta(days=14)
+
+        targets = [
+            channel
+            for channel in (*ctx.guild.channels, *ctx.guild.threads)
+            if isinstance(
+                channel,
+                (
+                    discord.TextChannel,
+                    discord.VoiceChannel,
+                    discord.StageChannel,
+                    discord.Thread,
+                ),
+            )
+        ]
+
+        await ctx.defer()
+        status_embed = discord.Embed(
+            description=(
+                f"Scanning {len(targets)} channel(s) for messages from <@{user_id}> "
+                f"sent since {discord.utils.format_dt(cutoff, 'R')}…"
+            ),
+            color=discord.Color.blurple(),
+        )
+        status_message = await ctx.send(embed=status_embed)
+
+        deleted = failed = skipped = scanned = 0
+
+        for index, channel in enumerate(targets, start=1):
+            permissions = channel.permissions_for(ctx.me)
+            if not (
+                permissions.view_channel
+                and permissions.read_message_history
+                and permissions.manage_messages
+            ):
+                skipped += 1
+                continue
+
+            found: list[discord.Message] = []
+            try:
+                async for message in channel.history(limit=None, after=cutoff):
+                    if message.author.id == user_id and message.created_at >= cutoff:
+                        found.append(message)
+            except discord.NotFound:
+                # Channel or thread vanished mid-scan.
+                skipped += 1
+                continue
+            except discord.HTTPException as exc:
+                logger.warning("clearchats: could not scan %s: %s", channel, exc)
+                failed += 1
+                continue
+
+            scanned += 1
+            if found:
+                channel_deleted, channel_failed = await self._purge_user_messages(
+                    channel, found, bulk_cutoff
+                )
+                deleted += channel_deleted
+                failed += channel_failed
+
+            if index % 5 == 0 or index == len(targets):
+                status_embed.description = (
+                    f"Scanning… {index}/{len(targets)} channels — "
+                    f"{deleted} message(s) deleted so far."
+                )
+                try:
+                    await status_message.edit(embed=status_embed)
+                except discord.HTTPException:
+                    pass
+
+        summary = (
+            f"Removed **{deleted}** message(s) from <@{user_id}> sent in the last "
+            f"**{humanfriendly.format_timespan(seconds)}**."
+            f"\nScanned {scanned} channel(s)"
+            + (f", skipped {skipped} I can't read or delete in" if skipped else "")
+            + (f", {failed} failed" if failed else "")
+            + "."
+        )
+        result = discord.Embed(
+            title="Message Cleanup",
+            description=summary,
+            color=discord.Color.orange() if failed else discord.Color.green(),
+        )
+        try:
+            await status_message.edit(embed=result)
+        except discord.HTTPException:
+            await ctx.send(embed=result)
 
     @commands.hybrid_command(
         name="kick",
@@ -1427,7 +1634,7 @@ class Moderation(commands.Cog, name="Moderation"):
         description="View the permissions of a member in the server.",
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     async def permissions(self, ctx: commands.Context, member: discord.Member = None):
         """View the permissions of a member in the server."""
         member = member or ctx.author
@@ -2020,93 +2227,132 @@ class Moderation(commands.Cog, name="Moderation"):
 
         if member.top_role >= ctx.author.top_role:
             return await Embeds.error(ctx, "🚫 You cannot jail someone with an equal or higher role.", reply=False)
-        if member.top_role >= ctx.guild.me.top_role:
-            return await Embeds.error(ctx, "🚫 I cannot jail someone with an equal or higher role than me.", reply=False)
-
-        guild_id = ctx.guild.id
-        jail_settings = await self.bot.database.get_jail_settings(guild_id)
-        if not jail_settings or not jail_settings.jail_role_id:
-            return await ctx.send("No jail settings found. Run `!jailsetup` first.")
-
-        jail_role = ctx.guild.get_role(jail_settings.jail_role_id)
-        jail_channel = ctx.guild.get_channel(jail_settings.jail_channel_id)
-        if not jail_role or not jail_channel:
-            return await ctx.send(
-                "🚫 Jail role or channel misconfigured. Contact an admin."
-            )
 
         duration_seconds = None
-        jailed_until = None
-
         if duration:
             try:
                 duration_seconds = humanfriendly.parse_timespan(duration)
-                jailed_until = discord.utils.utcnow() + timedelta(seconds=duration_seconds)
                 reason_text = reason or "No reason provided"
             except humanfriendly.InvalidTimespan:
                 reason_text = f"{duration} {reason or ''}".strip() or "No reason provided"
         else:
             reason_text = reason or "No reason provided"
 
+        ok, message = await self.jail_member(
+            ctx.guild,
+            member,
+            moderator=ctx.author,
+            reason=reason_text,
+            duration_seconds=duration_seconds,
+        )
+        if not ok:
+            return await Embeds.error(ctx, message, reply=False)
+        await ctx.reply(
+            embed=discord.Embed(description=message, color=discord.Color.blurple())
+        )
+
+    async def jail_member(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        *,
+        moderator=None,
+        reason: str = "No reason provided",
+        duration_seconds: Optional[int] = None,
+    ) -> tuple[bool, str]:
+        """Jail *member* and record the punishment.
+
+        Shared by the ``jail`` command, the honeypot's ``jail`` action and the
+        invite-link filter so all three behave identically: strip the member's
+        roles, apply the jail role, persist the case and schedule an automatic
+        release when a duration is given. Returns ``(ok, message)`` where
+        *message* explains the outcome and is safe to show or log.
+        """
+        jail_settings = await self.bot.database.get_jail_settings(guild.id)
+        if not jail_settings or not jail_settings.jail_role_id:
+            return False, "No jail settings found. Run `!jailsetup` first."
+
+        jail_role = guild.get_role(jail_settings.jail_role_id)
+        jail_channel = guild.get_channel(jail_settings.jail_channel_id)
+        if not jail_role or not jail_channel:
+            return False, "🚫 Jail role or channel misconfigured. Contact an admin."
+
+        me = guild.me
+        if me is None or member.top_role >= me.top_role:
+            return False, "🚫 I cannot jail someone with an equal or higher role than me."
+        if jail_role.position >= me.top_role.position:
+            return False, (
+                "🚫 I cannot assign the jail role because my role is not high enough. "
+                "Please move my bot role above the jail role in the server settings."
+            )
+
+        jailed_until = (
+            discord.utils.utcnow() + timedelta(seconds=duration_seconds)
+            if duration_seconds
+            else None
+        )
+        actor = moderator or self.bot.user
+        moderator_id = getattr(actor, "id", None) or self.bot.user.id
+
         to_remove = [
             r
             for r in member.roles
-            if r != ctx.guild.default_role and r != jail_role and not r.managed
+            if r != guild.default_role and r != jail_role and not r.managed
         ]
         removed_ids = [r.id for r in to_remove]
 
-        if jail_role.position >= ctx.guild.me.top_role.position:
-            return await Embeds.error(ctx, "🚫 I cannot assign the jail role because my role is not high enough. "
-                        "Please move my bot role above the jail role in the server settings.", reply=False)
-
         await self.bot.database.add_jailed_user(
-            guild_id, member.id, jailed_until, removed_ids
+            guild.id, member.id, jailed_until, removed_ids
         )
         # Mirror the stripped roles into the general role-restore store so
         # `!role restore` can recover them after the punishment.
         if removed_ids:
             await self.bot.database.log_user_roles(member.id, removed_ids)
         await self.bot.database.log_punishment_command(
-            moderator_id=ctx.author.id,
-            guild_id=guild_id,
+            moderator_id=moderator_id,
+            guild_id=guild.id,
             punishment_type=PunishmentType.JAIL,
         )
         await self.bot.database.add_punishment(
             user_id=member.id,
-            guild_id=guild_id,
-            moderator_id=ctx.author.id,
+            guild_id=guild.id,
+            moderator_id=moderator_id,
             punishment_type=PunishmentType.JAIL,
-            reason=reason_text,
+            reason=reason,
             duration=duration_seconds,
         )
 
-        if to_remove:
-            await member.remove_roles(*to_remove, reason="Jailed by moderator")
-        await member.add_roles(jail_role, reason="Jailed by moderator")
+        try:
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Jailed")
+            await member.add_roles(jail_role, reason="Jailed")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not apply the jail role to %s in %s", member.id, guild.id)
+            return False, "🚫 I couldn't apply the jail role due to missing permissions."
 
         jail_msg = discord.Embed(
-            description=f"**{member}**, you have been jailed{' until ' + jailed_until.isoformat() if jailed_until else ''}.",
+            description=(
+                f"**{member}**, you have been jailed"
+                f"{' until ' + jailed_until.isoformat() if jailed_until else ''}."
+            ),
             color=discord.Color.greyple(),
         )
         jail_msg.set_author(
-            name=f"Moderator: {ctx.author}",
-            icon_url=self.utils.get_avatar_url(ctx.author),
+            name=f"Moderator: {actor}",
+            icon_url=self.utils.get_avatar_url(actor),
         )
-        await jail_channel.send(embed=jail_msg)
-
-        confirm = discord.Embed(
-            description=(
-                f"{member.name} has been jailed "
-                f"{'until ' + jailed_until.isoformat() if jailed_until else 'indefinitely'}."
-            ),
-            color=discord.Color.blurple(),
-        )
-        await ctx.reply(embed=confirm)
+        try:
+            await jail_channel.send(embed=jail_msg)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.debug("Could not announce a jail in %s", guild.id)
 
         if duration_seconds:
-            asyncio.create_task(
-                self._auto_unjail(guild_id, member.id, duration_seconds)
-            )
+            asyncio.create_task(self._auto_unjail(guild.id, member.id, duration_seconds))
+
+        return True, (
+            f"{member.name} has been jailed "
+            f"{'until ' + jailed_until.isoformat() if jailed_until else 'indefinitely'}."
+        )
 
     async def _auto_unjail(self, guild_id: int, user_id: int, delay: int):
         """Helper to sleep then restore a jailed user."""
@@ -3108,8 +3354,10 @@ class Moderation(commands.Cog, name="Moderation"):
             )
             await ctx.send(embed=embed)
 
+    # ``ce`` now belongs to ,createembed (the embed builder), so this stays
+    # reachable only under its descriptive name.
     @commands.command(
-        name="ce", aliases=["enablecommand"], description="Enable a command in the specified channel.", hidden=True
+        name="enablecommand", description="Enable a command in the specified channel.", hidden=True
     )
     @commands.guild_only()
     @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
@@ -3737,7 +3985,7 @@ class Moderation(commands.Cog, name="Moderation"):
         description="Manage which channels are affected by lockdown.",
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     async def lockdown_channels(self, ctx: Context):
         embed = discord.Embed(
             title="Lockdown Channel Management",
@@ -3809,7 +4057,7 @@ class Moderation(commands.Cog, name="Moderation"):
         name="lockdown", aliases=["ld"], description="Lock all channels in the lockdown list."
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     @commands.bot_has_permissions(manage_guild=True)
     async def lockdown(self, ctx: Context):
         ids = await self.bot.database.get_lockdown_channels(ctx.guild.id)
@@ -3837,7 +4085,7 @@ class Moderation(commands.Cog, name="Moderation"):
         description="Unlock all channels in the lockdown list.",
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     @commands.bot_has_permissions(manage_guild=True)
     async def unlockdown(self, ctx: Context):
         ids = await self.bot.database.get_lockdown_channels(ctx.guild.id)
@@ -4140,7 +4388,7 @@ class Moderation(commands.Cog, name="Moderation"):
         invoke_without_command=True,
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     async def restrictcommand(self, ctx: Context):
         prefix = "/"
         if ctx.message:
@@ -4157,7 +4405,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}restrict {name}`{aliases} — {desc}")
             else:
@@ -4182,7 +4430,7 @@ class Moderation(commands.Cog, name="Moderation"):
         description="Allows the specified role exclusive permission to use a command",
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     @app_commands.default_permissions(manage_guild=True)
     @unified_cooldown(10)
     async def restrictcommand_add(
@@ -4212,7 +4460,7 @@ class Moderation(commands.Cog, name="Moderation"):
         description="Removes the specified roles exclusive permission to use a command",
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     @app_commands.default_permissions(manage_guild=True)
     @unified_cooldown(10)
     async def restrictcommand_remove(
@@ -4240,7 +4488,7 @@ class Moderation(commands.Cog, name="Moderation"):
         name="reset", description="Removes every restricted command"
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     @app_commands.default_permissions(manage_guild=True)
     @unified_cooldown(10)
     async def restrictcommand_reset(self, ctx: Context):
@@ -4257,7 +4505,7 @@ class Moderation(commands.Cog, name="Moderation"):
         name="list", description="View a list of every restricted command"
     )
     @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
     @app_commands.default_permissions(manage_guild=True)
     @unified_cooldown(10)
     async def restrictcommand_list(self, ctx: Context, filter_arg: str = None):
@@ -4382,7 +4630,70 @@ class Moderation(commands.Cog, name="Moderation"):
         embed = view.create_embed()
         await ctx.send(embed=embed, view=view)
 
+    def _audio_command_names(self) -> tuple[str, ...]:
+        """Every name and alias of the commands that upload their own audio.
+
+        Read off the command registry, so an alias added later is covered here
+        without this file having to know about it.
+        """
+        names: set[str] = set()
+        for name in AUDIO_COMMAND_EXEMPTIONS:
+            command = self.bot.get_command(name)
+            if command is None:
+                continue
+            names.add(command.qualified_name)
+            names.update(command.aliases)
+        return tuple(sorted(names))
+
+    async def _invokes_audio_command(self, message: discord.Message) -> bool:
+        """Whether the message runs a command that uploads its own attachment.
+
+        ``upload`` and ``postsong`` read the attached mp3 to put it on the
+        bucket and delete the source message themselves once the file is up, so
+        the filter has to stay out of their way. The command is resolved
+        through the bot's prefix and its command registry rather than by
+        matching strings, so aliases and per-guild prefixes still work.
+        """
+        content = (message.content or "").lstrip()
+        if not content:
+            return False
+
+        # Resolving the prefix costs a lookup, and the filter sees every single
+        # message, so ordinary chatter is dismissed on the first word alone. A
+        # prefix cannot make an invoking message stop ending with the command
+        # name, so this can only ever skip work, never the command itself.
+        names = self._audio_command_names()
+        if not names or not content.split(maxsplit=1)[0].lower().endswith(names):
+            return False
+
+        try:
+            prefixes = await self.bot.get_prefix(message)
+        except Exception:
+            return False
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+
+        for prefix in prefixes:
+            if not isinstance(prefix, str) or not prefix:
+                continue
+            if not content.startswith(prefix):
+                continue
+            words = content[len(prefix):].split(maxsplit=1)
+            if not words:
+                return False
+            command = self.bot.get_command(words[0])
+            if command is None:
+                return False
+            root = command.root_parent or command
+            return root.qualified_name in AUDIO_COMMAND_EXEMPTIONS
+        return False
+
     async def handle_antiaudio_check(self, message: discord.Message):
+        # Never touch the bot's own audio. The mp3 button mode hands the file
+        # over as an ephemeral attachment, and those must survive the filter.
+        if message.author.bot or message.flags.ephemeral:
+            return
+
         try:
             enabled = await self.bot.database.get_antiaudio_status(message.guild.id)
         except Exception as exc:
@@ -4396,6 +4707,11 @@ class Moderation(commands.Cog, name="Moderation"):
             raise
 
         if not enabled:
+            return
+
+        # The attachment has to survive until the command that consumes it is
+        # done, so these messages are checked by the command itself.
+        if await self._invokes_audio_command(message):
             return
 
         if message.reference and message.reference.type == discord.MessageReferenceType.forward:
@@ -4412,18 +4728,85 @@ class Moderation(commands.Cog, name="Moderation"):
             
             if is_audio_by_mime or is_audio_by_extension:
                 await message.delete()
+                try:
+                    prefix = await self.bot.get_prefix(message) or "!"
+                except Exception:
+                    prefix = "!"
                 embed = discord.Embed(
-                    description=f"{message.author.mention}: Audio files are not allowed in this server.",
+                    description=(
+                        f"{message.author.mention} — **audio files can't be posted here**, "
+                        "so your message was removed.\n\n"
+                        "**How to share an mp3:**\n"
+                        "**1.** Start a new message and attach the mp3.\n"
+                        f"**2.** Type `{prefix}upload` in that same message box and send it.\n"
+                        "**3.** I'll send back a link button you can share instead.\n\n"
+                        f"-# You can also reply to a message that has an mp3 with "
+                        f"`{prefix}upload`. Add a title after the command if you want: "
+                        f"`{prefix}upload Song Name`."
+                    ),
                     color=discord.Color.red(),
                 )
-                await message.channel.send(embed=embed, delete_after=10)
+                await message.channel.send(embed=embed, delete_after=20)
 
+
+    def _invite_link_exempt(self, message: discord.Message) -> bool:
+        """Staff who may share invites are never jailed for one."""
+        author = message.author
+        if self.bot.user is not None and author.id == self.bot.user.id:
+            return True
+        if message.guild.owner_id == author.id:
+            return True
+        owners = getattr(self.bot, "owner_ids", None) or set()
+        if author.id in owners:
+            return True
+        permissions = message.channel.permissions_for(author)
+        return permissions.administrator or permissions.manage_messages
+
+    async def handle_invite_link(self, message: discord.Message) -> bool:
+        """Jail whoever posts a Discord invite link.
+
+        Returns ``True`` when the message contained an invite and was handled,
+        so the caller can stop processing it. Requires jail to be configured;
+        otherwise the link is left alone (there is no cell to put anyone in).
+        """
+        if not INVITE_LINK_PATTERN.search(message.content or ""):
+            return False
+        if self._invite_link_exempt(message):
+            return False
+
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            logger.debug("Could not delete an invite link in %s", message.guild.id)
+
+        ok, _ = await self.jail_member(
+            message.guild,
+            message.author,
+            moderator=self.bot.user,
+            reason=INVITE_JAIL_REASON,
+        )
+        if ok:
+            notice = discord.Embed(
+                description=(
+                    f"{message.author.mention} was jailed for posting a Discord "
+                    "invite link."
+                ),
+                color=discord.Color.red(),
+            )
+            try:
+                await message.channel.send(embed=notice, delete_after=10)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        return True
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Deletes MP3 files if the filter is enabled in the server."""
+        """Jails invite links and deletes MP3 files when the filter is on."""
 
         if message.author.bot or not message.guild:
+            return
+
+        if await self.handle_invite_link(message):
             return
 
         if message.author.id not in self.allowed_mp3_bypass_ids:

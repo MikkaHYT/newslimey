@@ -587,16 +587,16 @@ class UserMixin(BaseManager):
                 await session.execute(
                     delete(GameSession).where(GameSession.owner_id == user_hash)
                 )
-                await session.execute(
-                    update(GameSession)
-                    .where(GameSession.owner_id != user_hash)
-                    .where(GameSession.participants.any(user_hash))
-                    .values(
-                        participants=func.array_remove(
-                            GameSession.participants, user_hash
-                        )
-                    )
+                # ``participants`` is a JSON array on SQLite, so strip the hash
+                # in Python instead of using Postgres' array_remove().
+                participant_sessions = await session.execute(
+                    select(GameSession).where(GameSession.owner_id != user_hash)
                 )
+                for game_session in participant_sessions.scalars().all():
+                    participants = list(game_session.participants or [])
+                    if user_hash in participants:
+                        participants.remove(user_hash)
+                        game_session.participants = participants
 
                 # Tasks / cooldowns / utility state
                 await session.execute(delete(Task).where(Task.user_id == user_hash))

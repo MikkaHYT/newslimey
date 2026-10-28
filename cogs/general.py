@@ -18,11 +18,12 @@ from decimal import Decimal
 from sqlalchemy import text
 from discord import ui, Interaction, SelectOption, ButtonStyle, app_commands
 from discord.ext import commands
+from utils.core.prefixes import render
 from utils.misc import MiscUtils
 from utils.cooldown import unified_cooldown
+from utils.core import mp3_buttons
 from utils.embeds import Embeds
 from utils.guardrails import check_slash_guardrails
-from urllib.parse import urlparse
 from typing import List, Optional
 from discord.ext.commands import Context
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,96 @@ NASA_API_KEY = os.getenv("NASA_API_KEY")
 
 HIDDEN_COGS = {"Owner", "Jishaku"}
 COMMANDS_PER_PAGE = 15
+#: Groups that publish their own paginated subcommand index (`,lf`) instead of
+#: having every child dumped into the help embeds. Listing them there drowns
+#: the section and risks overshooting the embed limits.
+HELP_SUBCOMMAND_EXCLUDE = {"lf"}
+#: Discord renders at most 25 options in one select, so the category menu is
+#: paginated once the bot has more cogs than that.
+COG_SELECT_LIMIT = 25
+
+#: Help categories, in menu order. Related cogs are folded into one section
+#: (both fun cogs, every music/media cog, and so on) so the menu reads by
+#: feature rather than one entry per cog.
+CATEGORY_ORDER: tuple[str, ...] = (
+    "🎵 Music & Media",
+    "🎮 Games & Casino",
+    "🕹️ Chat Games",
+    "🎉 Fun",
+    "💰 Economy",
+    "🎖️ Levels",
+    "👥 Community",
+    "🛡️ Moderation",
+    "🔊 Voice",
+    "ℹ️ General",
+)
+
+#: Which category each cog is filed under.
+CATEGORY_FOR_COG: dict[str, str] = {
+    # Music & media
+    "Music": "🎵 Music & Media",
+    "Mixtapes": "🎵 Music & Media",
+    "Radio": "🎵 Music & Media",
+    "LastFM": "🎵 Music & Media",
+    "SongInfo": "🎵 Music & Media",
+    "SongOfTheDay": "🎵 Music & Media",
+    "Covers": "🎵 Music & Media",
+    "Remaster": "🎵 Music & Media",
+    "Stem": "🎵 Music & Media",
+    "Edits": "🎵 Music & Media",
+    "Snippets": "🎵 Music & Media",
+    "MakeSnip": "🎵 Music & Media",
+    "Repost": "🎵 Music & Media",
+    "Unleaked": "🎵 Music & Media",
+    "BruxVault": "🎵 Music & Media",
+    # Games & casino
+    "Casino": "🎮 Games & Casino",
+    "Games": "🎮 Games & Casino",
+    # Chat games
+    "ChatGames": "🕹️ Chat Games",
+    # Fun
+    "Fun": "🎉 Fun",
+    "FunExtra": "🎉 Fun",
+    "Misc": "🎉 Fun",
+    "TTS": "🎉 Fun",
+    # Economy
+    "Economy": "💰 Economy",
+    "Vault": "💰 Economy",
+    # Levels
+    "Leveling": "🎖️ Levels",
+    "Admin": "🎖️ Levels",
+    # Community
+    "Community": "👥 Community",
+    "Roles": "👥 Community",
+    "BoosterRole": "👥 Community",
+    # Moderation
+    "Moderation": "🛡️ Moderation",
+    "Watchdog": "🛡️ Moderation",
+    "ServerLogs": "🛡️ Moderation",
+    # Voice
+    "Voicechat": "🔊 Voice",
+    # General
+    "General": "ℹ️ General",
+    "AI": "ℹ️ General",
+    "ImageGen": "ℹ️ General",
+    "Advertise": "ℹ️ General",
+}
+
+CATEGORY_DESCRIPTIONS: dict[str, str] = {
+    "🎵 Music & Media": "Music, the mixtape library, radio, covers, remasters, stems and snippets.",
+    "🎮 Games & Casino": "Casino tables and the mini-game collection.",
+    "🕹️ Chat Games": "Channel-wide games the whole server plays together in chat.",
+    "🎉 Fun": "Fun, reaction counters and the meme TTS voices.",
+    "💰 Economy": "Your wallet, bank, jobs, loans and the economy dashboard.",
+    "🎖️ Levels": "Levels, XP, level roles and the level admin menu.",
+    "👥 Community": "Roles, autoroles, boosters and community settings.",
+    "🛡️ Moderation": "Moderation, the watchdog and server logging.",
+    "🔊 Voice": "Private voice channels and voice controls.",
+    "ℹ️ General": "Info, utility and AI commands.",
+}
+
+# Raw mention tokens, so quoted text can show `@name` instead of `<@123>`.
+MENTION_PATTERN = re.compile(r"<@!?(\d+)>|<@&(\d+)>|<#(\d+)>")
 
 MESSAGE_LINK = re.compile(
     r"https?://(?:canary\.)?discord(?:app)?\.com/channels/"
@@ -47,12 +138,16 @@ MESSAGE_LINK = re.compile(
 )
 
 class HelpSelect(ui.Select):
-    def __init__(self, bot, embeds_by_cog):
+    """One page of command categories (Discord caps a select at 25 options)."""
+
+    def __init__(self, bot, embeds_by_cog, cogs, page: int = 0):
         self.bot = bot
         self.embeds_by_cog = embeds_by_cog
+        start = page * COG_SELECT_LIMIT
+        page_cogs = cogs[start : start + COG_SELECT_LIMIT]
         options = [
             SelectOption(label=cog, description=f"View commands for {cog}")
-            for cog in embeds_by_cog
+            for cog in page_cogs
         ]
         super().__init__(
             placeholder="Select a command category..",
@@ -67,6 +162,49 @@ class HelpSelect(ui.Select):
         view.message = await interaction.response.edit_message(
             embed=self.embeds_by_cog[cog][0], view=view
         )
+
+
+class CategoryMenuView(ui.View):
+    """The category picker, paging through cogs 25 at a time."""
+
+    def __init__(self, bot, embeds_by_cog):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.embeds_by_cog = embeds_by_cog
+        self.cogs = list(embeds_by_cog)
+        self.page = 0
+
+        self.prev_button = ui.Button(emoji="⬅", style=ButtonStyle.gray, row=1)
+        self.next_button = ui.Button(emoji="➡", style=ButtonStyle.gray, row=1)
+        self.prev_button.callback = self.go_back
+        self.next_button.callback = self.go_forward
+        self.add_item(self.prev_button)
+        self.add_item(self.next_button)
+        self._install_select()
+
+    @property
+    def pages(self) -> int:
+        return max(1, (len(self.cogs) + COG_SELECT_LIMIT - 1) // COG_SELECT_LIMIT)
+
+    def _install_select(self) -> None:
+        for child in list(self.children):
+            if isinstance(child, ui.Select):
+                self.remove_item(child)
+        self.add_item(HelpSelect(self.bot, self.embeds_by_cog, self.cogs, self.page))
+
+        show_nav = len(self.cogs) > COG_SELECT_LIMIT
+        self.prev_button.disabled = (not show_nav) or self.page <= 0
+        self.next_button.disabled = (not show_nav) or self.page >= self.pages - 1
+
+    async def go_back(self, interaction: Interaction) -> None:
+        self.page = max(0, self.page - 1)
+        self._install_select()
+        await interaction.response.edit_message(view=self)
+
+    async def go_forward(self, interaction: Interaction) -> None:
+        self.page = min(self.pages - 1, self.page + 1)
+        self._install_select()
+        await interaction.response.edit_message(view=self)
 
 class HelpPaginationView(ui.View):
     def __init__(self, embeds, bot, embeds_by_cog):
@@ -112,9 +250,7 @@ class HelpPaginationView(ui.View):
         )
 
     async def go_back_to_menu(self, interaction: Interaction):
-        select_menu = HelpSelect(self.bot, self.embeds_by_cog)
-        view = ui.View(timeout=120)
-        view.add_item(select_menu)
+        view = CategoryMenuView(self.bot, self.embeds_by_cog)
         await interaction.response.edit_message(
             content="Please select a command category:", embed=None, view=view
         )
@@ -294,10 +430,6 @@ class General(commands.Cog, name="General"):
         self.session = aiohttp.ClientSession()
         self.hidden_cogs: List[str] = ["Owner"]
         self.per_page = 1
-        self.snipes = {}
-        self.edit_snipes = {}
-        self.reaction_snipes = {}
-        self.snipe_enabled_cache = {}  # guild_id -> (enabled: bool, fetched_at: datetime)
         self.afk_users = {}
         self.currency_api = "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies"
         self.start_time = discord.utils.utcnow()
@@ -354,118 +486,6 @@ class General(commands.Cog, name="General"):
     async def on_ready(self):
         logger.info(f"Cog {self.__class__.__name__} is ready!")
 
-    async def _is_snipe_enabled(self, guild_id: int) -> bool:
-        """Cached lookup of whether snipe is enabled for a guild. Off by default."""
-        cache = self.snipe_enabled_cache.get(guild_id)
-        now = discord.utils.utcnow()
-        if cache and (now - cache[1]).total_seconds() <= 300:
-            return cache[0]
-        try:
-            enabled = await self.bot.database.get_snipe_enabled(guild_id)
-        except Exception as exc:
-            if self.bot.database._is_retryable_db_error(exc):
-                # Fail closed: don't cache message content if we can't confirm
-                # snipe is enabled for this guild.
-                return False
-            raise
-        self.snipe_enabled_cache[guild_id] = (enabled, now)
-        return enabled
-
-    def _redact_for_snipe(self, content: str) -> str:
-        """Redact PII/card/token data from snipe content before it is cached.
-
-        Reuses the Watchdog cog's redactor so the snipe commands surface the
-        same masked output as the mod-logs — sensitive data is never shown via
-        snipe even when the original message was cached. If the Watchdog cog
-        isn't loaded, the content is returned unchanged.
-        """
-        if not content:
-            return content
-        watchdog = self.bot.get_cog("Watchdog")
-        if watchdog is None:
-            return content
-        try:
-            return watchdog._redact_content(content)
-        except Exception:
-            logger.error("snipe redaction failed", exc_info=True)
-            return content
-
-    @commands.Cog.listener()
-    async def on_message_delete(self, message):
-        """Store deleted messages for snipe command"""
-        if message.author.bot:
-            return
-        try:
-            guild_id = message.guild.id
-            channel_id = message.channel.id
-        except AttributeError:
-            return
-        if not await self._is_snipe_enabled(guild_id):
-            return
-        channel_snipes = self.snipes.setdefault(guild_id, {}).setdefault(channel_id, [])
-        snipe_data = (
-            self._redact_for_snipe(message.content),
-            message.author,
-            discord.utils.utcnow(),
-            message.attachments,
-        )
-        channel_snipes.append(snipe_data)
-        if len(channel_snipes) > 50:
-            channel_snipes[:] = channel_snipes[-50:]
-
-    @commands.Cog.listener()
-    async def on_message_edit(self, before, after):
-        """Store edited messages for editsnipe command"""
-        if before.author.bot:
-            return
-        try:
-            guild_id = before.guild.id
-            channel_id = before.channel.id
-        except AttributeError:
-            return
-        if not await self._is_snipe_enabled(guild_id):
-            return
-        if before.content == after.content:
-            return
-        channel_snipes = self.edit_snipes.setdefault(guild_id, {}).setdefault(
-            channel_id, []
-        )
-        snipe_data = (
-            self._redact_for_snipe(before.content),
-            self._redact_for_snipe(after.content),
-            before.author,
-            discord.utils.utcnow(),
-        )
-        channel_snipes.append(snipe_data)
-        if len(channel_snipes) > 50:
-            channel_snipes[:] = channel_snipes[-50:]
-
-    @commands.Cog.listener()
-    async def on_reaction_remove(self, reaction, user):
-        """Store removed reactions for reaction snipe command"""
-        if user.bot:
-            return
-        try:
-            message = reaction.message
-            guild_id = message.guild.id
-            channel_id = message.channel.id
-        except AttributeError:
-            return
-        if not await self._is_snipe_enabled(guild_id):
-            return
-        channel_snipes = self.reaction_snipes.setdefault(guild_id, {}).setdefault(
-            channel_id, []
-        )
-        snipe_data = (
-            self._redact_for_snipe(message.content),
-            message.author,
-            discord.utils.utcnow(),
-            message.attachments,
-        )
-        channel_snipes.append(snipe_data)
-        if len(channel_snipes) > 50:
-            channel_snipes[:] = channel_snipes[-50:]
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """
@@ -493,7 +513,7 @@ class General(commands.Cog, name="General"):
                 )
                 await message.channel.send(embed=embed)
 
-    @commands.hybrid_command(
+    @commands.command(
         name="terms", description="View the terms of service."
     )
     async def terms_of_service(self, ctx: commands.Context) -> None:
@@ -501,7 +521,7 @@ class General(commands.Cog, name="General"):
         markdown = f"Click [**here**]({url}) to view the terms"
         await ctx.reply(markdown, mention_author=False)
 
-    @commands.hybrid_command(
+    @commands.command(
         name="privacy", description="View the privacy policy."
     )
     async def privacy_policy(self, ctx: commands.Context) -> None:
@@ -568,7 +588,8 @@ class General(commands.Cog, name="General"):
                 return
 
             embed = create_embed(
-                f"{cmd.qualified_name}", cmd.help or "No description available."
+                f"{cmd.qualified_name}",
+                render(cmd.help, prefix) or "No description available.",
             )
             usage = f"{prefix}{cmd.qualified_name}"
             if getattr(cmd, "signature", None):
@@ -587,49 +608,69 @@ class General(commands.Cog, name="General"):
             embed.add_field(name="Category", value=cog_name, inline=True)
 
             if isinstance(cmd, commands.Group) and getattr(cmd, "commands", None):
-                sub_list = [
-                    f"`{prefix}{cmd.qualified_name} {sub.name} {sub.signature}`".strip()
-                    for sub in cmd.commands
-                    if not sub.hidden
-                ]
-                if sub_list:
+                if cmd.name.lower() in HELP_SUBCOMMAND_EXCLUDE:
                     embed.add_field(
                         name="Subcommands",
-                        value="\n".join(sub_list[:20]) or "None",
+                        value=(
+                            f"Run `{prefix}{cmd.qualified_name}` to browse them "
+                            "page by page."
+                        ),
                         inline=False,
                     )
+                else:
+                    sub_list = [
+                        f"`{prefix}{cmd.qualified_name} {sub.name} {sub.signature}`".strip()
+                        for sub in cmd.commands
+                        if not sub.hidden
+                    ]
+                    if sub_list:
+                        embed.add_field(
+                            name="Subcommands",
+                            value="\n".join(sub_list[:20]) or "None",
+                            inline=False,
+                        )
 
             await ctx.reply(embed=embed)
             return
 
-        # No specific command requested — show interactive category menu
-        embeds_by_cog = {}
-        visible_cogs = [
-            (name, cog)
-            for name, cog in sorted(self.bot.cogs.items())
-            if name not in HIDDEN_COGS
-        ]
-
-        for cog_name, cog in visible_cogs:
+        # No specific command requested — show interactive category menu.
+        # Every cog is folded into a feature category, so related commands sit
+        # together instead of one section per cog.
+        grouped: dict[str, list] = {}
+        for cog_name, cog in sorted(self.bot.cogs.items()):
+            if cog_name in HIDDEN_COGS:
+                continue
             cmds = [c for c in cog.get_commands() if not c.hidden]
             if not cmds:
                 continue
+            category = CATEGORY_FOR_COG.get(cog_name, "📁 Other")
+            grouped.setdefault(category, []).extend(cmds)
+
+        ordered = [name for name in CATEGORY_ORDER if name in grouped]
+        ordered += sorted(name for name in grouped if name not in CATEGORY_ORDER)
+
+        embeds_by_cog = {}
+        for category in ordered:
+            cmds = sorted(grouped[category], key=lambda c: c.qualified_name.lower())
 
             pages = []
             for i in range(0, len(cmds), COMMANDS_PER_PAGE):
                 emb = create_embed(
-                    f"{cog_name} Commands",
-                    cog.__doc__ or "No description available",
+                    category,
+                    CATEGORY_DESCRIPTIONS.get(category, "No description available"),
                 )
                 for cmd in cmds[i : i + COMMANDS_PER_PAGE]:
-                    desc = cmd.help or "No description available"
+                    desc = render(cmd.help, prefix) or "No description available"
                     emb.add_field(
                         name=f"`{prefix}{cmd.qualified_name}{(' '+cmd.signature) if cmd.signature else ''}`",
                         value=f"↳ {desc}",
                         inline=False,
                     )
 
-                    if isinstance(cmd, commands.Group):
+                    if (
+                        isinstance(cmd, commands.Group)
+                        and cmd.name.lower() not in HELP_SUBCOMMAND_EXCLUDE
+                    ):
                         subs = [
                             f"{prefix}{cmd.name} {sub.name}"
                             for sub in cmd.commands
@@ -644,16 +685,13 @@ class General(commands.Cog, name="General"):
 
                 pages.append(emb)
 
-            if pages:
-                embeds_by_cog[cog_name] = pages
+            embeds_by_cog[category] = pages
 
         if not embeds_by_cog:
             return await ctx.reply("No visible commands available.")
 
-        menu = HelpSelect(self.bot, embeds_by_cog)
-        view = ui.View(timeout=120)
-        view.add_item(menu)
-        await ctx.reply("Please select a command category:", view=view)
+        menu = CategoryMenuView(self.bot, embeds_by_cog)
+        await ctx.reply("Please select a command category:", view=menu)
 
     @commands.command(
         name="membercount", description="Shows detailed member statistics."
@@ -798,176 +836,6 @@ class General(commands.Cog, name="General"):
                 delete_after=5,
             )
 
-    @commands.hybrid_command(name="snipe", aliases=["s"])
-    @unified_cooldown(3)
-    async def snipe(self, ctx: Context, index: int = 1) -> None:
-        """Retrieve deleted messages from the channel."""
-        await ctx.defer(ephemeral=False)
-        try:
-            index = max(1, min(index, 50))
-            guild_id = ctx.guild.id
-            channel_id = ctx.channel.id
-
-            snipes = self.snipes.get(guild_id, {}).get(channel_id, [])
-            if not snipes:
-                await ctx.send("There's nothing to snipe!", delete_after=5)
-                return
-
-            if index > len(snipes):
-                await ctx.send(
-                    f"Please provide a number between 1 and {len(snipes)}.",
-                    delete_after=5,
-                )
-                return
-
-            snipe = snipes[-index]
-            content, author, time, attachments = (
-                snipe if len(snipe) == 4 else (*snipe, [])
-            )
-
-            if not content and not attachments:
-                await ctx.send("This message has no viewable content!", delete_after=5)
-                return
-
-            embed = discord.Embed(
-                description=content if content else None,
-                color=ctx.author.top_role.color or discord.Color.red(),
-            )
-
-            if author:
-                embed.set_author(
-                    name=f"Message by {author.display_name}",
-                    icon_url=self.utils.get_avatar_url(author),
-                )
-
-            if time:
-                embed.set_footer(
-                    text=f"Deleted at {time.strftime('%Y-%m-%d %H:%M:%S')} UTC | {index}/{len(snipes)}"
-                )
-
-            if content and any(
-                domain in content.lower() for domain in ("tenor.com", "giphy.com")
-            ):
-                embed.set_image(url=content)
-            elif attachments:
-                for attachment in attachments:
-                    if not hasattr(attachment, "url"):
-                        continue
-
-                    if any(
-                        attachment.url.lower().endswith(ext)
-                        for ext in (".gif", ".png", ".jpg", ".jpeg")
-                    ):
-                        embed.set_image(url=attachment.url)
-                        break
-                    elif any(
-                        attachment.url.lower().endswith(ext)
-                        for ext in (".mp4", ".webm", ".mov")
-                    ):
-                        embed.add_field(
-                            name="Media",
-                            value=f"[Click to view]({attachment.url})",
-                            inline=False,
-                        )
-                        break
-                    else:
-                        embed.add_field(
-                            name="File",
-                            value=f"[Download]({attachment.url})",
-                            inline=False,
-                        )
-
-            await ctx.send(embed=embed)
-
-        except ValueError:
-            await ctx.send("Please provide a valid number.", delete_after=5)
-        except Exception as e:
-            logger.error(f"Error in snipe command: {e}", exc_info=True)
-            await ctx.send(
-                "An error occurred while retrieving the message.", delete_after=5
-            )
-
-    @commands.hybrid_command(name="editsnipe", aliases=["es"])
-    @unified_cooldown(3)
-    async def edit_snipe(self, ctx: Context) -> None:
-        """Retrieve the last edited message in the channel."""
-        await ctx.defer(ephemeral=False)
-        try:
-            guild_id = ctx.guild.id
-            channel_id = ctx.channel.id
-
-            snipes = self.edit_snipes.get(guild_id, {}).get(channel_id, [])
-            if not snipes:
-                await ctx.send("There are no edited messages to snipe!", delete_after=5)
-                return
-
-            before, after, author, time = snipes[-1]
-
-            embed = discord.Embed(
-                description=f"**Before:** {before}\n**After:** {after}",
-                color=ctx.author.top_role.color or discord.Color.red(),
-            )
-            embed.set_author(
-                name=f"Message by {author.display_name}",
-                icon_url=self.utils.get_avatar_url(author),
-            )
-            embed.set_footer(text=f"Edited at {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-
-            await ctx.send(embed=embed)
-
-        except Exception as e:
-            logger.error(f"Error in editsnipe command: {e}", exc_info=True)
-            await ctx.send(
-                "An error occurred while retrieving the edited message.", delete_after=5
-            )
-
-    @commands.hybrid_command(name="clearsnipe", aliases=["cs"])
-    @commands.has_permissions(manage_messages=True)
-    @app_commands.default_permissions(manage_messages=True)
-    @unified_cooldown(5)
-    async def clear_snipe(self, ctx: Context) -> None:
-        """Clear snipe history for the current channel."""
-        await ctx.defer(ephemeral=True)
-        guild_id = ctx.guild.id
-        channel_id = ctx.channel.id
-        cleared = False
-
-        if guild_id in self.snipes and channel_id in self.snipes[guild_id]:
-            del self.snipes[guild_id][channel_id]
-            cleared = True
-
-        if guild_id in self.edit_snipes and channel_id in self.edit_snipes[guild_id]:
-            del self.edit_snipes[guild_id][channel_id]
-            cleared = True
-
-        if cleared:
-            await Embeds.success(ctx, "Cleared snipe history for this channel.", reply=True)
-        else:
-            await ctx.send("No snipe history to clear!", delete_after=5)
-
-    @commands.command(
-        name="togglesnipe",
-        help="Enable or disable snipe (deleted/edited message caching) for this server.",
-    )
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def toggle_snipe(self, ctx: commands.Context) -> None:
-        """Toggle snipe on or off for this server. Off by default; opt-in per guild."""
-        guild_id = ctx.guild.id
-        current = await self.bot.database.get_snipe_enabled(guild_id)
-        new_state = not current
-        await self.bot.database.set_snipe_enabled(guild_id, new_state)
-        self.snipe_enabled_cache[guild_id] = (new_state, discord.utils.utcnow())
-        status = "enabled" if new_state else "disabled"
-        await ctx.send(
-            f"Snipe is now **{status}** for this server.\n"
-            + (
-                "Deleted and edited messages will be cached for the snipe commands."
-                if new_state
-                else "Deleted and edited messages will no longer be cached."
-            )
-        )
-
     @commands.command(
         name="cleardms", help="Clear all direct messages from the bot."
     )
@@ -1046,6 +914,69 @@ class General(commands.Cog, name="General"):
             logger.error(f"Error setting prefix: {e}")
 
     @commands.command(
+        name="mp3buttonmode",
+        aliases=["mp3buttons", "mp3mode"],
+        description="Toggle whether mp3 buttons attach the file instead of linking it.",
+    )
+    @commands.guild_only()
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
+    async def mp3_button_mode(self, ctx: Context, state: str = "") -> None:
+        """Attach the mp3 instead of linking it, per server.
+
+        With no option this flips the mode; `on` / `off` set it outright and
+        `status` shows where it stands. When it is on, pressing the mp3 button
+        on a leak / session / stem / freestyle / remaster card downloads the
+        file and drops it into an ephemeral reply.
+        """
+        settings = getattr(self.bot, "dash_settings", None)
+        if settings is None:
+            await Embeds.error(
+                ctx,
+                "The settings store isn't ready yet — try again in a moment.",
+                reply=False,
+                delete_after=None,
+            )
+            return
+
+        wanted = (state or "").strip().lower()
+        current = mp3_buttons.enabled(self.bot, ctx.guild.id)
+
+        if wanted in mp3_buttons.STATUS_VALUES:
+            await Embeds.success(
+                ctx,
+                f"mp3 button mode is currently **{'on' if current else 'off'}** "
+                "in this server.",
+                reply=False,
+                delete_after=None,
+            )
+            return
+
+        if wanted in ("", "toggle", "flip"):
+            enabled = not current
+        elif wanted in mp3_buttons.ON_VALUES:
+            enabled = True
+        elif wanted in mp3_buttons.OFF_VALUES:
+            enabled = False
+        else:
+            await Embeds.error(
+                ctx,
+                f"Usage: `{ctx.prefix}mp3buttonmode [on|off|status]`",
+                reply=False,
+                delete_after=None,
+            )
+            return
+
+        await settings.set_flag(
+            mp3_buttons.MP3_BUTTON_MODE_KEY, enabled, guild_id=ctx.guild.id
+        )
+        note = (
+            "mp3 buttons now download the file and attach it as an ephemeral reply."
+            if enabled
+            else "mp3 buttons are back to linking the file."
+        )
+        await Embeds.success(ctx, note, reply=False, delete_after=None)
+
+    @commands.command(
         name="listbots", description="List all bots in the server."
     )
     async def list_bots(self, ctx: commands.Context) -> None:
@@ -1090,7 +1021,7 @@ class General(commands.Cog, name="General"):
                 else discord.Color.blurple()
             )
         embed = discord.Embed(
-            description=f"Developed and maintained by `mistrusttt`, `chaosokay`, `cqllmetoxicc`, `juicewrldapi`, `yvngxenvy`, `flow`",
+            description="Developed and maintained by `mikk.a`",
             color=color,
         )
         embed.set_author(name="TPNE Bot")
@@ -1311,7 +1242,7 @@ class General(commands.Cog, name="General"):
         await Embeds.success(ctx, f"Cleared name history for {user.display_name}.", delete_after=10, reply=False)
 
     @commands.hybrid_command(
-        name="serverinfo", aliases=["si"], description="View information about the server."
+        name="serverinfo", aliases=["serverinf"], description="View information about the server."
     )
     @unified_cooldown(5)
     async def serverinfo(self, ctx: commands.Context) -> None:
@@ -1503,7 +1434,7 @@ class General(commands.Cog, name="General"):
         else:
             await Embeds.error(ctx, f"{member.display_name} does not have a server-specific avatar. Here's their global avatar: {member.display_avatar.url}", reply=True)
 
-    @commands.hybrid_command(
+    @commands.command(
         name="servericon",
         description="View the icon of the current server."
     )
@@ -1550,39 +1481,390 @@ class General(commands.Cog, name="General"):
             await ctx.reply(embed=embed, view=view)
             logger.warning("Failed to send invite link via DMs, sending in channel")
 
-    @commands.command(
-        name="emojisteal", help="Steal a custom server emoji"
-    )
-    async def steal(self, ctx: commands.Context, emoji: str):
-        """Steal a custom emoji server emoji"""
+    # ------------------------------------------------------------------
+    # Emoji stealing
+    # ------------------------------------------------------------------
+
+    #: Discord's emoji CDN. ``PartialEmoji.url`` uses an animated WebP, which is
+    #: what re-uploads with a white background, so the URL is built directly.
+    EMOJI_CDN = "https://cdn.discordapp.com/emojis"
+
+    #: What one emoji image may weigh. Discord rejects anything larger, and a
+    #: phone screenshot is usually a few MB -- so uploads are shrunk first.
+    MAX_EMOJI_BYTES = 256 * 1024
+
+    #: What is worth downloading before decoding. The image itself is shrunk to
+    #: fit, but pulling a huge upload through the bot's connection is not.
+    MAX_EMOJI_SOURCE_BYTES = 10 * 1024 * 1024
+
+    #: Emoji are displayed at 128px, so anything bigger is wasted bytes.
+    EMOJI_IMAGE_SIZE = 128
+
+    #: Decoding a huge image costs width * height * 4 bytes of RAM before the
+    #: downscale, so very large pictures are refused rather than risked.
+    MAX_EMOJI_PIXELS = 40_000_000
+
+    #: Attachment extensions accepted when the MIME type is missing or wrong.
+    EMOJI_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+    @staticmethod
+    def _is_emoji_image(attachment) -> bool:
+        """Whether an attachment looks like a picture Discord can take."""
+        filename = str(getattr(attachment, "filename", "") or "").lower()
+        content_type = str(getattr(attachment, "content_type", "") or "").lower()
+        return content_type.startswith("image/") or filename.endswith(
+            General.EMOJI_IMAGE_SUFFIXES
+        )
+
+    @classmethod
+    def _emoji_attachment(
+        cls, message: Optional[discord.Message]
+    ) -> Optional[discord.Attachment]:
+        """The first image attachment on ``message``, or ``None``."""
+        for attachment in getattr(message, "attachments", None) or []:
+            if cls._is_emoji_image(attachment):
+                return attachment
+        return None
+
+    @classmethod
+    def _prepare_emoji_image(cls, data: bytes) -> bytes:
+        """Shrink an upload into something Discord accepts as an emoji.
+
+        Static images are re-encoded as an emoji-sized RGBA PNG -- the fix
+        ``_emoji_png`` makes for stolen emojis (no white box behind the
+        transparency), plus the downscale that lets a phone screenshot fit in
+        Discord's 256 KB limit. Animated GIFs are passed through untouched,
+        because resizing every frame changes the timing; one that is already
+        over the limit cannot be shrunk here and is refused.
+
+        Raises ``ValueError`` with a user-facing message for anything that
+        cannot become an emoji.
+        """
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                if getattr(image, "is_animated", False):
+                    if len(data) > cls.MAX_EMOJI_BYTES:
+                        raise ValueError(
+                            "Animated emojis have to be under 256 KB as-is — "
+                            "try a smaller GIF or a still image."
+                        )
+                    return data
+
+                width, height = image.size
+                if width * height > cls.MAX_EMOJI_PIXELS:
+                    raise ValueError(
+                        "That image is too large to turn into an emoji — "
+                        "crop or shrink it first."
+                    )
+
+                # JPEG only: decode straight to a small version instead of
+                # allocating the full-resolution bitmap first.
+                image.draft("RGB", (cls.EMOJI_IMAGE_SIZE * 2,) * 2)
+                frame = image.convert("RGBA")
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError("That attachment doesn't look like an image.") from error
+
+        frame.thumbnail((cls.EMOJI_IMAGE_SIZE, cls.EMOJI_IMAGE_SIZE), Image.LANCZOS)
+        out = io.BytesIO()
+        frame.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+
+    @staticmethod
+    def _sanitize_emoji_name(raw: str) -> Optional[str]:
+        """Turn a free-text reply into a name Discord will accept."""
+        name = re.sub(r"[^A-Za-z0-9_]+", "_", (raw or "").strip()).strip("_")
+        name = name[:32]
+        return name if len(name) >= 2 else None
+
+    @staticmethod
+    def _emoji_png(data: bytes) -> Optional[bytes]:
+        """Re-encode a static emoji as a true RGBA PNG.
+
+        Discord's CDN serves palette PNGs, and some save/re-save paths drop the
+        alpha channel on the way back in -- which is exactly what leaves a white
+        box behind when the emoji is added by hand. Converting to true-colour
+        RGBA keeps the transparency intact.
+        """
+        try:
+            image = Image.open(io.BytesIO(data))
+            if getattr(image, "is_animated", False):
+                return None
+            out = io.BytesIO()
+            image.convert("RGBA").save(out, format="PNG")
+            return out.getvalue()
+        except Exception:
+            logger.debug("Could not re-encode emoji to RGBA PNG", exc_info=True)
+            return None
+
+    async def _download_emoji_asset(
+        self, ctx: commands.Context, emoji: str
+    ) -> Optional[tuple[bytes, str, str]]:
+        """Fetch a custom emoji as ``(bytes, name, extension)``.
+
+        Animated emojis come down as GIF and static ones as PNG, with the PNG
+        forced back to straight RGBA. Returns ``None`` after replying when the
+        emoji is invalid, un-fetchable, or not a custom emoji.
+        """
         try:
             partial_emoji = discord.PartialEmoji.from_str(emoji)
-            if not partial_emoji.is_custom_emoji():
-                return await ctx.reply(
-                    "You provided a standard emoji, which cannot be stolen.",
-                    delete_after=5,
-                )
+        except Exception:
+            partial_emoji = None
 
-            emoji_url = str(partial_emoji.url)
-            emoji_name = partial_emoji.name or "emoji"
-            ext = urlparse(emoji_url).path.rsplit(".", 1)[-1]
-
-            async with self.session.get(emoji_url) as response:
-                if response.status != 200:
-                    return await ctx.reply(
-                        "Failed to download the emoji.", delete_after=5
-                    )
-                data = await response.read()
-
-            buffer = io.BytesIO(data)
-            buffer.seek(0)
-            discord_file = discord.File(fp=buffer, filename=f"{emoji_name}.{ext}")
-            await ctx.reply(file=discord_file)
-        except discord.InvalidArgument:
+        if partial_emoji is None or not partial_emoji.is_custom_emoji():
             await ctx.reply(
-                "Invalid emoji format. Please provide a valid custom emoji.",
+                "You provided a standard emoji, which cannot be stolen.",
                 delete_after=5,
             )
+            return None
+
+        ext = "gif" if partial_emoji.animated else "png"
+        emoji_name = partial_emoji.name or "emoji"
+        emoji_url = f"{self.EMOJI_CDN}/{partial_emoji.id}.{ext}"
+
+        try:
+            async with self.session.get(emoji_url) as response:
+                if response.status != 200:
+                    await ctx.reply(
+                        "Failed to download the emoji.", delete_after=5
+                    )
+                    return None
+                data = await response.read()
+        except aiohttp.ClientError:
+            logger.warning("Failed to download emoji %s", emoji_name, exc_info=True)
+            await ctx.reply("Failed to download the emoji.", delete_after=5)
+            return None
+
+        if not partial_emoji.animated:
+            png = self._emoji_png(data)
+            if png is not None:
+                data = png
+
+        return data, emoji_name, ext
+
+    @commands.command(
+        name="emojisteal",
+        aliases=["stealemoji"],
+        help="Steal a custom server emoji",
+    )
+    async def steal(self, ctx: commands.Context, emoji: str):
+        """Steal a custom server emoji"""
+        asset = await self._download_emoji_asset(ctx, emoji)
+        if asset is None:
+            return
+        data, emoji_name, ext = asset
+        await ctx.reply(
+            file=discord.File(fp=io.BytesIO(data), filename=f"{emoji_name}.{ext}")
+        )
+
+    @commands.command(
+        name="stealaddemoji",
+        aliases=["stealemojiadd"],
+        help="Steal a custom emoji and add it to this server under a name you reply with.",
+    )
+    @commands.guild_only()
+    @commands.has_permissions(manage_emojis_and_stickers=True)
+    @commands.bot_has_permissions(manage_emojis_and_stickers=True)
+    async def steal_add_emoji(self, ctx: commands.Context, emoji: str):
+        """Steal an emoji, then add it to the server under the name you send next."""
+        asset = await self._download_emoji_asset(ctx, emoji)
+        if asset is None:
+            return
+        data, suggested, ext = asset
+
+        prompt = await ctx.reply(
+            "What should I name this emoji? Send the name as your next message in "
+            "this channel (2–32 letters, numbers or underscores).\n"
+            f"-# Original name: `{suggested}`",
+            file=discord.File(fp=io.BytesIO(data), filename=f"{suggested}.{ext}"),
+        )
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.author.id == ctx.author.id
+                and message.channel.id == ctx.channel.id
+            )
+
+        try:
+            name_message = await self.bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await ctx.send(
+                "⌛ Timed out waiting for a name. Run the command again.",
+                delete_after=10,
+            )
+            return
+
+        name = self._sanitize_emoji_name(name_message.content)
+        if name is None:
+            await ctx.send(
+                "❌ That name won't work. Emoji names need 2–32 letters, numbers "
+                "or underscores.",
+                delete_after=10,
+            )
+            return
+
+        # The name is in hand, so the prompt and the reply have done their job.
+        for message in (prompt, name_message):
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        try:
+            created = await ctx.guild.create_custom_emoji(
+                name=name,
+                image=data,
+                reason=f"Emoji stolen by {ctx.author}",
+            )
+        except discord.Forbidden:
+            await ctx.send(
+                "❌ I don't have permission to add emojis to this server.",
+                delete_after=10,
+            )
+            return
+        except discord.HTTPException as exc:
+            await ctx.send(
+                f"❌ Discord rejected that emoji (`{exc.status}`) — the server may "
+                "be out of slots, or animated emojis may need a boost level.",
+                delete_after=10,
+            )
+            return
+
+        await ctx.send(f"✅ Added {created} as `:{created.name}:`.")
+
+    @commands.command(
+        name="createemoji",
+        aliases=["newemoji", "makeemoji"],
+        help="Turn an image into a server emoji. Attach the image and give it a name.",
+    )
+    @commands.guild_only()
+    # Bot admins (`admin allow`) and the application team may add emojis
+    # without holding Manage Expressions themselves; everyone else still needs
+    # it. The bot still needs the permission of its own to upload the image.
+    @commands.check_any(
+        commands.is_owner(),
+        commands.has_permissions(manage_emojis_and_stickers=True),
+    )
+    @commands.bot_has_permissions(manage_emojis_and_stickers=True)
+    async def create_emoji(
+        self,
+        ctx: commands.Context,
+        name: str,
+        image: Optional[discord.Attachment] = None,
+    ) -> None:
+        """Create a server emoji from an attached image.
+
+        Usage: `{PREFIX}createemoji <name>` with the image attached to the same
+        message (or to the message being replied to). The slash version takes
+        the picture as a file: `/createemoji name:<name> image:<file>`.
+        """
+        emoji_name = self._sanitize_emoji_name(name)
+        if emoji_name is None:
+            await ctx.reply(
+                "❌ Emoji names need 2–32 letters, numbers or underscores.",
+                delete_after=10,
+            )
+            return
+
+        # discord.py fills an attachment-typed parameter from the invoking
+        # message, so the picture normally arrives as `image` already. It only
+        # takes the *first* file, though, which may be a video next to the
+        # picture -- so fall back to the message, then to the replied-to one.
+        attachment = image
+        if attachment is None or not self._is_emoji_image(attachment):
+            attachment = self._emoji_attachment(ctx.message) or attachment
+        if attachment is None:
+            reference = getattr(ctx.message, "reference", None)
+            if reference is not None:
+                attachment = self._emoji_attachment(
+                    getattr(reference, "resolved", None)
+                )
+        if attachment is None:
+            await ctx.reply(
+                "❌ Attach the image you want as an emoji — "
+                f"`{ctx.prefix}createemoji {emoji_name}` with the picture on the "
+                "same message, or reply to the picture with that command.",
+                delete_after=15,
+            )
+            return
+
+        size = int(getattr(attachment, "size", 0) or 0)
+        if size > self.MAX_EMOJI_SOURCE_BYTES:
+            await ctx.reply(
+                f"❌ That file is {humanfriendly.format_size(size)} — "
+                f"I can only read images up to "
+                f"{humanfriendly.format_size(self.MAX_EMOJI_SOURCE_BYTES)}.",
+                delete_after=10,
+            )
+            return
+        try:
+            data = await attachment.read()
+        except discord.HTTPException:
+            logger.warning(
+                "Could not download emoji attachment %s",
+                getattr(attachment, "filename", "?"),
+                exc_info=True,
+            )
+            await ctx.reply(
+                "❌ I couldn't download that attachment.", delete_after=10
+            )
+            return
+
+        if not data:
+            await ctx.reply("❌ That image came through empty.", delete_after=10)
+            return
+
+        try:
+            data = self._prepare_emoji_image(data)
+        except ValueError as error:
+            await ctx.reply(f"❌ {error}", delete_after=10)
+            return
+
+        existing = discord.utils.get(ctx.guild.emojis, name=emoji_name)
+        if existing is not None:
+            await ctx.reply(
+                f"❌ This server already has an emoji called `:{emoji_name}:` — "
+                "pick another name.",
+                delete_after=10,
+            )
+            return
+        if len(ctx.guild.emojis) >= ctx.guild.emoji_limit:
+            await ctx.reply(
+                f"❌ This server is out of emoji slots "
+                f"({len(ctx.guild.emojis)}/{ctx.guild.emoji_limit}).",
+                delete_after=10,
+            )
+            return
+
+        try:
+            created = await ctx.guild.create_custom_emoji(
+                name=emoji_name,
+                image=data,
+                reason=f"Emoji created by {ctx.author} ({ctx.author.id})",
+            )
+        except discord.Forbidden:
+            await ctx.reply(
+                "❌ I don't have permission to add emojis to this server.",
+                delete_after=10,
+            )
+            return
+        except discord.HTTPException as error:
+            logger.warning(
+                "Discord rejected emoji %s in guild %s",
+                emoji_name,
+                getattr(ctx.guild, "id", "?"),
+                exc_info=True,
+            )
+            status = f" (`{error.status}`)" if error.status else ""
+            await ctx.reply(
+                f"❌ Discord rejected that image{status} — it may be an "
+                "unsupported format, or animated emojis may need a boost level.",
+                delete_after=10,
+            )
+            return
+
+        await ctx.send(f"✅ Added {created} as `:{created.name}:`.")
 
     @commands.command(
         name="convert", help="Convert currency from one type to another."
@@ -1774,7 +2056,7 @@ class General(commands.Cog, name="General"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}encode {name}`{aliases} — {desc}")
             else:
@@ -2016,7 +2298,7 @@ class General(commands.Cog, name="General"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}decode {name}`{aliases} — {desc}")
             else:
@@ -2516,7 +2798,7 @@ class General(commands.Cog, name="General"):
         embed2 = discord.Embed(description=f"**REMINDER:**\n\n{safe_reminder}")
         await ctx.reply(embed=embed2)
 
-    @commands.hybrid_command(
+    @commands.command(
         name="apod", description="Fetch NASA's Astronomy Picture of the Day."
     )
     @unified_cooldown(30)
@@ -2673,14 +2955,20 @@ class General(commands.Cog, name="General"):
             if msg:
                 quote_text = msg.content
                 author_name = msg.author.display_name
+                handle_name = msg.author.name
                 avatar_user = msg.author
             elif payload:
                 quote_text = payload
                 author_name = ctx.author.display_name
+                handle_name = ctx.author.name
                 avatar_user = ctx.author
             else:
                 await Embeds.error(ctx, "Please provide a message link, ID, reply to a message, or provide some text to quote.", title="Quote", delete_after=5, reply=True)
                 return
+
+            # `<@123>` renders as a meaningless number in an image, so swap
+            # mentions for the names they point at before laying the text out.
+            quote_text = await self._render_mentions(ctx, quote_text or "", msg)
 
             avatar_asset = self.utils.get_avatar_asset(avatar_user)
             avatar_bytes = await avatar_asset.read()
@@ -2887,6 +3175,20 @@ class General(commands.Cog, name="General"):
             )
             y_current += auth_h
 
+            # The account handle sits under the quoted display name, so the
+            # card still identifies someone whose nickname doesn't match.
+            handle_str = f"@{handle_name}"
+            l, t, r, b = draw.textbbox((0, 0), handle_str, font=self.font_handle)
+            w_handle = r - l
+            x_handle = RECT_X + (text_area_w - w_handle) // 2
+            draw.text(
+                (x_handle, y_current),
+                handle_str,
+                font=self.font_handle,
+                fill=(140, 140, 140),
+            )
+            y_current += handle_h
+
             date_str = discord.utils.utcnow().strftime("%d/%m/%Y")
             l, t, r, b = draw.textbbox((0, 0), date_str, font=self.font_date)
             w_date, h_date = r - l, b - t
@@ -2903,6 +3205,55 @@ class General(commands.Cog, name="General"):
         except discord.app_commands.errors.CommandOnCooldown as e:
             retry_after = e.retry_after
             await Embeds.warning(ctx, f"Please wait {retry_after:.1f} seconds before using this command again.", title="Cooldown", delete_after=5, reply=True)
+
+    async def _render_mentions(
+        self,
+        ctx: commands.Context,
+        text: str,
+        message: Optional[discord.Message] = None,
+    ) -> str:
+        """Replace raw mention tokens with the names they point at.
+
+        Quoted text arrives as `<@123>` / `<@&123>` / `<#123>`; drawn into an
+        image those are just numbers, so this yields `@name`, `@role` and
+        `#channel` instead.
+        """
+        if not text or "<" not in text:
+            return text
+
+        guild = getattr(message, "guild", None) or ctx.guild
+        mentioned = {
+            user.id: user for user in (getattr(message, "mentions", None) or [])
+        }
+
+        async def user_name(user_id: int) -> str:
+            member = guild.get_member(user_id) if guild is not None else None
+            if member is not None:
+                return member.display_name
+            user = mentioned.get(user_id) or self.bot.get_user(user_id)
+            if user is None:
+                try:
+                    user = await self.bot.fetch_user(user_id)
+                except discord.HTTPException:
+                    return "user"
+            return getattr(user, "display_name", None) or user.name
+
+        pieces: List[str] = []
+        cursor = 0
+        for match in MENTION_PATTERN.finditer(text):
+            pieces.append(text[cursor : match.start()])
+            user_id, role_id, channel_id = match.groups()
+            if user_id:
+                pieces.append(f"@{await user_name(int(user_id))}")
+            elif role_id:
+                role = guild.get_role(int(role_id)) if guild is not None else None
+                pieces.append(f"@{role.name}" if role is not None else "@role")
+            else:
+                channel = self.bot.get_channel(int(channel_id))
+                pieces.append(f"#{channel.name}" if channel is not None else "#channel")
+            cursor = match.end()
+        pieces.append(text[cursor:])
+        return "".join(pieces)
 
     def wrap_text(
         self,

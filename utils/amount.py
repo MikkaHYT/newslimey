@@ -5,8 +5,8 @@ Provides standardized rounding and validation for currency and crypto amounts.
 All economic values should use these utilities to ensure consistency.
 """
 
-from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, getcontext
-from typing import Tuple
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, getcontext, localcontext
+from typing import Optional, Tuple
 
 # Set decimal context precision high enough for large economic values
 # Default is 28, but we need at least 38 for large supply calculations
@@ -21,9 +21,50 @@ MIN_CURRENCY_AMOUNT = Decimal("0.01")
 MIN_CRYPTO_AMOUNT = Decimal("0.00000001")
 
 
+def _working_precision(amount: Decimal, places: int) -> int:
+    """Digits a context needs to quantize ``amount`` to ``places`` decimals.
+
+    No fixed precision is enough forever: this economy's supply grows without
+    bound, and quantizing a balance to the cent needs one digit per integer
+    digit plus the decimals. Once total supply passed 1e36 the 38-digit global
+    context could no longer hold the result of ``round_currency``, so every
+    wallet write raised ``InvalidOperation`` and gambling stopped. This returns
+    the digits the number actually needs, with head room, and never less than
+    the global precision so ordinary amounts behave exactly as before.
+    """
+    if not amount.is_finite():
+        return getcontext().prec
+    integer_digits = max(amount.adjusted() + 1, 1) if amount else 1
+    return max(getcontext().prec, integer_digits + places + 4)
+
+
 class AmountUtils:
     """Utility class for handling monetary amounts with proper rounding."""
-    
+
+    @staticmethod
+    def quantize(
+        amount: Decimal | int | float | str,
+        exponent: Decimal,
+        rounding: Optional[str] = None,
+    ) -> Decimal:
+        """Quantize to ``exponent`` at whatever precision the value needs.
+
+        ``Decimal.quantize`` raises ``InvalidOperation`` when the result would
+        need more digits than the active context keeps, which is how a supply
+        past 1e36 broke ``round_currency`` and with it every wallet write. The
+        context is widened locally to fit the number, so two (or eight)
+        decimals stay exact at any magnitude. ``rounding=None`` keeps the
+        active context's rounding, matching a bare ``quantize`` call.
+        """
+        if not isinstance(amount, Decimal):
+            amount = Decimal(str(amount))
+        places = max(0, -exponent.as_tuple().exponent)
+        with localcontext() as ctx:
+            ctx.prec = _working_precision(amount, places)
+            if rounding is None:
+                return amount.quantize(exponent)
+            return amount.quantize(exponent, rounding=rounding)
+
     @staticmethod
     def round_currency(amount: Decimal) -> Decimal:
         """
@@ -38,7 +79,7 @@ class AmountUtils:
         Returns:
             Amount rounded to 2 decimal places
         """
-        return amount.quantize(CURRENCY_PRECISION, rounding=ROUND_HALF_UP)
+        return AmountUtils.quantize(amount, CURRENCY_PRECISION, rounding=ROUND_HALF_UP)
     
     @staticmethod
     def truncate_currency(amount: Decimal) -> Decimal:
@@ -54,7 +95,7 @@ class AmountUtils:
         Returns:
             Amount truncated to 2 decimal places
         """
-        return amount.quantize(CURRENCY_PRECISION, rounding=ROUND_DOWN)
+        return AmountUtils.quantize(amount, CURRENCY_PRECISION, rounding=ROUND_DOWN)
     
     @staticmethod
     def round_crypto(amount: Decimal) -> Decimal:
@@ -69,7 +110,7 @@ class AmountUtils:
         Returns:
             Amount rounded to 8 decimal places
         """
-        return amount.quantize(CRYPTO_PRECISION, rounding=ROUND_HALF_UP)
+        return AmountUtils.quantize(amount, CRYPTO_PRECISION, rounding=ROUND_HALF_UP)
     
     @staticmethod
     def truncate_crypto(amount: Decimal) -> Decimal:
@@ -84,7 +125,7 @@ class AmountUtils:
         Returns:
             Amount truncated to 8 decimal places
         """
-        return amount.quantize(CRYPTO_PRECISION, rounding=ROUND_DOWN)
+        return AmountUtils.quantize(amount, CRYPTO_PRECISION, rounding=ROUND_DOWN)
     
     @staticmethod
     def validate_currency_minimum(amount: Decimal) -> Tuple[bool, str]:

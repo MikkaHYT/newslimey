@@ -31,9 +31,26 @@ from datetime import timedelta, date
 import discord
 import uuid
 import logging
-from decimal import Decimal, ROUND_HALF_UP
+from utils.amount import AmountUtils
 
 logger = logging.getLogger("discord.client")
+
+# ---------------------------------------------------------------------------
+# Dynamic shop pricing
+# ---------------------------------------------------------------------------
+# Shop pricing is fixed: every item has one catalogue price, in the millions,
+# and every member pays exactly that. The price is set by the item's own
+# standing in the catalogue - rarer and more useful items cost more than the
+# common ones - not by who is buying it, so a whale and a newcomer see the same
+# figure and the shop cannot be priced off a balance that moves underneath it.
+# The catalogue in ``seed_default_shop_items`` is the single source of those
+# numbers, and seeding puts a row back on them if it has drifted.
+
+#: SQLite keeps the money columns as floats, so at 1e32 a cent-exact comparison
+#: is meaningless. A purchase lands the wallet a hair above the price (a
+#: billionth of it, or a cent for ordinary amounts) so the spend's own guard
+#: cannot fail on storage drift alone.
+SHOP_SETTLE_CUSHION = Decimal("1e-9")
 
 
 class InventoryMixin(BaseManager):
@@ -43,7 +60,7 @@ class InventoryMixin(BaseManager):
         """Add a new crypto asset or update existing one for a user."""
 
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         try:
             async with self.async_sessionmaker() as session:
                 async with session.begin():
@@ -99,7 +116,7 @@ class InventoryMixin(BaseManager):
     async def get_crypto_assets(self, user_id: int) -> List[CryptoAsset]:
         """Get all crypto assets for a user."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(CryptoAsset).where(CryptoAsset.user_id == user_id)
@@ -109,7 +126,7 @@ class InventoryMixin(BaseManager):
     async def get_crypto_asset(self, user_id: int, symbol: str) -> CryptoAsset:
         """Get specific crypto asset for a user."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(CryptoAsset).where(
@@ -121,7 +138,7 @@ class InventoryMixin(BaseManager):
     async def update_crypto_amount(self, user_id: int, symbol: str, amount: Decimal):
         """Update amount of a crypto asset."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -157,10 +174,10 @@ class InventoryMixin(BaseManager):
 
         await self.ensure_user_identity(sender_user_id)
         await self.ensure_user_identity(receiver_user_id)
-        sender_user_id = self.hash_user_id(sender_user_id)
-        receiver_user_id = self.hash_user_id(receiver_user_id)
+        sender_user_id = self.econ_hash_user_id(sender_user_id)
+        receiver_user_id = self.econ_hash_user_id(receiver_user_id)
         symbol = symbol.upper()
-        amount = amount.quantize(Decimal("0.00000000"), ROUND_HALF_UP)
+        amount = AmountUtils.round_crypto(amount)
 
         if amount <= 0:
             raise ValueError("Transfer amount must be positive.")
@@ -222,7 +239,7 @@ class InventoryMixin(BaseManager):
     async def delete_crypto_asset(self, user_id: int, symbol: str):
         """Delete a crypto asset entry."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 await session.execute(
@@ -236,7 +253,7 @@ class InventoryMixin(BaseManager):
     async def get_total_crypto_value(self, user_id: int) -> Decimal:
         """Get total value of all crypto assets at purchase price."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(func.sum(CryptoAsset.amount * CryptoAsset.purchase_price)).where(
@@ -334,7 +351,7 @@ class InventoryMixin(BaseManager):
             List of Item objects in the user's inventory
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(select(Item).where(Item.user_id == user_id))
             return result.scalars().all()
@@ -342,7 +359,7 @@ class InventoryMixin(BaseManager):
     async def get_user_inventory_grouped(self, user_id: int) -> List[dict]:
         """Return inventory items grouped by name with aggregated quantity."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(
@@ -392,7 +409,7 @@ class InventoryMixin(BaseManager):
             Item object if found, None otherwise
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(Item).where(Item.user_id == user_id, Item.id == item_id)
@@ -411,7 +428,7 @@ class InventoryMixin(BaseManager):
             List of matching Item objects
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(Item).where(Item.user_id == user_id, Item.name == item_name)
@@ -432,7 +449,7 @@ class InventoryMixin(BaseManager):
             List of matching Item objects
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(Item).where(Item.user_id == user_id, Item.item_type == item_type)
@@ -446,8 +463,8 @@ class InventoryMixin(BaseManager):
 
         await self.ensure_user_identity(from_user_id)
         await self.ensure_user_identity(to_user_id)
-        from_user_id = self.hash_user_id(from_user_id)
-        to_user_id = self.hash_user_id(to_user_id)
+        from_user_id = self.econ_hash_user_id(from_user_id)
+        to_user_id = self.econ_hash_user_id(to_user_id)
 
         if quantity <= 0:
             raise ValueError("Transfer quantity must be positive")
@@ -512,7 +529,7 @@ class InventoryMixin(BaseManager):
             True if update succeeded, False otherwise
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -559,7 +576,7 @@ class InventoryMixin(BaseManager):
             True if removal succeeded, False otherwise
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -628,7 +645,7 @@ class InventoryMixin(BaseManager):
         """
 
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             serial_number = await self.generate_item_serial_number()
             item = Item(
@@ -699,6 +716,35 @@ class InventoryMixin(BaseManager):
             max_uses=max_uses,
         )
 
+    async def admin_remove_item(
+        self, user_id: int, name: str, quantity: int = 1
+    ) -> int:
+        """Owner-only: take items out of a member's inventory by name.
+
+        Removes up to ``quantity`` copies, deleting rows that hit zero and
+        decrementing the rest. Returns how many were actually removed.
+        """
+        if quantity <= 0:
+            return 0
+        user_id = self.econ_hash_user_id(user_id)
+        removed = 0
+        async with self.async_sessionmaker() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(Item).where(Item.user_id == user_id, Item.name == name)
+                )
+                for item in result.scalars().all():
+                    if removed >= quantity:
+                        break
+                    take = min(item.quantity or 1, quantity - removed)
+                    removed += take
+                    if (item.quantity or 1) - take <= 0:
+                        await session.delete(item)
+                    else:
+                        item.quantity = (item.quantity or 1) - take
+            await session.commit()
+        return removed
+
     async def merge_duplicate_items(self, user_id: int) -> int:
         """
         Consolidate duplicate items in a user's inventory.
@@ -711,7 +757,7 @@ class InventoryMixin(BaseManager):
             Number of items merged
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -847,23 +893,90 @@ class InventoryMixin(BaseManager):
             )
             return result.scalar_one_or_none()
 
+    # ---- shop pricing -------------------------------------------------
+    @staticmethod
+    def _shop_round(value: Decimal) -> Decimal:
+        """Round a price to the cent, even past the default decimal context.
+
+        Balances here run past 1e36, and ``quantize`` to two places needs more
+        digits than the global context keeps, so this goes through the shared
+        helper that widens the context to fit the number instead of raising
+        InvalidOperation on a large price.
+        """
+        return AmountUtils.round_currency(Decimal(value))
+
+    def shop_price(self, shop_item) -> Decimal:
+        """What ``shop_item`` costs: its own catalogue price, for everyone.
+
+        One fixed figure per item rather than a share of the buyer's balance, so
+        the cheaper items stay cheap next to the rarer ones instead of every
+        price chasing whoever is looking at it.
+        """
+        return self._shop_round(Decimal(str(getattr(shop_item, "price", 0) or 0)))
+
+    async def get_spendable_balance(self, user_id: int) -> Decimal:
+        """Wallet + bank for a member: what they can pay with right now."""
+        wallet = await self.get_wallet_by_user_id(user_id)
+        return Decimal(str(wallet.balance or 0)) + Decimal(str(wallet.bank_balance or 0))
+
+    async def get_shop_price(self, shop_item) -> Decimal:
+        """The price of ``shop_item``, for the embed and the buy buttons."""
+        return self.shop_price(shop_item)
+
     async def purchase_shop_item(
         self, user_id: int, shop_item_id: int, quantity: int = 1
     ) -> dict:
         """
         Purchase a shop item by:
           - Verifying available stock and daily purchase limits.
-          - Checking if the buyer’s wallet has enough funds.
+          - Checking that the buyer’s wallet + bank covers the price.
+          - Drawing whatever the wallet is short of out of the bank.
           - Deducting the total cost from the user’s wallet.
           - Reducing the shop’s stock.
           - Adding the purchased item to the user’s inventory.
           - Recording the purchase for daily limit tracking.
-        Returns a dict containing purchase details.
+
+        The price charged is the item's own catalogue price (see
+        ``shop_price``), worked out before the session opens so the top-up from
+        the bank cannot nest a write inside the purchase transaction (which
+        SQLite would lock). Returns a dict containing purchase details.
         """
 
         raw_user_id = user_id
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
+
+        # The price is fixed per item, but it can still be paid out of wallet or
+        # bank, so the top-up has to happen before the purchase session opens:
+        # that session then holds reads while ``process_treasury_transaction``
+        # spends from another connection, which a write held open here would
+        # deadlock.
+        quoted_item = await self.get_shop_item_by_id(shop_item_id)
+        if quoted_item is None:
+            raise ValueError("Shop item not found.")
+        if quantity <= 0:
+            raise ValueError("Quantity must be positive.")
+        spendable = await self.get_spendable_balance(raw_user_id)
+        total_cost = self._shop_round(self.shop_price(quoted_item) * quantity)
+        wallet_id = await self.get_wallet_id_for_user(raw_user_id)
+        wallet_balance = self._shop_round(
+            Decimal(str(await self.get_wallet_balance(wallet_id)))
+        )
+        cushion = max(
+            Decimal("0.01"),
+            self._shop_round(total_cost * SHOP_SETTLE_CUSHION),
+        )
+        if wallet_balance < total_cost + cushion:
+            if spendable < total_cost:
+                raise ValueError("Insufficient funds.")
+            top_up = self._shop_round(total_cost + cushion - wallet_balance)
+            if top_up > 0:
+                await self.withdraw_from_bank(
+                    wallet_id,
+                    top_up,
+                    f"Shop purchase — {top_up} moved from bank",
+                )
+
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -883,8 +996,6 @@ class InventoryMixin(BaseManager):
                 )
                 if not limit_check["allowed"]:
                     raise ValueError(limit_check["reason"])
-
-                total_cost = Decimal(str(shop_item.price * quantity))
 
                 wallet_id = await self.get_wallet_id_for_user(raw_user_id)
                 wallet = await session.get(Wallet, wallet_id)
@@ -956,7 +1067,7 @@ class InventoryMixin(BaseManager):
 
         raw_user_id = user_id
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -1003,7 +1114,7 @@ class InventoryMixin(BaseManager):
         """Set a cooldown for a user on a specific item."""
 
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         expiry = discord.utils.utcnow() + timedelta(seconds=cooldown_seconds)
 
         async with self.async_sessionmaker() as session:
@@ -1028,7 +1139,7 @@ class InventoryMixin(BaseManager):
         Returns 0 if no cooldown or if expired.
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             stmt = select(ItemCooldown).where(
                 ItemCooldown.user_id == user_id, ItemCooldown.item_name == item_name
@@ -1049,14 +1160,14 @@ class InventoryMixin(BaseManager):
         """Check if an item is on cooldown for a user."""
 
         raw_user_id = user_id
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         remaining = await self.get_item_cooldown(raw_user_id, item_name)
         return remaining > 0
 
     async def clear_item_cooldown(self, user_id: int, item_name: str) -> bool:
         """Clear a cooldown for a user's item. Returns True if cooldown was cleared."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 stmt = select(ItemCooldown).where(
@@ -1080,7 +1191,7 @@ class InventoryMixin(BaseManager):
         """Create a timed effect for a user."""
 
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 expires_at = discord.utils.utcnow() + timedelta(
@@ -1100,7 +1211,7 @@ class InventoryMixin(BaseManager):
     async def get_user_active_effects(self, user_id: int) -> List[ActiveEffect]:
         """Get all non-expired effects for a user."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             now = discord.utils.utcnow()
             stmt = (
@@ -1116,7 +1227,7 @@ class InventoryMixin(BaseManager):
     ) -> List[ActiveEffect]:
         """Get all non-expired effects of a specific type for a user."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             now = discord.utils.utcnow()
             stmt = (
@@ -1155,7 +1266,7 @@ class InventoryMixin(BaseManager):
         """
 
         raw_user_id = user_id
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         effects = await self.get_active_effects_by_type(raw_user_id, effect_type)
         if not effects:
             return Decimal("1.0")
@@ -1217,8 +1328,8 @@ class InventoryMixin(BaseManager):
 
         await self.ensure_user_identity(from_user_id)
         await self.ensure_user_identity(to_user_id)
-        from_user_id = self.hash_user_id(from_user_id)
-        to_user_id = self.hash_user_id(to_user_id)
+        from_user_id = self.econ_hash_user_id(from_user_id)
+        to_user_id = self.econ_hash_user_id(to_user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 # Verify ownership
@@ -1323,7 +1434,7 @@ class InventoryMixin(BaseManager):
     async def get_pending_trades(self, user_id: int) -> List[TradeLog]:
         """Get all pending trades where the user is either sender or recipient."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             stmt = (
                 select(TradeLog)
@@ -1347,7 +1458,7 @@ class InventoryMixin(BaseManager):
     async def get_pending_trades_for_user(self, user_id: int) -> List[TradeLog]:
         """Get all pending trades where the user is the recipient."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             stmt = (
                 select(TradeLog)
@@ -1371,7 +1482,7 @@ class InventoryMixin(BaseManager):
 
         raw_user_id = user_id
         await self.ensure_user_identity(user_id)
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -1493,8 +1604,8 @@ class InventoryMixin(BaseManager):
         raw_target_id = target_id
         await self.ensure_user_identity(issuer_id)
         await self.ensure_user_identity(target_id)
-        issuer_id = self.hash_user_id(issuer_id)
-        target_id = self.hash_user_id(target_id)
+        issuer_id = self.econ_hash_user_id(issuer_id)
+        target_id = self.econ_hash_user_id(target_id)
         # Check economic circuit breaker before processing
         circuit_breaker = await self.check_economic_circuit_breaker()
         if circuit_breaker["triggered"]:
@@ -1540,7 +1651,7 @@ class InventoryMixin(BaseManager):
         Does NOT assume uniqueness—just looks for ANY active row.
         """
 
-        target_id = self.hash_user_id(target_id)
+        target_id = self.econ_hash_user_id(target_id)
         async with self.async_sessionmaker() as session:
             stmt = select(
                 exists().where(Bounty.target_id == target_id, Bounty.active == True)
@@ -1554,7 +1665,7 @@ class InventoryMixin(BaseManager):
         If there are none, returns Decimal('0').
         """
 
-        target_id = self.hash_user_id(target_id)
+        target_id = self.econ_hash_user_id(target_id)
         async with self.async_sessionmaker() as session:
             stmt = select(func.sum(Bounty.reward).label("total_reward")).where(
                 Bounty.target_id == target_id, Bounty.active == True
@@ -1571,7 +1682,10 @@ class InventoryMixin(BaseManager):
         async with self.async_sessionmaker() as session:
             stmt = (
                 select(Bounty.target_id, func.sum(Bounty.reward).label("total_reward"))
-                .where(Bounty.active == True)
+                .where(
+                    Bounty.active == True,
+                    self._scope_filter(Bounty.target_id),
+                )
                 .group_by(Bounty.target_id)
                 .order_by(func.sum(Bounty.reward).desc())
                 .limit(limit)
@@ -1587,7 +1701,12 @@ class InventoryMixin(BaseManager):
     async def get_active_bounties(self) -> List[Bounty]:
         """Get all active bounties."""
         async with self.async_sessionmaker() as session:
-            result = await session.execute(select(Bounty).where(Bounty.active == True))
+            result = await session.execute(
+                select(Bounty).where(
+                    Bounty.active == True,
+                    self._scope_filter(Bounty.target_id),
+                )
+            )
             return result.scalars().all()
 
     async def claim_bounty(self, claimer_id: int, target_id: int) -> Bounty:
@@ -1600,8 +1719,8 @@ class InventoryMixin(BaseManager):
         raw_target_id = target_id
         await self.ensure_user_identity(claimer_id)
         await self.ensure_user_identity(target_id)
-        claimer_id = self.hash_user_id(claimer_id)
-        target_id = self.hash_user_id(target_id)
+        claimer_id = self.econ_hash_user_id(claimer_id)
+        target_id = self.econ_hash_user_id(target_id)
         # Check economic circuit breaker before processing
         circuit_breaker = await self.check_economic_circuit_breaker()
         if circuit_breaker["triggered"]:
@@ -1645,7 +1764,7 @@ class InventoryMixin(BaseManager):
     ) -> int:
         """Return how many of a shop item a user has bought on a given date."""
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         if purchase_date is None:
             purchase_date = discord.utils.utcnow().date()
         async with self.async_sessionmaker() as session:
@@ -1672,6 +1791,7 @@ class InventoryMixin(BaseManager):
             ).where(
                 ShopPurchaseLog.shop_item_id == shop_item_id,
                 ShopPurchaseLog.purchase_date == purchase_date,
+                self._scope_filter(ShopPurchaseLog.user_id),
             )
             result = await session.execute(stmt)
             return int(result.scalar_one())
@@ -1734,7 +1854,7 @@ class InventoryMixin(BaseManager):
         Returns the consumed item (or None if no matching item was available).
         """
 
-        user_id = self.hash_user_id(user_id)
+        user_id = self.econ_hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
                 result = await session.execute(
@@ -1813,7 +1933,7 @@ class InventoryMixin(BaseManager):
         raw_target_id = target_user_id
         await self.ensure_user_identity(user_id)
         await self.ensure_user_identity(target_user_id)
-        user_id_h = self.hash_user_id(user_id)
+        user_id_h = self.econ_hash_user_id(user_id)
 
         async with self.async_sessionmaker() as session:
             async with session.begin():
@@ -1993,16 +2113,25 @@ class InventoryMixin(BaseManager):
     async def seed_default_shop_items(self) -> dict:
         """
         Seed the shop with the default Dank Memer-style mixed-scarcity catalog.
-        Only creates items that do not already exist by name.
+
+        Creates the items that do not exist yet, and puts the price of the ones
+        that do back onto the catalogue figure below - that list is the shop's
+        pricing, so a row left on an older price (or edited by hand) is brought
+        back onto it instead of drifting away from the rest of the shelf.
+
         Returns a summary dict with counts.
         """
 
+        # Prices are fixed and in the millions, ascending with how good the item
+        # is: the common consumables sit around 1-4 million, the uncommon
+        # defensive and offensive items 6-8 million, the rares 12-15 million,
+        # and the legendary collectible dwarfs the lot.
         catalog = [
             # Defensive
             {
                 "name": "Padlock",
                 "description": "Protects your wallet from one robbery attempt.",
-                "price": 12500,
+                "price": 1500000,
                 "quantity": 50,
                 "item_type": ItemType.DEFENSIVE,
                 "category": ItemCategory.DEFENSIVE,
@@ -2014,7 +2143,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Anti-Rob Aura",
                 "description": "Timed aura that blocks all wallet robberies.",
-                "price": 75000,
+                "price": 8000000,
                 "quantity": 30,
                 "item_type": ItemType.DEFENSIVE,
                 "category": ItemCategory.DEFENSIVE,
@@ -2028,7 +2157,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Bank Insurance",
                 "description": "Timed aura that blocks all bank robberies.",
-                "price": 125000,
+                "price": 15000000,
                 "quantity": 20,
                 "item_type": ItemType.DEFENSIVE,
                 "category": ItemCategory.DEFENSIVE,
@@ -2043,7 +2172,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Handcuffs",
                 "description": "Handcuff a user, reducing their robbery payouts for 30m.",
-                "price": 50000,
+                "price": 6000000,
                 "quantity": 30,
                 "item_type": ItemType.OFFENSIVE,
                 "category": ItemCategory.OFFENSIVE,
@@ -2058,7 +2187,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Cursed Coin",
                 "description": "Hex a user so their earnings are reduced for 1h.",
-                "price": 100000,
+                "price": 12000000,
                 "quantity": 20,
                 "item_type": ItemType.OFFENSIVE,
                 "category": ItemCategory.OFFENSIVE,
@@ -2074,7 +2203,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Lucky Clover",
                 "description": "Boosts your luck for 1h.",
-                "price": 25000,
+                "price": 3000000,
                 "quantity": 50,
                 "item_type": ItemType.CONSUMABLE,
                 "category": ItemCategory.UTILITY,
@@ -2088,7 +2217,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Money Multiplier",
                 "description": "Increases gambling payouts for 1h.",
-                "price": 37500,
+                "price": 4000000,
                 "quantity": 40,
                 "item_type": ItemType.CONSUMABLE,
                 "category": ItemCategory.UTILITY,
@@ -2102,7 +2231,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Energy Drink",
                 "description": "Reduces command cooldowns for 30m.",
-                "price": 20000,
+                "price": 2000000,
                 "quantity": 50,
                 "item_type": ItemType.CONSUMABLE,
                 "category": ItemCategory.UTILITY,
@@ -2117,7 +2246,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Instant Cash Crate",
                 "description": "Redeem for an instant currency grant.",
-                "price": 5000,
+                "price": 1000000,
                 "quantity": 50,
                 "item_type": ItemType.REDEEMABLE,
                 "category": ItemCategory.REDEEMABLE,
@@ -2131,7 +2260,7 @@ class InventoryMixin(BaseManager):
             {
                 "name": "Golden Pepe",
                 "description": "A rare cosmetic collectible.",
-                "price": 2500000,
+                "price": 50000000,
                 "quantity": 50,
                 "item_type": ItemType.COLLECTIBLE,
                 "category": ItemCategory.COLLECTIBLE,
@@ -2141,14 +2270,24 @@ class InventoryMixin(BaseManager):
             },
         ]
 
+        # The shop is a catalogue, not a limited run: every default item is
+        # stocked without limit so the view never shows a "49 left" counter.
+        for entry in catalog:
+            entry["unlimited"] = True
+
         created = 0
+        repriced = 0
         skipped = 0
         async with self.async_sessionmaker() as session:
             for data in catalog:
                 result = await session.execute(
                     select(ShopItem).where(ShopItem.name == data["name"])
                 )
-                if result.scalar_one_or_none():
+                existing = result.scalar_one_or_none()
+                if existing is not None:
+                    if existing.price != data["price"]:
+                        existing.price = data["price"]
+                        repriced += 1
                     skipped += 1
                     continue
 
@@ -2157,4 +2296,15 @@ class InventoryMixin(BaseManager):
                 created += 1
             await session.commit()
 
-        return {"created": created, "skipped": skipped, "total": len(catalog)}
+        if created or repriced:
+            logging.info(
+                "[Shop] Catalog seeded: %d created, %d priced onto the catalogue",
+                created,
+                repriced,
+            )
+        return {
+            "created": created,
+            "repriced": repriced,
+            "skipped": skipped,
+            "total": len(catalog),
+        }

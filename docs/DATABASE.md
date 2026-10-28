@@ -31,6 +31,7 @@ Overview of key SQLAlchemy models defined in `database/models.py`.
 - Bounty: User posted rewards for target actions.
 - Block: Ledger block including index, previous hash, transactions JSON.
 - Supply: Aggregate supply counters (total, circulating, treasury).
+- CharityFund: Per-scope donated currency plus its claim rules (threshold, min/max claim, cooldown).
 - CryptoAsset / CryptoPrice: Basic portfolio and price tracking.
 
 ## Gameplay and Fairness

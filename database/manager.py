@@ -61,6 +61,7 @@ from .models import (
     LockdownChannel,
     Juul,
     UserAlt,
+    StickyMessage,
     OwnerAuditLog,
     Job,
     VIPTier,

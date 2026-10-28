@@ -8,6 +8,8 @@ import logging
 from typing import Optional
 from discord.ext import commands, tasks
 from discord.ext.commands import Context
+
+from utils.core.prefixes import render
 from urllib.parse import urlparse
 from utils.misc import MiscUtils
 from utils.cooldown import unified_cooldown
@@ -558,7 +560,7 @@ class Voicechat(commands.Cog):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}vc {name}`{aliases} — {desc}")
             else:

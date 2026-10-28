@@ -1,5 +1,7 @@
 import re
 import json
+import math
+import random
 import discord
 import logging
 import asyncio
@@ -8,10 +10,11 @@ import secrets
 import hashlib
 from itertools import combinations
 from collections import Counter
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, InvalidOperation
 from discord import ui, ButtonStyle, Interaction
 from discord.ui import View, Button
 from discord.ext import commands
+from utils.core.prefixes import render
 from discord.ext.commands import Context
 from utils.misc import MiscUtils
 from utils.amount import AmountUtils
@@ -42,6 +45,279 @@ from textwrap import shorten
 logger = logging.getLogger("discord.client")
 
 
+# ---------------------------------------------------------------------------
+# Wheel / Plinko / Baccarat table rules
+# ---------------------------------------------------------------------------
+#: ``(multiplier, weight)`` for the wheel. The weights are tuned to a 0.95
+#: expected return, and ``x25`` comes up roughly once in 637 spins.
+WHEEL_SEGMENTS: tuple[tuple[float, float], ...] = (
+    (0.0, 30.0),
+    (0.5, 24.0),
+    (1.0, 16.0),
+    (1.5, 12.0),
+    (2.0, 7.0),
+    (3.0, 4.0),
+    (5.0, 1.8),
+    (10.0, 0.6),
+    (25.0, 0.15),
+)
+WHEEL_TOTAL_WEIGHT = sum(weight for _, weight in WHEEL_SEGMENTS)
+
+#: ``risk -> exponent``. Lower flattens the plinko paytable (safer), higher
+#: stretches it (the edge slots pay more, the fat middle pays less). Every
+#: risk returns the same ``PLINKO_EDGE``.
+PLINKO_RISK: dict[str, float] = {"low": 0.30, "medium": 0.55, "high": 0.85}
+PLINKO_EDGE = 0.95
+PLINKO_ROWS = 12
+
+#: Baccarat returns per unit staked (stake included). Deliberately tuned so the
+#: three bets sit within a couple of percent of each other.
+BACCARAT_PAYOUTS: dict[str, float] = {"player": 2.05, "banker": 2.0, "tie": 9.5}
+
+
+# ---------------------------------------------------------------------------
+# Limbo / Dragon Tower / Chicken (Stake-style originals, local RNG)
+# ---------------------------------------------------------------------------
+#: These three games resolve with the bot's local RNG rather than FairGate, so
+#: they are not provably fair. Each is tuned to a 99% return, matching the
+#: Stake originals they are modelled on.
+LOCAL_RTP = Decimal("0.99")
+
+#: Limbo: the player names a target multiplier and one uniform draw decides it.
+#: ``result = RTP / (1 - r)`` gives ``P(result >= target) = RTP / target``, so
+#: the expected return is a flat ``RTP`` whichever target is picked.
+LIMBO_MIN_TARGET = Decimal("1.01")
+LIMBO_MAX_TARGET = Decimal("1000000")
+LIMBO_DRAW_POOL = 1_000_000
+
+#: Dragon Tower: climb ``TOWER_ROWS`` rows, picking one tile per row. A row has
+#: ``tiles`` tiles of which ``dragons`` are fatal.
+TOWER_ROWS = 9
+TOWER_DIFFICULTIES: dict[str, dict[str, int]] = {
+    "easy": {"tiles": 4, "dragons": 1},     # 75% safe per row
+    "medium": {"tiles": 3, "dragons": 1},   # 66.7% safe
+    "hard": {"tiles": 2, "dragons": 1},     # 50% safe
+    "expert": {"tiles": 3, "dragons": 2},   # 33.3% safe
+    "master": {"tiles": 4, "dragons": 3},   # 25% safe
+}
+
+#: Chicken: cross ``CHICKEN_LANES`` lanes, each survived with ``safe_prob``.
+CHICKEN_LANES = 9
+CHICKEN_DIFFICULTIES: dict[str, float] = {
+    "easy": 0.95,
+    "medium": 0.90,
+    "hard": 0.85,
+    "daredevil": 0.75,
+}
+
+
+def _climb_multiplier(step: int, safe_prob: float) -> Decimal:
+    """Fair multiplier after ``step`` survived rounds at ``safe_prob`` each.
+
+    ``RTP / p**step`` holds the expected return at ``RTP`` however far the
+    player climbs. Truncated (never rounded up) so the house edge is exact.
+    """
+    if step <= 0:
+        return Decimal("1.00")
+    value = LOCAL_RTP / (Decimal(str(safe_prob)) ** step)
+    return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def tower_multipliers(tiles: int, dragons: int) -> list[Decimal]:
+    """Multiplier ladder for a Dragon Tower difficulty (index = rows climbed)."""
+    safe_prob = (tiles - dragons) / tiles
+    return [_climb_multiplier(step, safe_prob) for step in range(TOWER_ROWS + 1)]
+
+
+def chicken_multipliers(safe_prob: float) -> list[Decimal]:
+    """Multiplier ladder for a Chicken difficulty (index = lanes crossed)."""
+    return [_climb_multiplier(step, safe_prob) for step in range(CHICKEN_LANES + 1)]
+
+
+def plinko_paytable(rows: int, risk: float, edge: float = PLINKO_EDGE) -> tuple[float, ...]:
+    """A paytable whose expected value is ``edge``, shaped by ``risk``.
+
+    Slot ``k`` comes up ``C(rows, k) / 2 ** rows`` of the time; every slot pays
+    ``c * (1 / P(k)) ** risk``, and ``c`` is solved so the mean return is
+    ``edge`` whichever risk the player picks.
+    """
+    weights = [math.comb(rows, k) for k in range(rows + 1)]
+    total = float(sum(weights))
+    shaped = [(total / weight) ** risk for weight in weights]
+    expected = sum((weight / total) * value for weight, value in zip(weights, shaped))
+    scale = edge / expected
+    return tuple(round(value * scale, 2) for value in shaped)
+
+
+PLINKO_PAYTABLES: dict[str, tuple[float, ...]] = {
+    name: plinko_paytable(PLINKO_ROWS, risk) for name, risk in PLINKO_RISK.items()
+}
+
+#: Width of one plinko cell in the rendered board, in monospace characters.
+#: Even, so each row can be centred with an integer space offset.
+PLINKO_CELL = 6
+#: Ball / peg glyphs. Both are single-column so the pyramid stays aligned.
+PLINKO_BALL = "  ●   "
+PLINKO_PEG = "  ·   "
+
+
+def plinko_board(
+    rows: int,
+    steps: list[bool],
+    ball_row: int,
+    paytable: tuple[float, ...],
+    landed: int | None = None,
+) -> str:
+    """Render the plinko pyramid as a monospace code block.
+
+    ``steps`` is the recorded left/right path (``True`` = right); the ball is
+    drawn on ``ball_row`` and is parked in the hole once it is ``rows``.
+    ``landed`` highlights the slot the ball finished in.
+    """
+    position = 0
+    ball_positions = [0]
+    for step in steps:
+        if step:
+            position += 1
+        ball_positions.append(position)
+
+    cell = PLINKO_CELL
+    indent = cell // 2
+    lines: list[str] = []
+    for row in range(rows):
+        index = ball_positions[row] if ball_row == row else None
+        line = " " * ((rows - row) * indent)
+        line += "".join(
+            PLINKO_BALL if index == col else PLINKO_PEG
+            for col in range(row + 1)
+        )
+        lines.append(line.rstrip())
+
+    slot_index = ball_positions[rows]
+    slots: list[str] = []
+    for col in range(rows + 1):
+        if ball_row >= rows and col == slot_index:
+            slots.append(PLINKO_BALL)
+        else:
+            slots.append(f"{paytable[col]:.3g}".center(cell))
+    lines.append("".join(slots))
+
+    if landed is not None:
+        lines.append(" " * (slot_index * cell + 2) + "^")
+
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def wheel_segment(roll: int, pool: int = 10000) -> float:
+    """Pick a wheel multiplier from a uniform ``roll`` in ``[0, pool)``."""
+    target = (roll / pool) * WHEEL_TOTAL_WEIGHT
+    upto = 0.0
+    for value, weight in WHEEL_SEGMENTS:
+        upto += weight
+        if target < upto:
+            return value
+    return WHEEL_SEGMENTS[-1][0]
+
+
+def baccarat_card_value(rank: str) -> int:
+    """Face value for the baccarat draw: A=1, J/Q/K=11/12/13, 10=10."""
+    if rank == "A":
+        return 1
+    if rank == "J":
+        return 11
+    if rank == "Q":
+        return 12
+    if rank == "K":
+        return 13
+    return int(rank)
+
+
+def baccarat_face(value: int) -> str:
+    return {1: "A", 11: "J", 12: "Q", 13: "K"}.get(value, str(value))
+
+
+def baccarat_hand_value(hand: list[int]) -> int:
+    """Baccarat total: every card counts as its value modulo ten."""
+    return sum(card if card < 10 else 0 for card in hand) % 10
+
+
+def baccarat_round(draw) -> dict[str, object]:
+    """One standard coup, third-card rules included.
+
+    ``draw`` returns the next card value (1-13) from the deck FairGate dealt.
+    """
+    player = [draw(), draw()]
+    banker = [draw(), draw()]
+    player_total, banker_total = baccarat_hand_value(player), baccarat_hand_value(banker)
+
+    if player_total < 8 and banker_total < 8:
+        third: int | None = None
+        if player_total <= 5:
+            third = draw()
+            player.append(third)
+            player_total = baccarat_hand_value(player)
+
+        if third is None:
+            draws = banker_total <= 5
+        else:
+            draws = (
+                banker_total <= 2
+                or (banker_total == 3 and third != 8)
+                or (banker_total == 4 and 2 <= third <= 7)
+                or (banker_total == 5 and 4 <= third <= 7)
+                or (banker_total == 6 and 6 <= third <= 7)
+            )
+        if draws:
+            banker.append(draw())
+            banker_total = baccarat_hand_value(banker)
+
+    if player_total > banker_total:
+        outcome = "player"
+    elif banker_total > player_total:
+        outcome = "banker"
+    else:
+        outcome = "tie"
+
+    return {
+        "player": player_total,
+        "banker": banker_total,
+        "outcome": outcome,
+        "player_hand": player,
+        "banker_hand": banker,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Item boost budget (Money Multiplier / Lucky Clover)
+# ---------------------------------------------------------------------------
+# ``gambling_multiplier`` and ``luck_boost`` are the only two shop effects that
+# touch casino payouts. Unbounded, they turned the casino into a money printer:
+# a losing round had a 50% chance of being *paid as a win* (``luck_boost``
+# caps the second chance at 50%) and that saved win was then multiplied by the
+# gamble boost, so a player holding both items faced roughly a 300% return - on
+# every game. Coins could be extracted from the Treasury as fast as the player
+# could click, and the auto-rebalancer minted the difference straight back.
+#
+# Both effects now spend from a single budget expressed in *coins*, not ratios.
+# That is the part that matters: a ratio scales with the player's balance, so a
+# whale's bet won 1,000x more from the same 25k item and there was no ceiling to
+# reach. An absolute budget is reached and then simply stops.
+#
+#   * the win multiplier boosts **profit only** - never the stake - and only on
+#     the first ``ITEM_BOOST_STAKE_CAP`` coins of the bet;
+#   * a luck save refunds (a share of) the stake, never the potential winnings,
+#     and is never multiplied by the gamble boost;
+#   * one activation can never add more than ``ITEM_BOOST_MAX_GAIN`` in total.
+#
+# Both items stay useful at ordinary stakes and are worth almost nothing on a
+# balance-sized bet. Raise the caps to loosen, lower them (or set either to 0)
+# to tighten; ``LUCK_SAVE_REFUND_RATIO`` at 0 turns the clover into a pure
+# second chance that pays nothing.
+ITEM_BOOST_STAKE_CAP = Decimal("250000")  # bet size the boosts act on
+ITEM_BOOST_MAX_GAIN = Decimal("250000")  # most one activation can add
+LUCK_SAVE_REFUND_RATIO = Decimal("1.0")  # share of that bet a save returns
+
+
 class CrashView(discord.ui.LayoutView):
     """Crash game view using Components V2 Container system."""
 
@@ -61,6 +337,10 @@ class CrashView(discord.ui.LayoutView):
         self.start_event: asyncio.Event = asyncio.Event()
         self.game_phase: str = None
         self.current_multiplier = Decimal("1.0")
+        # Optional admin-set ceiling. When the multiplier reaches it the round
+        # is force-crashed for anyone still playing. ``None`` means uncapped.
+        # Set from the ``!crashadmin`` panel.
+        self.crash_limit: Decimal | None = None
 
         self.max_allowed_bet = Decimal("0")
 
@@ -118,7 +398,12 @@ class CrashView(discord.ui.LayoutView):
                     status = f"🟢 playing → {await self.casino.formatter(val)} {self.casino.currency_name}"
                 lines.append(f"<@{uid}> {status}")
 
-            content = f"**Multiplier:** {self.current_multiplier:.2f}×\n\n**Players:**\n" + "\n".join(lines) if lines else f"**Multiplier:** {self.current_multiplier:.2f}×"
+            header = f"**Multiplier:** {self.current_multiplier:.2f}×"
+            if self.crash_limit is not None:
+                header += f"  ·  **Crash limit:** {self.crash_limit:.2f}×"
+            content = (
+                f"{header}\n\n**Players:**\n" + "\n".join(lines) if lines else header
+            )
             accent_color = 0x5865F2  # Blurple
             show_buttons = True
             active_can_cash = any(
@@ -178,6 +463,25 @@ class CrashView(discord.ui.LayoutView):
 
         return container
 
+    def _resolve_crash_bet(
+        self, raw: Decimal, balance: Decimal, max_allowed: Decimal
+    ) -> tuple[Decimal | None, bool, str | None]:
+        """Turn a modal entry into a playable crash bet.
+
+        Returns ``(bet, capped, error)``. When ``error`` is set, ``bet`` is
+        ``None`` and the join is refused. Otherwise ``capped`` reports whether
+        the amount was reduced to the table maximum - the capped amount is
+        still played, which is what lets ``all`` / ``half`` / ``max`` actually
+        enter the game instead of only being told the limit.
+        """
+        if raw <= 0:
+            return None, False, "Bet must be positive."
+        if raw > balance:
+            return None, False, "Insufficient funds."
+        if max_allowed and raw > max_allowed:
+            return max_allowed, True, None
+        return raw, False, None
+
     async def join_callback(self, interaction: Interaction):
         """Show the bet modal when someone clicks Join."""
 
@@ -216,20 +520,13 @@ class CrashView(discord.ui.LayoutView):
                     f"Invalid bet: {e}", ephemeral=True
                 )
 
-            if bet <= 0:
-                return await sub_int.response.send_message(
-                    "Bet must be positive.", ephemeral=True
-                )
-            if bet > balance:
-                return await sub_int.response.send_message(
-                    "Insufficient funds.", ephemeral=True
-                )
-            if bet > max_allowed:
-                bet = max_allowed
-                await sub_int.response.send_message(
-                    f"Bet capped to max {formatted_max}.", ephemeral=True
-                )
-                return
+            # ``all`` / ``half`` / ``max`` (and oversized numbers) resolve to a
+            # real amount above; clamp an over-table bet to the max but still
+            # play it, instead of only announcing the cap and dropping the join.
+            resolved, capped, error = self._resolve_crash_bet(bet, balance, max_allowed)
+            if error is not None:
+                return await sub_int.response.send_message(error, ephemeral=True)
+            bet = resolved
 
             try:
                 await self.bot.database.spend_from_wallet(
@@ -282,8 +579,10 @@ class CrashView(discord.ui.LayoutView):
             await self._persist_crash_player_verify(uid)
 
             self.cashout_btn.disabled = False
+            note = f" (capped at the {formatted_max} max)" if capped else ""
             await sub_int.response.send_message(
-                f"You joined with **{await self.casino.formatter(bet)}** {self.casino.currency_name}",
+                f"You joined with **{await self.casino.formatter(bet)}** "
+                f"{self.casino.currency_name}{note}",
                 ephemeral=True,
             )
             await self.update_game_message()
@@ -353,7 +652,7 @@ class CrashView(discord.ui.LayoutView):
 
         win = AmountUtils.round_currency(bet * mult)
         win, _, boost_text = await self.casino._apply_item_multipliers(
-            uid, win, True
+            uid, win, True, stake=bet
         )
 
         wallet = await self.bot.database.get_wallet_id_for_user(uid)
@@ -529,7 +828,37 @@ class CrashView(discord.ui.LayoutView):
                     break
 
                 self.current_multiplier += self.calculate_increment()
+
+                # Admin crash limit: once the multiplier reaches the ceiling,
+                # cap the display there and force-crash everyone still playing.
+                reached_limit = self._enforce_crash_limit()
+
                 await self._crash_players_at_current_multiplier()
+
+                if reached_limit:
+                    for uid in self.players:
+                        if uid not in self.cashed_out and uid not in self.crashed_out:
+                            self.crashed_out[uid] = self.crash_limit
+                            await self.casino._remove_refund(self.session_id, user_id=uid)
+                            await self.casino.process_game_result(uid, "crash", self.players[uid])
+                            pf = self.pf_data.get(uid, {})
+                            await self.casino._record_game_outcome(
+                                uid, "crash", "loss", self.players[uid], pf,
+                                payout_multiplier=Decimal("0"),
+                                payout_amount=Decimal("0"),
+                            )
+                            await self.casino._log_game_event(
+                                self.session_id,
+                                "crash",
+                                {
+                                    "user_id": uid,
+                                    "multiplier": str(self.crash_limit),
+                                    "reason": "crash_limit",
+                                },
+                            )
+                    await self.update_game_message()
+                    break
+
                 await self.update_game_message()
                 await asyncio.sleep(1)
 
@@ -551,6 +880,18 @@ class CrashView(discord.ui.LayoutView):
         finally:
             self.is_running = False
             self.casino.cleanup_after_game(ctx.channel.id)
+
+    def _enforce_crash_limit(self) -> bool:
+        """Clamp to the admin crash limit; return whether the ceiling was hit.
+
+        When a limit is set and the multiplier has reached it, the multiplier
+        is capped there so the display shows exactly the limit, and ``True`` is
+        returned so the caller ends the round and crashes anyone still in.
+        """
+        if self.crash_limit is None or self.current_multiplier < self.crash_limit:
+            return False
+        self.current_multiplier = self.crash_limit
+        return True
 
     def calculate_increment(self) -> Decimal:
         m = self.current_multiplier
@@ -743,7 +1084,7 @@ class MinesGridLayout(discord.ui.LayoutView):
         multiplier = await self._calculate_multiplier()
         potential = AmountUtils.round_currency(self.bet_amount * Decimal(str(multiplier)))
         potential, saved, boost_text = await casino._apply_item_multipliers(
-            self.user_id, potential, False
+            self.user_id, potential, False, stake=self.bet_amount
         )
         if saved:
             wallet_id = await self.bot.database.get_wallet_id_for_user(self.user_id)
@@ -846,7 +1187,7 @@ class MinesGridLayout(discord.ui.LayoutView):
         multiplier = await self._calculate_multiplier()
         winnings = self.bet_amount * Decimal(str(multiplier))
         winnings, _, boost_text = await casino._apply_item_multipliers(
-            self.user_id, winnings, True
+            self.user_id, winnings, True, stake=self.bet_amount
         )
         winnings = AmountUtils.round_currency(winnings)
 
@@ -1083,7 +1424,7 @@ class MinesGridLayout(discord.ui.LayoutView):
         multiplier = await self._calculate_multiplier()
         winnings = self.bet_amount * Decimal(str(multiplier))
         winnings, _, boost_text = await casino._apply_item_multipliers(
-            self.user_id, winnings, True
+            self.user_id, winnings, True, stake=self.bet_amount
         )
         winnings = AmountUtils.round_currency(winnings)
 
@@ -1491,13 +1832,11 @@ class DoubleOrNothingView(discord.ui.LayoutView):
         if self.rounds > 0:
             await self.casino.process_game_result(self.user_id, "double", self.initial_amount)
 
-        # Apply purchased gambling multiplier to the cashout amount
-        gambling_multiplier = await self.casino._get_gambling_multiplier(self.user_id)
-        if gambling_multiplier != Decimal("1.0"):
-            self.winnings = AmountUtils.round_currency(self.winnings * gambling_multiplier)
-            boost_text = f" 🎰 Gamble ×{gambling_multiplier:.2f}"
-        else:
-            boost_text = ""
+        # Apply purchased gambling multiplier to the cashout amount, through the
+        # shared budget so this path can't out-pay the one every other game uses.
+        self.winnings, _, boost_text = await self.casino._apply_item_multipliers(
+            self.user_id, self.winnings, True, stake=self.initial_amount
+        )
 
         formatted_winnings = await self.casino.formatter(self.winnings)
 
@@ -2087,11 +2426,11 @@ class RouletteView(discord.ui.LayoutView):
         boost_text = ""
         if total_winnings > 0:
             total_winnings, _, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, total_winnings, True
+                self.user_id, total_winnings, True, stake=total_wager
             )
         else:
             potential_win, lucky_win, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, total_wager, False
+                self.user_id, total_wager, False, stake=total_wager
             )
             if lucky_win:
                 total_winnings = potential_win
@@ -2229,14 +2568,30 @@ HILO_CARD_EMOJIS = {
     "back": "<:uncovered:1361825843525194029>",
 }
 
+#: Hi-Lo is dealt from a real 52-card shoe: ranks 1-13 with the ace low
+#: (always 1, never 11), four of each, shuffled fresh. The odds are read off
+#: the cards still left, so the hand runs as long as the player keeps calling
+#: it right.
+HILO_FACE_BY_RANK = {1: "A", 11: "J", 12: "Q", 13: "K"}
+
+
+def hilo_rank_face(rank: int) -> str:
+    return HILO_FACE_BY_RANK.get(rank, str(rank))
+
+
+def hilo_deck_ranks() -> list[int]:
+    deck = [rank for rank in range(1, 14) for _ in range(4)]
+    random.shuffle(deck)
+    return deck
+
 
 class HiLoView(discord.ui.LayoutView):
     """HiLo card guessing game using Components V2 Container system."""
 
     def __init__(self, bot, cog, user: discord.Member, bet_amount: Decimal,
-                 wallet_id: int, currency_name: str, current_card: str,
+                 wallet_id: int, currency_name: str, current_card: int,
                  house_edge: Decimal, PF: dict, session_id, ctx: Context,
-                 deck: list[str] | None = None):
+                 deck: list[int] | None = None):
         super().__init__(timeout=300)
         self.bot = bot
         self.cog: Casino = cog
@@ -2247,22 +2602,22 @@ class HiLoView(discord.ui.LayoutView):
         self.currency_name = currency_name
         self.ctx = ctx
 
-        self.current_card = current_card
+        self.current = int(current_card)
         self.house_edge = house_edge
         self.PF = PF
         self.session_id = session_id
         self.message: discord.Message | None = None
 
-        self.deck = list(deck) if deck else []
+        self.deck = list(deck) if deck else hilo_deck_ranks()
         self.multiplier = Decimal("1.0")
-        self.history: list[str] = []
+        self.history: list[int] = []
         self.game_active = True
         self.has_played = False
         self.skips_used = 0
         self.lock = asyncio.Lock()
 
         # ── Buttons ──
-        higher_prob, lower_prob = self._calculate_probs(self.current_card)
+        higher_prob, lower_prob = self._calculate_probs()
         self.btn_higher = discord.ui.Button(
             label=f"Higher ({higher_prob}%)", style=discord.ButtonStyle.gray, custom_id="hilo_higher"
         )
@@ -2284,59 +2639,47 @@ class HiLoView(discord.ui.LayoutView):
 
     # ── Multiplier / probability helpers ──
 
-    def _calculate_multiplier(self, card: str, action: str) -> Decimal:
-        current_value = HILO_CARD_VALUES[card]
-        total = len(HILO_CARDS) - 1  # exclude current card
+    def _odds(self, action: str) -> Decimal:
+        """Fair odds for a call against the cards still left in the shoe.
 
-        if action == "higher":
-            favorable = len([c for c in HILO_CARDS if HILO_CARD_VALUES[c] > current_value])
-        else:
-            favorable = len([c for c in HILO_CARDS if HILO_CARD_VALUES[c] < current_value])
-
-        if favorable == 0:
+        ``(len(deck) / favourable) * (1 - house_edge)`` — the exact chance the
+        call lands, shaved by the player's house edge. ``0`` when no card left
+        can satisfy the guess.
+        """
+        total = len(self.deck)
+        if total == 0:
             return Decimal("0")
-
+        if action == "higher":
+            favorable = sum(1 for card in self.deck if card > self.current)
+        else:
+            favorable = sum(1 for card in self.deck if card < self.current)
+        if favorable <= 0:
+            return Decimal("0")
         probability = Decimal(favorable) / Decimal(total)
-        multiplier = (Decimal("1") / probability) * (Decimal("1") - self.house_edge)
+        return (Decimal("1") / probability) * (Decimal("1") - self.house_edge)
 
-        return max(multiplier, Decimal("1.01"))
-
-    def _calculate_probs(self, card: str) -> tuple[int, int]:
-        current_value = HILO_CARD_VALUES[card]
-        higher = len([c for c in HILO_CARDS if HILO_CARD_VALUES[c] > current_value])
-        lower = len([c for c in HILO_CARDS if HILO_CARD_VALUES[c] < current_value])
-        total = len(HILO_CARDS) - 1
-
-        higher_prob = max(8, min(92, round((higher / total) * 100)))
-        lower_prob = max(8, min(92, round((lower / total) * 100)))
-        return higher_prob, lower_prob
-
-    async def _calculate_profits(self, card: str) -> tuple[str, str, str]:
-        higher_mult = self._calculate_multiplier(card, "higher")
-        lower_mult = self._calculate_multiplier(card, "lower")
-
-        profit_higher = (self.bet_amount * self.multiplier * higher_mult) - self.bet_amount
-        profit_lower = (self.bet_amount * self.multiplier * lower_mult) - self.bet_amount
-        total_profit = (self.bet_amount * self.multiplier) - self.bet_amount
-
-        return (
-            await self.cog.formatter(profit_higher),
-            await self.cog.formatter(profit_lower),
-            await self.cog.formatter(total_profit),
-        )
+    def _calculate_probs(self) -> tuple[int, int]:
+        total = len(self.deck)
+        if total == 0:
+            return 0, 0
+        higher = sum(1 for card in self.deck if card > self.current)
+        lower = sum(1 for card in self.deck if card < self.current)
+        return round((higher / total) * 100), round((lower / total) * 100)
 
     # ── Container rendering ──
 
     def _rebuild_container(self, status: str = "Playing", result_text: str | None = None):
         self.clear_items()
 
-        card_emoji = HILO_CARD_EMOJIS.get(self.current_card, HILO_CARD_EMOJIS["back"])
+        current_face = hilo_rank_face(self.current)
+        card_emoji = HILO_CARD_EMOJIS.get(current_face, HILO_CARD_EMOJIS["back"])
 
         # History string
         history_parts = []
         for card in self.history:
-            history_parts.append(f"{HILO_CARD_EMOJIS.get(card, '🃏')} {card}")
-        history_parts.append(f"{card_emoji} {self.current_card}")
+            face = hilo_rank_face(card)
+            history_parts.append(f"{HILO_CARD_EMOJIS.get(face, '🃏')} {face}")
+        history_parts.append(f"{card_emoji} {current_face}")
         history_parts.append(HILO_CARD_EMOJIS["back"])
         history_str = " → ".join(history_parts)
 
@@ -2349,12 +2692,12 @@ class HiLoView(discord.ui.LayoutView):
 
         children = [
             discord.ui.TextDisplay(f"## {HILO_CARD_EMOJIS['back']} HiLo — {status}"),
-            discord.ui.TextDisplay(f"**Current Card:** {card_emoji} **{self.current_card}**"),
+            discord.ui.TextDisplay(f"**Current Card:** {card_emoji} **{current_face}**"),
         ]
 
         if status == "Playing":
-            higher_mult = self._calculate_multiplier(self.current_card, "higher")
-            lower_mult = self._calculate_multiplier(self.current_card, "lower")
+            higher_mult = self._odds("higher")
+            lower_mult = self._odds("lower")
             children.append(discord.ui.TextDisplay(
                 f"**Higher** ({higher_mult:.2f}x) │ "
                 f"**Lower** ({lower_mult:.2f}x) │ "
@@ -2377,31 +2720,22 @@ class HiLoView(discord.ui.LayoutView):
         self.add_item(container)
 
     def _update_button_labels(self):
-        higher_prob, lower_prob = self._calculate_probs(self.current_card)
+        higher_prob, lower_prob = self._calculate_probs()
         self.btn_higher.label = f"Higher ({higher_prob}%)"
         self.btn_lower.label = f"Lower ({lower_prob}%)"
         self.btn_cashout.label = f"Cash Out {self.multiplier:.2f}x"
 
     # ── Game lifecycle ──
 
-    async def _next_fairgate_card(self) -> str | None:
-        """Pop the next card from the pre-shuffled deck, drawing a fresh deck if needed."""
+    def _next_card(self) -> int:
+        """Draw the next card, reshuffling a fresh shoe when it runs out.
+
+        The hand never ends on its own — it keeps going, one card per call,
+        until the player cashes out or busts.
+        """
         if not self.deck:
-            self.PF = await self.cog.bump_fairgate_pf(self.user_id, self.PF)
-            try:
-                self.deck = await self.cog.fairgate_play_hilo_deck(self.user_id, self.PF)
-            except FairGateError as exc:
-                logger.exception("HiLo deck refresh failed for user %s: %s", self.user_id, exc)
-                await self.force_end(refund=True)
-                content = "🚫 The game server could not be reached. Your bet has been refunded."
-                self._rebuild_container(status="Error", result_text=content)
-                if self.message:
-                    try:
-                        await self.message.edit(view=self)
-                    except Exception:
-                        pass
-                return None
-        return self.deck.pop(0)
+            self.deck = hilo_deck_ranks()
+        return self.deck.pop()
 
     async def _end_game(self, win: bool, payout: Decimal | None = None):
         self.game_active = False
@@ -2473,7 +2807,13 @@ class HiLoView(discord.ui.LayoutView):
 
     # ── Button callbacks ──
 
-    async def _higher_callback(self, interaction: discord.Interaction):
+    async def _guess(self, interaction: discord.Interaction, action: str):
+        """Resolve one higher/lower call and keep the hand alive on a hit.
+
+        A correct call lifts the multiplier by that call's true odds and deals
+        the next card; a wrong one ends the run, unless a bought item saves the
+        pot. Nothing here ends the hand early — it runs until you cash out.
+        """
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("This isn't your game!", ephemeral=True)
         if not self.game_active:
@@ -2483,139 +2823,52 @@ class HiLoView(discord.ui.LayoutView):
             if not self.game_active:
                 return await interaction.response.defer()
 
+            odds = self._odds(action)
+            if odds <= 0:
+                return await interaction.response.send_message(
+                    f"No card left that is {action} — cash out.", ephemeral=True
+                )
+
             await interaction.response.defer()
             self.has_played = True
-            self.history.append(self.current_card)
+            self.history.append(self.current)
 
-            next_card = await self._next_fairgate_card()
-            if next_card is None:
-                await interaction.followup.send(
-                    "🚫 The game server could not be reached. Your bet has been refunded.",
-                    ephemeral=True,
-                )
+            drawn = self._next_card()
+            correct = drawn > self.current if action == "higher" else drawn < self.current
+
+            if correct:
+                self.multiplier *= odds
+                self.current = drawn
+                self._update_button_labels()
+                self._rebuild_container()
+                await interaction.followup.edit_message(interaction.message.id, view=self)
                 return
 
-            multiplier_increase = self._calculate_multiplier(self.history[-1], "higher")
-
-            current_value = HILO_CARD_VALUES[self.history[-1]]
-            next_value = HILO_CARD_VALUES[next_card]
-
-            if next_value > current_value:
-                self.multiplier *= multiplier_increase
-                self.current_card = next_card
-                if next_card in ["A", "K"]:
-                    winnings = self.bet_amount * self.multiplier
-                    winnings, _, boost_text = await self.cog._apply_item_multipliers(
-                        self.user_id, winnings, True
-                    )
-                    try:
-                        await self.bot.database.process_treasury_transaction(
-                            wallet_id=self.wallet_id, amount=winnings, description="HiLo Win"
-                        , transaction_type="game_payout")
-                    except ValueError as e:
-                        await interaction.followup.send(f"\U0001f6ab Transaction failed: {e}", ephemeral=True)
-                        return
-                    await self._end_game(True, payout=winnings)
-                    await self._show_result(interaction, True, auto_cashout_card=next_card, boost_text=boost_text, payout=winnings)
+            # A wrong call ends the run — unless a bought item saves the pot.
+            self.current = drawn
+            potential = self.bet_amount * self.multiplier
+            potential, saved, boost_text = await self.cog._apply_item_multipliers(
+                self.user_id, potential, False, stake=self.bet_amount
+            )
+            if saved:
+                try:
+                    await self.bot.database.process_treasury_transaction(
+                        wallet_id=self.wallet_id, amount=potential, description="HiLo Win"
+                    , transaction_type="game_payout")
+                except ValueError as e:
+                    await interaction.followup.send(f"\U0001f6ab Transaction failed: {e}", ephemeral=True)
                     return
-            else:
-                # next_value < current_value (same-card is impossible now that
-                # current_card is excluded from the draw).
-                self.current_card = next_card
-                potential = self.bet_amount * self.multiplier
-                potential, saved, boost_text = await self.cog._apply_item_multipliers(
-                    self.user_id, potential, False
-                )
-                if saved:
-                    try:
-                        await self.bot.database.process_treasury_transaction(
-                            wallet_id=self.wallet_id, amount=potential, description="HiLo Win"
-                        , transaction_type="game_payout")
-                    except ValueError as e:
-                        await interaction.followup.send(f"\U0001f6ab Transaction failed: {e}", ephemeral=True)
-                        return
-                    await self._end_game(True, payout=potential)
-                    await self._show_result(interaction, True, boost_text=boost_text, payout=potential)
-                    return
-                await self._end_game(False)
-                await self._show_result(interaction, False, boost_text=boost_text)
+                await self._end_game(True, payout=potential)
+                await self._show_result(interaction, True, boost_text=boost_text, payout=potential)
                 return
+            await self._end_game(False)
+            await self._show_result(interaction, False, boost_text=boost_text)
 
-            self._update_button_labels()
-            self._rebuild_container()
-            await interaction.followup.edit_message(interaction.message.id, view=self)
+    async def _higher_callback(self, interaction: discord.Interaction):
+        await self._guess(interaction, "higher")
 
     async def _lower_callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("This isn't your game!", ephemeral=True)
-        if not self.game_active:
-            return await interaction.response.defer()
-
-        async with self.lock:
-            if not self.game_active:
-                return await interaction.response.defer()
-
-            await interaction.response.defer()
-            self.has_played = True
-            self.history.append(self.current_card)
-
-            next_card = await self._next_fairgate_card()
-            if next_card is None:
-                await interaction.followup.send(
-                    "🚫 The game server could not be reached. Your bet has been refunded.",
-                    ephemeral=True,
-                )
-                return
-
-            multiplier_increase = self._calculate_multiplier(self.history[-1], "lower")
-
-            current_value = HILO_CARD_VALUES[self.history[-1]]
-            next_value = HILO_CARD_VALUES[next_card]
-
-            if next_value < current_value:
-                self.multiplier *= multiplier_increase
-                self.current_card = next_card
-                if next_card in ["A", "K"]:
-                    winnings = self.bet_amount * self.multiplier
-                    winnings, _, boost_text = await self.cog._apply_item_multipliers(
-                        self.user_id, winnings, True
-                    )
-                    try:
-                        await self.bot.database.process_treasury_transaction(
-                            wallet_id=self.wallet_id, amount=winnings, description="HiLo Win"
-                        , transaction_type="game_payout")
-                    except ValueError as e:
-                        await interaction.followup.send(f"\U0001f6ab Transaction failed: {e}", ephemeral=True)
-                        return
-                    await self._end_game(True, payout=winnings)
-                    await self._show_result(interaction, True, auto_cashout_card=next_card, boost_text=boost_text, payout=winnings)
-                    return
-            else:
-                # next_value > current_value (same-card is impossible now
-                # that current_card is excluded from the draw).
-                self.current_card = next_card
-                potential = self.bet_amount * self.multiplier
-                potential, saved, boost_text = await self.cog._apply_item_multipliers(
-                    self.user_id, potential, False
-                )
-                if saved:
-                    try:
-                        await self.bot.database.process_treasury_transaction(
-                            wallet_id=self.wallet_id, amount=potential, description="HiLo Win"
-                        , transaction_type="game_payout")
-                    except ValueError as e:
-                        await interaction.followup.send(f"\U0001f6ab Transaction failed: {e}", ephemeral=True)
-                        return
-                    await self._end_game(True, payout=potential)
-                    await self._show_result(interaction, True, boost_text=boost_text, payout=potential)
-                    return
-                await self._end_game(False)
-                await self._show_result(interaction, False, boost_text=boost_text)
-                return
-
-            self._update_button_labels()
-            self._rebuild_container()
-            await interaction.followup.edit_message(interaction.message.id, view=self)
+        await self._guess(interaction, "lower")
 
     async def _skip_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -2634,14 +2887,8 @@ class HiLoView(discord.ui.LayoutView):
 
             await interaction.response.defer()
             self.skips_used += 1
-            self.history.append(self.current_card)
-            self.current_card = await self._next_fairgate_card()
-            if self.current_card is None:
-                await interaction.followup.send(
-                    "🚫 The game server could not be reached. Your bet has been refunded.",
-                    ephemeral=True,
-                )
-                return
+            self.history.append(self.current)
+            self.current = self._next_card()
             self._update_button_labels()
             self._rebuild_container()
             await interaction.followup.edit_message(interaction.message.id, view=self)
@@ -2664,7 +2911,7 @@ class HiLoView(discord.ui.LayoutView):
 
             winnings = self.bet_amount * self.multiplier
             winnings, _, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, winnings, True
+                self.user_id, winnings, True, stake=self.bet_amount
             )
             try:
                 await self.bot.database.process_treasury_transaction(
@@ -2839,7 +3086,7 @@ class PokerView(View):
         if player_wins:
             payout = self.bet * Decimal("2")
             payout, _, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, payout, True
+                self.user_id, payout, True, stake=self.bet
             )
             payout_multiplier = (
                 (payout / self.bet).quantize(
@@ -2877,7 +3124,7 @@ class PokerView(View):
         else:
             potential = self.bet * Decimal("2")
             potential, saved, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, potential, False
+                self.user_id, potential, False, stake=self.bet
             )
             if saved:
                 payout_multiplier = (
@@ -3120,7 +3367,7 @@ class LadderView(discord.ui.LayoutView):
             self.current_multiplier = self.STEP_MULTS[self.step]
             current_winnings = self.bet * self.current_multiplier
             current_winnings, _, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, current_winnings, True
+                self.user_id, current_winnings, True, stake=self.bet
             )
             current_winnings = AmountUtils.round_currency(current_winnings)
             formatted_winnings = await self.cog.formatter(current_winnings)
@@ -3183,7 +3430,7 @@ class LadderView(discord.ui.LayoutView):
             # ── fell ──
             potential = self.bet * self.current_multiplier
             potential, saved, boost_text = await self.cog._apply_item_multipliers(
-                self.user_id, potential, False
+                self.user_id, potential, False, stake=self.bet
             )
             if saved:
                 potential = AmountUtils.round_currency(potential)
@@ -3257,7 +3504,7 @@ class LadderView(discord.ui.LayoutView):
 
         final_reward = self.bet * self.current_multiplier
         final_reward, _, boost_text = await self.cog._apply_item_multipliers(
-            self.user_id, final_reward, True
+            self.user_id, final_reward, True, stake=self.bet
         )
         final_reward = AmountUtils.round_currency(final_reward)
         await self.cog.process_game_result(self.user_id, "ladder", self.bet)
@@ -3651,7 +3898,7 @@ class SlotsView(discord.ui.LayoutView):
             is_winner = total_winnings > 0
             potential_payout = total_winnings if is_winner else self.bet
             final_winnings, final_winner, boost_text = await self.cog._apply_item_multipliers(
-                user_id, potential_payout, is_winner
+                user_id, potential_payout, is_winner, stake=self.bet
             )
             final_winnings = AmountUtils.round_currency(final_winnings)
 
@@ -4003,6 +4250,494 @@ class GameHistoryPaginator(discord.ui.View):
         return embed
 
 
+class _LocalClimbView(discord.ui.LayoutView):
+    """Shared skeleton for the local-RNG climbing games (Dragon Tower, Chicken).
+
+    Subclasses render their own board and resolve a single round; this base
+    owns the wallet/session plumbing: cash-out, busts (including luck saves),
+    forced ends and timeout refunds, all settled through the local recorder.
+    """
+
+    GAME_NAME = "climb"
+    TITLE = "Climb"
+    MAX_STEPS = 1
+    INSTRUCTIONS = ""
+
+    def __init__(
+        self,
+        *,
+        bot: commands.Bot,
+        cog: "Casino",
+        user_id: int,
+        bet: Decimal,
+        wallet_id,
+        session_id,
+        currency_name: str,
+        difficulty: str,
+    ):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.cog = cog
+        self.user_id = user_id
+        self.bet = bet
+        self.wallet_id = wallet_id
+        self.session_id = session_id
+        self.currency_name = currency_name
+        self.difficulty = difficulty
+        self.step = 0
+        self.finished = False
+        self.start_time = discord.utils.utcnow()
+        self.message: discord.Message | None = None
+
+    # -- subclass hooks --------------------------------------------------
+    def multiplier_at(self, step: int) -> Decimal:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def _board(self) -> str:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def _action_buttons(self) -> list[discord.ui.Button]:  # pragma: no cover
+        raise NotImplementedError
+
+    async def build_initial(self) -> None:
+        top = AmountUtils.round_currency(self.bet * self.multiplier_at(self.MAX_STEPS))
+        content = (
+            f"**Bet:** {self.currency_name} **{await self.cog.formatter(self.bet)}**\n"
+            f"**Difficulty:** {self.difficulty.title()} • Max {self.MAX_STEPS} steps\n"
+            f"**Top payout:** {self.currency_name} **{await self.cog.formatter(top)}** "
+            f"({self.multiplier_at(self.MAX_STEPS)}x)\n\n{self.INSTRUCTIONS}"
+        )
+        self._build_container(accent_color=0x5865F2, content=content)
+
+    def _build_container(
+        self, *, accent_color: int, content: str, show_buttons: bool = True
+    ) -> None:
+        children = [
+            discord.ui.TextDisplay(f"## {self.TITLE}"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(self._board()),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(content),
+        ]
+        if show_buttons:
+            children.append(discord.ui.Separator())
+            children.append(discord.ui.ActionRow(*self._action_buttons()))
+        container = discord.ui.Container(*children, accent_color=accent_color)
+        self.clear_items()
+        self.add_item(container)
+
+    # -- guards ----------------------------------------------------------
+    async def _check_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This isn't your game.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _expired(self) -> bool:
+        return (discord.utils.utcnow() - self.start_time).total_seconds() > 300
+
+    # -- settlement ------------------------------------------------------
+    async def _finalize(
+        self,
+        interaction: discord.Interaction,
+        *,
+        outcome: str,
+        winnings: Decimal,
+        content: str,
+        accent: int,
+    ) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        winnings = AmountUtils.round_currency(winnings)
+        await self.cog.process_game_result(self.user_id, self.GAME_NAME, self.bet)
+        payout_multiplier = (
+            (winnings / self.bet).quantize(
+                Decimal("0.0000000001"), rounding=ROUND_HALF_UP
+            )
+            if self.bet
+            else Decimal("0")
+        )
+        await self.cog._record_local_outcome(
+            self.user_id,
+            self.GAME_NAME,
+            outcome,
+            self.bet,
+            payout_multiplier=payout_multiplier,
+            payout_amount=winnings,
+        )
+        if winnings > 0:
+            await self.bot.database.process_treasury_transaction(
+                wallet_id=self.wallet_id,
+                amount=winnings,
+                description=f"{self.GAME_NAME.title()} payout",
+                transaction_type="game_payout",
+            )
+        self._build_container(
+            accent_color=accent, content=content, show_buttons=False
+        )
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            pass
+        await self.cog._remove_refund(self.session_id, user_id=self.user_id)
+        await self.cog._end_game_session(
+            self.session_id,
+            outcome=outcome,
+            final_state={"step": self.step, "winnings": str(winnings)},
+        )
+        self.stop()
+
+    async def _cashout(self, interaction: discord.Interaction) -> None:
+        if self.step <= 0:
+            return await interaction.response.send_message(
+                "Make at least one move before cashing out.", ephemeral=True
+            )
+        multiplier = self.multiplier_at(self.step)
+        winnings, _, boost = await self.cog._apply_item_multipliers(
+            self.user_id, self.bet * multiplier, True, stake=self.bet
+        )
+        winnings = AmountUtils.round_currency(winnings)
+        content = (
+            f"💰 **Cashed out at {multiplier}x!**\n"
+            f"Winnings: {self.currency_name} "
+            f"**{await self.cog.formatter(winnings)}**{boost}"
+        )
+        await self._finalize(
+            interaction, outcome="win", winnings=winnings, content=content, accent=0x57F287
+        )
+
+    async def _expire(self, interaction: discord.Interaction) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        self._build_container(
+            accent_color=0xFEE75C,
+            content="This game expired. Your bet has been refunded.",
+            show_buttons=False,
+        )
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            pass
+        await self.bot.database.process_treasury_transaction(
+            wallet_id=self.wallet_id,
+            amount=self.bet,
+            description=f"{self.GAME_NAME.title()} refund",
+            transaction_type="game_payout",
+        )
+        await self.cog._remove_refund(self.session_id, user_id=self.user_id)
+        await self.cog._end_game_session(
+            self.session_id,
+            outcome="forced_end",
+            final_state={"reason": "expired", "refund": True},
+        )
+        self.stop()
+
+    async def force_end(self, *, refund: bool = False) -> None:
+        self.finished = True
+        self._build_container(
+            accent_color=0xFEE75C, content="Game ended (forced).", show_buttons=False
+        )
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+        if refund:
+            await self.bot.database.process_treasury_transaction(
+                wallet_id=self.wallet_id,
+                amount=self.bet,
+                description=f"{self.GAME_NAME.title()} refund",
+                transaction_type="game_payout",
+            )
+        await self.cog._remove_refund(self.session_id, user_id=self.user_id)
+        await self.cog._end_game_session(
+            self.session_id,
+            outcome="forced_end",
+            final_state={"reason": "force_end", "refund": refund},
+        )
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        try:
+            self._build_container(
+                accent_color=0xFEE75C,
+                content="Game timed out. Your bet has been refunded.",
+                show_buttons=False,
+            )
+            if self.message:
+                try:
+                    await self.message.edit(view=self)
+                except Exception:
+                    pass
+            await self.bot.database.process_treasury_transaction(
+                wallet_id=self.wallet_id,
+                amount=self.bet,
+                description=f"{self.GAME_NAME.title()} refund",
+                transaction_type="game_payout",
+            )
+            await self.cog._remove_refund(self.session_id, user_id=self.user_id)
+            await self.cog._end_game_session(
+                self.session_id,
+                outcome="forced_end",
+                final_state={"reason": "timeout", "refund": True},
+            )
+        except Exception:
+            pass
+        self.stop()
+
+
+class DragonTowerView(_LocalClimbView):
+    """Climb the tower by picking an egg each row while avoiding the dragons."""
+
+    GAME_NAME = "tower"
+    TITLE = "🐉 Dragon Tower"
+    MAX_STEPS = TOWER_ROWS
+    INSTRUCTIONS = (
+        "Pick an egg on each row. One in every row hides a dragon — hit it and "
+        "the whole climb is lost. Cash out any time to bank the multiplier."
+    )
+
+    def __init__(self, *, difficulty: str, **kwargs):
+        super().__init__(difficulty=difficulty, **kwargs)
+        spec = TOWER_DIFFICULTIES[difficulty]
+        self.tiles = spec["tiles"]
+        self.dragons = spec["dragons"]
+        self.multipliers = tower_multipliers(self.tiles, self.dragons)
+        self.safe_pct = (self.tiles - self.dragons) / self.tiles * 100
+
+        self.pick_buttons = []
+        for idx in range(self.tiles):
+            button = discord.ui.Button(
+                label=f"🥚 {idx + 1}", style=discord.ButtonStyle.secondary
+            )
+            button.callback = self._make_pick(idx)
+            self.pick_buttons.append(button)
+        self.cashout_button = discord.ui.Button(
+            label="💰 Cash Out", style=discord.ButtonStyle.green
+        )
+        self.cashout_button.callback = self._cashout_callback
+
+    def multiplier_at(self, step: int) -> Decimal:
+        return self.multipliers[step]
+
+    def _action_buttons(self):
+        self.cashout_button.disabled = self.step <= 0
+        return [*self.pick_buttons, self.cashout_button]
+
+    def _board(self) -> str:
+        lines = []
+        for row in range(self.MAX_STEPS, 0, -1):
+            if row <= self.step:
+                marker = "✅"
+            elif row == self.step + 1:
+                marker = "▶"
+            else:
+                marker = "⬜"
+            lines.append(
+                f"`{marker} Row {row:>2} │ {self.multipliers[row]:>10.2f}x │ "
+                f"{self.safe_pct:.1f}% safe`"
+            )
+        return "\n".join(lines)
+
+    def _make_pick(self, idx: int):
+        async def callback(interaction: discord.Interaction):
+            await self._pick(interaction, idx)
+
+        return callback
+
+    async def _pick(self, interaction: discord.Interaction, idx: int) -> None:
+        if not await self._check_owner(interaction):
+            return
+        if self.finished or self.step >= self.MAX_STEPS:
+            return
+        if self._expired():
+            return await self._expire(interaction)
+
+        dragons = set(self.cog._rng.sample(range(self.tiles), self.dragons))
+        if idx in dragons:
+            potential, saved, boost = await self.cog._apply_item_multipliers(
+                self.user_id, self.bet * self.multiplier_at(self.step), False, stake=self.bet
+            )
+            if saved:
+                potential = AmountUtils.round_currency(potential)
+                content = (
+                    f"🍀 **The dragon struck, but luck saved you!**\n"
+                    f"Row {self.step} • Multiplier {self.multiplier_at(self.step)}x\n"
+                    f"Winnings: {self.currency_name} "
+                    f"**{await self.cog.formatter(potential)}**{boost}"
+                )
+                return await self._finalize(
+                    interaction, outcome="win", winnings=potential,
+                    content=content, accent=0x57F287,
+                )
+            content = (
+                f"💥 **A dragon! You fell on row {self.step + 1}.**\n"
+                f"Lost: {self.currency_name} **{await self.cog.formatter(self.bet)}**"
+            )
+            return await self._finalize(
+                interaction, outcome="loss", winnings=Decimal("0"),
+                content=content, accent=0xED4245,
+            )
+
+        self.step += 1
+        if self.step >= self.MAX_STEPS:
+            winnings, _, boost = await self.cog._apply_item_multipliers(
+                self.user_id, self.bet * self.multiplier_at(self.step), True, stake=self.bet
+            )
+            winnings = AmountUtils.round_currency(winnings)
+            content = (
+                f"🏆 **You reached the top!**\n"
+                f"Multiplier {self.multiplier_at(self.step)}x\n"
+                f"Winnings: {self.currency_name} "
+                f"**{await self.cog.formatter(winnings)}**{boost}"
+            )
+            return await self._finalize(
+                interaction, outcome="win", winnings=winnings,
+                content=content, accent=0xFEE75C,
+            )
+
+        potential = AmountUtils.round_currency(self.bet * self.multiplier_at(self.step))
+        content = (
+            f"🥚 **Safe! Climbed to row {self.step}.**\n"
+            f"Multiplier {self.multiplier_at(self.step)}x • Potential "
+            f"{self.currency_name} **{await self.cog.formatter(potential)}**\n"
+            f"Next row is {self.safe_pct:.1f}% safe."
+        )
+        self._build_container(accent_color=0x57F287, content=content)
+        await interaction.response.edit_message(view=self)
+
+    async def _cashout_callback(self, interaction: discord.Interaction) -> None:
+        if not await self._check_owner(interaction):
+            return
+        if self.finished:
+            return
+        await self._cashout(interaction)
+
+
+class ChickenView(_LocalClimbView):
+    """Cross lane after lane; each lane can end the run with a car."""
+
+    GAME_NAME = "chicken"
+    TITLE = "🐔 Chicken"
+    MAX_STEPS = CHICKEN_LANES
+    INSTRUCTIONS = (
+        "Cross the road one lane at a time. Every lane is crossed safely with "
+        "the chance shown; get hit and you lose the lot. Cash out any time."
+    )
+
+    def __init__(self, *, difficulty: str, **kwargs):
+        super().__init__(difficulty=difficulty, **kwargs)
+        self.safe_prob = CHICKEN_DIFFICULTIES[difficulty]
+        self.multipliers = chicken_multipliers(self.safe_prob)
+        self.advance_button = discord.ui.Button(
+            label="🐔 Cross", style=discord.ButtonStyle.green
+        )
+        self.advance_button.callback = self._advance_callback
+        self.cashout_button = discord.ui.Button(
+            label="💰 Cash Out", style=discord.ButtonStyle.red
+        )
+        self.cashout_button.callback = self._cashout_callback
+
+    def multiplier_at(self, step: int) -> Decimal:
+        return self.multipliers[step]
+
+    def _action_buttons(self):
+        self.cashout_button.disabled = self.step <= 0
+        return [self.advance_button, self.cashout_button]
+
+    def _board(self) -> str:
+        cells = []
+        for lane in range(1, self.MAX_STEPS + 1):
+            if lane <= self.step:
+                cells.append("✅")
+            elif lane == self.step + 1:
+                cells.append("🐔")
+            else:
+                cells.append("🛣️")
+        strip = " ".join(cells)
+        return (
+            f"{strip}\n"
+            f"`Lane {self.step}/{self.MAX_STEPS} • next lane {self.safe_prob * 100:.0f}% "
+            f"safe • {self.multiplier_at(self.step):.2f}x`"
+        )
+
+    async def _advance_callback(self, interaction: discord.Interaction) -> None:
+        if not await self._check_owner(interaction):
+            return
+        if self.finished or self.step >= self.MAX_STEPS:
+            return
+        if self._expired():
+            return await self._expire(interaction)
+
+        if self.cog._rng.random() < self.safe_prob:
+            self.step += 1
+            if self.step >= self.MAX_STEPS:
+                winnings, _, boost = await self.cog._apply_item_multipliers(
+                    self.user_id, self.bet * self.multiplier_at(self.step), True, stake=self.bet
+                )
+                winnings = AmountUtils.round_currency(winnings)
+                content = (
+                    f"🏁 **You crossed all {self.MAX_STEPS} lanes!**\n"
+                    f"Multiplier {self.multiplier_at(self.step)}x\n"
+                    f"Winnings: {self.currency_name} "
+                    f"**{await self.cog.formatter(winnings)}**{boost}"
+                )
+                return await self._finalize(
+                    interaction, outcome="win", winnings=winnings,
+                    content=content, accent=0xFEE75C,
+                )
+            potential = AmountUtils.round_currency(
+                self.bet * self.multiplier_at(self.step)
+            )
+            content = (
+                f"🚗 **Lane {self.step} cleared!**\n"
+                f"Multiplier {self.multiplier_at(self.step)}x • Potential "
+                f"{self.currency_name} **{await self.cog.formatter(potential)}**\n"
+                f"Next lane is {self.safe_prob * 100:.0f}% safe."
+            )
+            self._build_container(accent_color=0x57F287, content=content)
+            await interaction.response.edit_message(view=self)
+            return
+
+        potential, saved, boost = await self.cog._apply_item_multipliers(
+            self.user_id, self.bet * self.multiplier_at(self.step), False, stake=self.bet
+        )
+        if saved:
+            potential = AmountUtils.round_currency(potential)
+            content = (
+                f"🍀 **A car nearly hit you, but luck saved you!**\n"
+                f"Lane {self.step} • Multiplier {self.multiplier_at(self.step)}x\n"
+                f"Winnings: {self.currency_name} "
+                f"**{await self.cog.formatter(potential)}**{boost}"
+            )
+            return await self._finalize(
+                interaction, outcome="win", winnings=potential,
+                content=content, accent=0x57F287,
+            )
+        content = (
+            f"🚗💥 **Splat! A car got you on lane {self.step + 1}.**\n"
+            f"Lost: {self.currency_name} **{await self.cog.formatter(self.bet)}**"
+        )
+        return await self._finalize(
+            interaction, outcome="loss", winnings=Decimal("0"),
+            content=content, accent=0xED4245,
+        )
+
+    async def _cashout_callback(self, interaction: discord.Interaction) -> None:
+        if not await self._check_owner(interaction):
+            return
+        if self.finished:
+            return
+        await self._cashout(interaction)
+
+
 class Casino(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -4029,7 +4764,16 @@ class Casino(commands.Cog):
             "crash",
             "hilo",
             "keno",
+            "wheel",
+            "plinko",
+            "baccarat",
+            "limbo",
+            "tower",
+            "chicken",
         ]
+
+        # Local RNG for the Stake-style originals (limbo / tower / chicken).
+        self._rng = secrets.SystemRandom()
 
         # FairGate integration (all casino games now use FairGate).
         self.fairgate_client: FairGateClient | None = None
@@ -4191,6 +4935,25 @@ class Casino(commands.Cog):
                 "game": "numbers",
                 "params": {"pool": 1_000_000, "pick": 1, "replacement": True},
             }
+        if game_key == "wheel":
+            return {
+                "game": "numbers",
+                "params": {"pool": 10000, "pick": 1, "replacement": True},
+            }
+        if game_key == "plinko":
+            return {
+                "game": "numbers",
+                "params": {"pool": 2, "pick": PLINKO_ROWS, "replacement": True},
+            }
+        if game_key == "baccarat":
+            return {
+                "game": "cards",
+                "params": {
+                    "deck_count": 1,
+                    "format": "full_deck",
+                    "deck_order": "python",
+                },
+            }
         if game_key == "slots":
             first_weights = self.SLOTS_REEL_WEIGHTS[0]
             return {
@@ -4256,6 +5019,42 @@ class Casino(commands.Cog):
             hash_hex=PF["server_seed_hash"],
             payout_multiplier=payout_multiplier,
             payout_amount=payout_amount,
+        )
+
+    async def _record_local_outcome(
+        self,
+        user_id: int,
+        game_name: str,
+        outcome: str,
+        bet_amount,
+        *,
+        payout_multiplier=None,
+        payout_amount=None,
+    ) -> None:
+        """Persist a locally-resolved win/loss for stats and history.
+
+        Local-RNG games are recorded with ``provider="local"`` so they show up
+        in stats/leaderboards without pretending to be FairGate-verifiable.
+        """
+        await self.bot.database.record_local_game(
+            user_id,
+            game_name,
+            outcome,
+            bet_amount,
+            payout_multiplier=payout_multiplier,
+            payout_amount=payout_amount,
+        )
+
+    def _draw_limbo_result(self) -> Decimal:
+        """One uniform Limbo draw, floored to two decimals.
+
+        ``RTP / (1 - r)`` with ``r`` uniform on ``[0, 1)``; floors so the stake
+        probability is never rounded in the player's favour.
+        """
+        roll = self._rng.randrange(LIMBO_DRAW_POOL)
+        r = Decimal(roll) / Decimal(LIMBO_DRAW_POOL)
+        return (LOCAL_RTP / (Decimal("1") - r)).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
         )
 
     async def fairgate_play_coinflip(
@@ -4739,7 +5538,7 @@ class Casino(commands.Cog):
         if max_frac < 0:
             max_frac = 0
         quant = Decimal(1).scaleb(-max_frac) if max_frac else Decimal(1)
-        xq = x.quantize(quant, rounding=rounding)
+        xq = AmountUtils.quantize(x, quant, rounding=rounding)
         s = f"{xq:,.{max_frac}f}"
         if "." in s:
             s = s.rstrip("0").rstrip(".")
@@ -4868,7 +5667,7 @@ class Casino(commands.Cog):
             raise ValueError("Invalid amount.")
 
         try:
-            amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            amount = AmountUtils.round_currency(amount)
         except InvalidOperation:
             raise ValueError("Invalid amount.")
 
@@ -4899,39 +5698,99 @@ class Casino(commands.Cog):
         """Combined active luck multiplier for a user."""
         return await self.bot.database.get_luck_multiplier(user_id)
 
+    @staticmethod
+    def _boosted_stake(stake) -> Decimal:
+        """The part of a bet the item boosts are allowed to act on.
+
+        ``None`` (a call site that did not pass its stake) covers nothing, so an
+        unknown bet simply goes unboosted rather than being boosted by a ratio
+        nobody bounded.
+        """
+        if stake is None:
+            return Decimal("0")
+        try:
+            stake = Decimal(str(stake))
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal("0")
+        if stake <= 0 or ITEM_BOOST_STAKE_CAP <= 0:
+            return Decimal("0")
+        return min(stake, ITEM_BOOST_STAKE_CAP)
+
+    def _win_boost_extra(
+        self, payout: Decimal, stake, multiplier: Decimal
+    ) -> Decimal:
+        """Extra coins a win multiplier may add: profit only, on capped stake.
+
+        The stake is never boosted - only the profit riding on the part of the
+        bet inside ``ITEM_BOOST_STAKE_CAP`` - and the result is capped at
+        ``ITEM_BOOST_MAX_GAIN``. A push or an under-1x return (some Keno rows)
+        has no profit to boost and is left alone.
+        """
+        if multiplier <= Decimal("1.0"):
+            return Decimal("0")
+        covered = self._boosted_stake(stake)
+        if covered <= 0:
+            return Decimal("0")
+        stake_amount = Decimal(str(stake))
+        profit = Decimal(str(payout)) - stake_amount
+        if profit <= 0:
+            return Decimal("0")
+        extra = profit * (covered / stake_amount) * (multiplier - Decimal("1.0"))
+        return min(AmountUtils.round_currency(extra), ITEM_BOOST_MAX_GAIN)
+
+    def _luck_save_refund(self, stake, payout: Decimal) -> Decimal:
+        """What a saved loss pays: a share of the covered bet, never a win.
+
+        Capped by what the round already owed (``payout``), so a save can never
+        pay more than the game's own figure, and never the potential winnings a
+        loss branch is handed.
+        """
+        covered = self._boosted_stake(stake)
+        if covered <= 0:
+            return Decimal("0")
+        refund = min(covered * LUCK_SAVE_REFUND_RATIO, Decimal(str(payout)))
+        return min(AmountUtils.round_currency(refund), ITEM_BOOST_MAX_GAIN)
+
     async def _apply_item_multipliers(
         self,
         user_id: int,
         payout: Decimal,
         is_winner: bool,
+        *,
+        stake: Decimal | str | int | float | None = None,
     ) -> tuple[Decimal, bool, str]:
         """
         Apply purchased item effects to a casino payout.
 
         Returns a tuple of (adjusted_payout, final_is_winner, boost_text).
-        - ``gambling_multiplier`` increases the payout on any win.
-        - ``luck_boost`` gives a losing outcome a second chance to become a win.
+        - ``gambling_multiplier`` adds a bounded slice of extra *profit* on a
+          win; it never multiplies the stake and never scales with the balance.
+        - ``luck_boost`` gives a losing outcome a second chance, which refunds
+          (part of) the stake instead of paying a win.
+
+        ``stake`` is the amount the player wagered this round. Callers pass it
+        so the boosts can be budgeted in coins; a call that omits it gets no
+        boost at all, which is the safe direction (see the constants above).
         """
-        boost_text = ""
         if is_winner:
             gambling_multiplier = await self._get_gambling_multiplier(user_id)
-            if gambling_multiplier != Decimal("1.0"):
-                payout = AmountUtils.round_currency(payout * gambling_multiplier)
-                boost_text += f" 🎰 Gamble ×{gambling_multiplier:.2f}"
-            return payout, True, boost_text
+            extra = self._win_boost_extra(payout, stake, gambling_multiplier)
+            if extra <= 0:
+                return payout, True, ""
+            payout = AmountUtils.round_currency(Decimal(str(payout)) + extra)
+            return payout, True, f" 🎰 Gamble ×{gambling_multiplier:.2f}"
 
-        # Loss: try a luck reroll
+        # Loss: try a luck save. The save pays a stake refund, so the gamble
+        # multiplier deliberately does not touch it - a saved loss is not a win.
         luck_multiplier = await self._get_luck_multiplier(user_id)
         chance = self._luck_second_chance(luck_multiplier)
-        if chance > 0 and secrets.SystemRandom().random() < chance:
-            gambling_multiplier = await self._get_gambling_multiplier(user_id)
-            if gambling_multiplier != Decimal("1.0"):
-                payout = AmountUtils.round_currency(payout * gambling_multiplier)
-                boost_text += f" 🎰 Gamble ×{gambling_multiplier:.2f}"
-            boost_text += f" 🍀 Luck ({chance*100:.0f}%)"
-            return payout, True, boost_text
+        if chance <= 0 or secrets.SystemRandom().random() >= chance:
+            return payout, False, ""
 
-        return payout, False, ""
+        refund = self._luck_save_refund(stake, payout)
+        if refund <= 0:
+            return payout, False, ""
+        return refund, True, f" 🍀 Luck save ({chance*100:.0f}%)"
 
     ### TEMPORARILY REMOVED FROM COMMAND GROUP
     ### DISCORD DISALLOWS THE WORD "CASINO" FROM COMMAND NAMES
@@ -4951,7 +5810,7 @@ class Casino(commands.Cog):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}game {name}`{aliases} — {desc}")
             else:
@@ -5718,7 +6577,7 @@ class Casino(commands.Cog):
 
             winnings = Decimal(amount) * win_multiplier
             winnings, final_winner, boost_text = await self._apply_item_multipliers(
-                user_id, winnings, is_winner
+                user_id, winnings, is_winner, stake=amount
             )
 
             if final_winner:
@@ -5873,14 +6732,10 @@ class Casino(commands.Cog):
 
             if sg_outcome == "win":
                 raw_multiplier = base_multiplier
-                winnings = (amount * raw_multiplier).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                winnings = AmountUtils.round_currency(amount * raw_multiplier)
             elif sg_outcome == "mega_win":
                 raw_multiplier = bonus_multiplier
-                winnings = (amount * raw_multiplier).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                winnings = AmountUtils.round_currency(amount * raw_multiplier)
             elif sg_outcome == "recovery":
                 raw_multiplier = SUPERGAMBLE_RECOVERY_MULTIPLIER
                 winnings = AmountUtils.round_currency(amount * raw_multiplier)
@@ -5891,14 +6746,12 @@ class Casino(commands.Cog):
             boost_text = ""
             if sg_outcome in ("win", "mega_win"):
                 winnings, _, boost_text = await self._apply_item_multipliers(
-                    user_id, winnings, True
+                    user_id, winnings, True, stake=amount
                 )
             elif sg_outcome == "loss":
-                potential_win = (amount * base_multiplier).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                potential_win = AmountUtils.round_currency(amount * base_multiplier)
                 potential_win, lucky_win, boost_text = await self._apply_item_multipliers(
-                    user_id, potential_win, False
+                    user_id, potential_win, False, stake=amount
                 )
                 if lucky_win:
                     sg_outcome = "win"
@@ -6265,7 +7118,7 @@ class Casino(commands.Cog):
         is_winner = raw_winnings > 0
         potential_payout = raw_winnings if is_winner else stake
         winnings, final_winner, boost_text = await self._apply_item_multipliers(
-            user_id, potential_payout, is_winner
+            user_id, potential_payout, is_winner, stake=stake
         )
 
         # Process game result for rakeback
@@ -6461,7 +7314,7 @@ class Casino(commands.Cog):
             result = f"🎲 You rolled {roll_desc}\nYou lost {currency_name} **{await self.formatter(amount)}**."
 
         winnings, final_winner, boost_text = await self._apply_item_multipliers(
-            user_id, winnings, is_winner
+            user_id, winnings, is_winner, stake=amount
         )
         winnings = AmountUtils.round_currency(winnings)
 
@@ -6825,7 +7678,7 @@ class Casino(commands.Cog):
                 is_winner = False
                 potential_payout = Decimal(hand_bet) * Decimal("2")
                 potential_payout, final_winner, boost_text = await self._apply_item_multipliers(
-                    user_id, potential_payout, is_winner
+                    user_id, potential_payout, is_winner, stake=hand_bet
                 )
                 if final_winner:
                     winnings = potential_payout
@@ -6881,7 +7734,7 @@ class Casino(commands.Cog):
                     result = f"You win {self.currency_name} **{await self.formatter(winnings)}**!"
 
                 winnings, _, boost_text = await self._apply_item_multipliers(
-                    user_id, winnings, is_winner
+                    user_id, winnings, is_winner, stake=hand_bet
                 )
                 if boost_text:
                     result += boost_text
@@ -6944,7 +7797,7 @@ class Casino(commands.Cog):
                 is_winner = False
                 potential_payout = Decimal(hand_bet) * Decimal("2")
                 potential_payout, final_winner, boost_text = await self._apply_item_multipliers(
-                    user_id, potential_payout, is_winner
+                    user_id, potential_payout, is_winner, stake=hand_bet
                 )
                 if final_winner:
                     winnings = potential_payout
@@ -7628,28 +8481,10 @@ class Casino(commands.Cog):
             )
 
             house_edge = await self.calculate_house_edge(user_id)
-            try:
-                deck = await self.fairgate_play_hilo_deck(user_id, PF)
-            except FairGateError as exc:
-                logger.exception("HiLo deck draw failed for user %s: %s", user_id, exc)
-                await self._refund_game_session(
-                    session_id,
-                    user_id=user_id,
-                    wallet_id=wallet_id,
-                    amount=bet_amount,
-                    reason="FairGate unreachable — hilo bet refunded",
-                )
-                self.active_players.discard(user_id)
-                await Embeds.error(ctx, description="🚫 The game server could not be reached. Your bet has been refunded.", delete_after=5)
-                return
-            # First card must be between 2 and Q (local parity).
-            first_idx = next(
-                (i for i, c in enumerate(deck) if c in HILO_CARDS[1:-1]),
-                None,
-            )
-            if first_idx is None:
-                raise RuntimeError("FairGate Hi-Lo deck contained no valid starting card")
-            current_card = deck.pop(first_idx)
+            # Deal locally from a real shuffled 52-card shoe (A high). The hand
+            # keeps going until the player cashes out or busts.
+            deck = hilo_deck_ranks()
+            current_card = deck.pop()
 
             view = HiLoView(
                 bot=self.bot, cog=self, user=user, bet_amount=bet_amount,
@@ -7729,6 +8564,702 @@ class Casino(commands.Cog):
         msg = await ctx.reply(view=view)
         view.message = msg
         self._register_session_handler(session_id, view.force_end)
+
+    # ------------------------------------------------------------------
+    # One-shot FairGate games (wheel / plinko / baccarat)
+    # ------------------------------------------------------------------
+    async def _play_bet_game(
+        self,
+        ctx: Context,
+        *,
+        game: str,
+        bet_amount: str,
+        resolve,
+        lose_multiplier: Decimal = Decimal("2"),
+        always_pay: bool = False,
+    ) -> dict | None:
+        """Run the shared bet -> FairGate -> settle -> record pipeline.
+
+        ``resolve`` is an async callable ``(user_id, PF) -> (won, multiplier,
+        detail, extra)`` that draws the outcome and renders its own line of
+        text. The wallet is debited first and a refund is registered before the
+        draw, so a game server failure always gives the stake back.
+        """
+        user_id = ctx.author.id
+        PF = await self.start_fairgate_proof(user_id)
+
+        wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
+        balance = Decimal(str(await self.bot.database.get_wallet_balance(wallet_id)))
+
+        try:
+            amount = await self.amount_handler(bet_amount, balance)
+            amount = Decimal(amount)
+        except ValueError as e:
+            await Embeds.error(ctx, description=str(e), delete_after=5)
+            return None
+
+        max_allowed = await self.bot.database.get_max_gamble_amount(user_id, False)
+        if amount > max_allowed:
+            amount = max_allowed
+            await Embeds.warning(
+                ctx,
+                description="You are a high-roller, so your bet was auto-adjusted to the max allowed: "
+                f"**{await self.formatter(amount)} {self.currency_name}**.",
+                color=discord.Color.orange(),
+                delete_after=5,
+            )
+
+        try:
+            await self.bot.database.spend_from_wallet(
+                wallet_id=wallet_id,
+                amount=amount,
+                description=f"{game.title()} bet",
+            )
+        except ValueError as e:
+            await Embeds.error(ctx, description=f"🚫 {e}", delete_after=5)
+            return None
+
+        session_id = await self._create_game_session(
+            ctx,
+            game,
+            owner_id=user_id,
+            wager_total=amount,
+            state={
+                "user_id": user_id,
+                "bet": str(amount),
+                "wallet_id": str(wallet_id),
+                "fairgate_verify_params": self._fairgate_verify_params(game),
+            },
+            rng=PF,
+        )
+        await self._add_refund(
+            session_id,
+            user_id=user_id,
+            wallet_id=str(wallet_id),
+            amount=amount,
+            reason=f"{game}_bet",
+        )
+
+        try:
+            won, multiplier, detail, extra = await resolve(user_id, PF)
+        except FairGateError as exc:
+            logger.exception("%s draw failed for user %s: %s", game, user_id, exc)
+            await self._refund_game_session(
+                session_id,
+                user_id=user_id,
+                wallet_id=wallet_id,
+                amount=amount,
+                reason=f"FairGate unreachable — {game} bet refunded",
+            )
+            await Embeds.error(
+                ctx,
+                description="🚫 The game server could not be reached. Your bet has been refunded.",
+                delete_after=5,
+            )
+            return None
+
+        if always_pay:
+            # Games like plinko pay whatever the ball lands on, even below 1x.
+            payout = AmountUtils.round_currency(Decimal(amount) * multiplier)
+            if won:
+                winnings, final_winner, boost_text = await self._apply_item_multipliers(
+                    user_id, payout, True, stake=amount
+                )
+                winnings = AmountUtils.round_currency(winnings)
+            else:
+                winnings, final_winner, boost_text = payout, False, ""
+        else:
+            potential = Decimal(amount) * multiplier if won else Decimal(amount) * lose_multiplier
+            winnings, final_winner, boost_text = await self._apply_item_multipliers(
+                user_id, potential, won, stake=amount
+            )
+            winnings = AmountUtils.round_currency(winnings)
+            if not final_winner:
+                winnings = Decimal("0")
+
+        await self.process_game_result(user_id, game, amount)
+
+        if winnings > 0:
+            try:
+                await self.bot.database.process_treasury_transaction(
+                    wallet_id=wallet_id,
+                    amount=winnings,
+                    description=f"{game.title()} win",
+                    transaction_type="game_payout",
+                )
+            except ValueError as e:
+                await Embeds.error(ctx, description=f"🚫 Transaction failed: {e}", delete_after=5)
+                return None
+
+        payout_multiplier = (
+            (winnings / amount).quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_UP)
+            if amount else Decimal("0")
+        )
+        outcome = "win" if final_winner else "loss"
+        await self._record_game_outcome(
+            user_id, game, outcome, amount, PF,
+            payout_multiplier=payout_multiplier,
+            payout_amount=winnings,
+        )
+
+        reported = winnings if winnings > 0 else amount
+        await self._remove_refund(session_id, user_id=user_id)
+        await self._log_game_event(
+            session_id,
+            "result",
+            {"outcome": outcome, "amount": str(reported)},
+        )
+        await self._end_game_session(
+            session_id,
+            outcome=outcome,
+            final_state={"amount": str(reported)},
+        )
+
+        return {
+            "amount": amount,
+            "winnings": winnings,
+            "won": final_winner,
+            "boost_text": boost_text,
+            "detail": detail,
+            **extra,
+        }
+
+    async def _play_local_bet_game(
+        self,
+        ctx: Context,
+        *,
+        game: str,
+        bet_amount: str,
+        resolve,
+    ) -> dict | None:
+        """The local-RNG twin of :meth:`_play_bet_game`.
+
+        ``resolve`` is an async callable ``(user_id) -> (won, multiplier,
+        detail, extra)`` that draws the outcome locally. The wallet is debited
+        first and a refund is registered before the draw so an unexpected
+        error can always hand the stake back.
+        """
+        user_id = ctx.author.id
+        wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
+        balance = Decimal(str(await self.bot.database.get_wallet_balance(wallet_id)))
+
+        try:
+            amount = await self.amount_handler(bet_amount, balance)
+            amount = Decimal(amount)
+        except ValueError as e:
+            await Embeds.error(ctx, description=str(e), delete_after=5)
+            return None
+
+        max_allowed = await self.bot.database.get_max_gamble_amount(user_id, False)
+        if amount > max_allowed:
+            amount = max_allowed
+            await Embeds.warning(
+                ctx,
+                description="You are a high-roller, so your bet was auto-adjusted to the max allowed: "
+                f"**{await self.formatter(amount)} {self.currency_name}**.",
+                color=discord.Color.orange(),
+                delete_after=5,
+            )
+
+        try:
+            await self.bot.database.spend_from_wallet(
+                wallet_id=wallet_id,
+                amount=amount,
+                description=f"{game.title()} bet",
+            )
+        except ValueError as e:
+            await Embeds.error(ctx, description=f"🚫 {e}", delete_after=5)
+            return None
+
+        session_id = await self._create_game_session(
+            ctx,
+            game,
+            owner_id=user_id,
+            wager_total=amount,
+            state={
+                "user_id": user_id,
+                "bet": str(amount),
+                "wallet_id": str(wallet_id),
+                "provider": "local",
+            },
+        )
+        await self._add_refund(
+            session_id,
+            user_id=user_id,
+            wallet_id=str(wallet_id),
+            amount=amount,
+            reason=f"{game}_bet",
+        )
+
+        won, multiplier, detail, extra = await resolve(user_id)
+
+        if won:
+            winnings, final_winner, boost_text = await self._apply_item_multipliers(
+                user_id, Decimal(amount) * multiplier, True, stake=amount
+            )
+            winnings = AmountUtils.round_currency(winnings)
+        else:
+            winnings, final_winner, boost_text = Decimal("0"), False, ""
+
+        await self.process_game_result(user_id, game, amount)
+
+        if winnings > 0:
+            await self.bot.database.process_treasury_transaction(
+                wallet_id=wallet_id,
+                amount=winnings,
+                description=f"{game.title()} win",
+                transaction_type="game_payout",
+            )
+
+        payout_multiplier = (
+            (winnings / amount).quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_UP)
+            if amount else Decimal("0")
+        )
+        outcome = "win" if final_winner else "loss"
+        await self._record_local_outcome(
+            user_id, game, outcome, amount,
+            payout_multiplier=payout_multiplier,
+            payout_amount=winnings,
+        )
+
+        reported = winnings if winnings > 0 else amount
+        await self._remove_refund(session_id, user_id=user_id)
+        await self._log_game_event(
+            session_id,
+            "result",
+            {"outcome": outcome, "amount": str(reported)},
+        )
+        await self._end_game_session(
+            session_id,
+            outcome=outcome,
+            final_state={"amount": str(reported)},
+        )
+
+        return {
+            "amount": amount,
+            "winnings": winnings,
+            "won": final_winner,
+            "boost_text": boost_text,
+            "detail": detail,
+            **extra,
+        }
+
+    async def _result_outcome(
+        self, amount: Decimal, winnings: Decimal, boost: str = ""
+    ) -> str:
+        """A win / break-even / partial-return / loss line for a settled bet."""
+        if winnings > amount:
+            return f"You won {self.currency_name} **{await self.formatter(winnings)}**!{boost}"
+        if winnings == amount:
+            return (
+                f"You broke even — returned {self.currency_name} "
+                f"**{await self.formatter(winnings)}**.{boost}"
+            )
+        if winnings > 0:
+            net = amount - winnings
+            return (
+                f"Returned {self.currency_name} **{await self.formatter(winnings)}** "
+                f"(net -{await self.formatter(net)}).{boost}"
+            )
+        return f"You lost {self.currency_name} **{await self.formatter(amount)}**."
+
+    async def _post_result(
+        self, ctx: Context, title: str, result: dict, *, footer: str | None = None
+    ) -> None:
+        """Post one game's result in the house embed style."""
+        outcome = await self._result_outcome(
+            result["amount"], result["winnings"], result.get("boost_text", "")
+        )
+        color = (
+            ctx.author.top_role.color
+            if getattr(ctx.author, "top_role", None)
+            else discord.Color.blurple()
+        )
+        embed = discord.Embed(color=color)
+        embed.set_author(name=title, icon_url=self.utils.get_avatar_url(ctx.author))
+        embed.description = f"{result['detail']}\n{outcome}"
+        if footer:
+            embed.set_footer(text=footer)
+        await ctx.reply(embed=embed)
+
+    async def _post_plinko_result(
+        self, ctx: Context, choice: str, result: dict
+    ) -> None:
+        """Animate the ball down the board, then land it in its hole."""
+        steps = result["steps"]
+        slot = result["slot"]
+        paytable = PLINKO_PAYTABLES[choice]
+        amount = result["amount"]
+        winnings = result["winnings"]
+        multiplier = Decimal(str(paytable[slot]))
+
+        color = (
+            ctx.author.top_role.color
+            if getattr(ctx.author, "top_role", None)
+            else discord.Color.blurple()
+        )
+        embed = discord.Embed(color=color)
+        embed.set_author(
+            name=f"Plinko · {choice} risk",
+            icon_url=self.utils.get_avatar_url(ctx.author),
+        )
+        embed.set_footer(
+            text=f"Bet: {await self.formatter(amount)} · every risk returns 95%"
+        )
+
+        dropping = "-# 🔻 Dropping..."
+        embed.description = (
+            plinko_board(PLINKO_ROWS, steps, 0, paytable) + f"\n\n{dropping}"
+        )
+        message = await ctx.reply(embed=embed)
+
+        for ball_row in range(1, PLINKO_ROWS + 1):
+            await asyncio.sleep(0.35)
+            landed = slot if ball_row == PLINKO_ROWS else None
+            board = plinko_board(PLINKO_ROWS, steps, ball_row, paytable, landed)
+            embed.description = f"{board}\n\n{dropping}"
+            try:
+                await message.edit(embed=embed)
+            except discord.HTTPException:
+                break
+
+        outcome = await self._result_outcome(
+            amount, winnings, result.get("boost_text", "")
+        )
+        board = plinko_board(PLINKO_ROWS, steps, PLINKO_ROWS, paytable, slot)
+        embed.description = (
+            f"{board}\n\n🔻 Landed on **{multiplier:g}x** · slot **{slot + 1}**\n{outcome}"
+        )
+        try:
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    @commands.command(
+        name="wheel",
+        aliases=["wof", "wheeloffortune"],
+        description="Spin the wheel of fortune — it stops between 0x and 25x.",
+    )
+    @unified_cooldown(5)
+    async def wheel(self, ctx: Context, *, bet_amount: str):
+        """Spin the weighted wheel. Usage: `!wheel 100`."""
+
+        async def resolve(user_id: int, PF: dict):
+            roll = int(
+                (await self.fairgate_play_numbers(
+                    user_id, PF, pool=10000, pick=1, replacement=True
+                ))[0]
+            )
+            landed = Decimal(str(wheel_segment(roll)))
+            won = landed > Decimal("1")
+            track = "".join(
+                f"**x{value:g}**" if Decimal(str(value)) == landed else f"`x{value:g}`"
+                for value, _ in WHEEL_SEGMENTS
+            )
+            detail = f"🎡 Landed on **x{landed:g}**\n{track}"
+            return won, (landed if won else Decimal("0")), detail, {}
+
+        result = await self._play_bet_game(
+            ctx, game="wheel", bet_amount=bet_amount, resolve=resolve
+        )
+        if result is None:
+            return
+        await self._post_result(
+            ctx,
+            "Wheel of Fortune",
+            result,
+            footer=f"Bet: {await self.formatter(result['amount'])} · x25 lands about once in 637 spins",
+        )
+
+    @commands.command(
+        name="plinko",
+        aliases=["plink"],
+        description="Drop a ball down the plinko board — low, medium or high risk.",
+    )
+    @unified_cooldown(5)
+    async def plinko(self, ctx: Context, bet_amount: str, risk: str = "medium"):
+        """Drop a ball. Usage: `!plinko 100 high`."""
+        choice = (risk or "medium").strip().lower()
+        if choice not in PLINKO_PAYTABLES:
+            await Embeds.error(
+                ctx, description="Risk must be `low`, `medium` or `high`.", delete_after=5
+            )
+            return
+        paytable = PLINKO_PAYTABLES[choice]
+
+        async def resolve(user_id: int, PF: dict):
+            draws = await self.fairgate_play_numbers(
+                user_id, PF, pool=2, pick=PLINKO_ROWS, replacement=True
+            )
+            steps = [int(value) == 1 for value in draws]
+            slot = max(0, min(sum(steps), len(paytable) - 1))
+            multiplier = Decimal(str(paytable[slot]))
+            # Every slot pays its own multiplier, so the ball landing on 0.66x
+            # returns 0.66x rather than nothing. ``won`` only controls boosts and
+            # how the result is labelled.
+            won = multiplier > Decimal("1")
+            detail = f"🔻 Landed on **{multiplier:g}x** · slot **{slot + 1}**"
+            return won, multiplier, detail, {"steps": steps, "slot": slot}
+
+        result = await self._play_bet_game(
+            ctx,
+            game="plinko",
+            bet_amount=bet_amount,
+            resolve=resolve,
+            always_pay=True,
+        )
+        if result is None:
+            return
+        await self._post_plinko_result(ctx, choice, result)
+
+    @commands.command(
+        name="baccarat",
+        aliases=["bac", "bacc"],
+        description="Play a coup of baccarat — bet on player, banker or tie.",
+    )
+    @unified_cooldown(5)
+    async def baccarat(self, ctx: Context, bet_amount: str, spot: str = "player"):
+        """Play one coup. Usage: `!baccarat 100 banker`."""
+        choice = (spot or "player").strip().lower()
+        if choice not in BACCARAT_PAYOUTS:
+            await Embeds.error(
+                ctx, description="Bet on `player`, `banker` or `tie`.", delete_after=5
+            )
+            return
+
+        async def resolve(user_id: int, PF: dict):
+            deck = await self.fairgate_play_cards(user_id, PF, deck_count=1)
+            values = [baccarat_card_value(card[:-1]) for card in deck]
+
+            def draw() -> int:
+                return values.pop()
+
+            coup = baccarat_round(draw)
+            outcome = str(coup["outcome"])
+            won = outcome == choice
+            multiplier = Decimal(str(BACCARAT_PAYOUTS[choice])) if won else Decimal("0")
+            player_hand = " ".join(f"`{baccarat_face(v)}`" for v in coup["player_hand"])
+            banker_hand = " ".join(f"`{baccarat_face(v)}`" for v in coup["banker_hand"])
+            detail = (
+                f"🃏 **Player** {player_hand} — **{coup['player']}**\n"
+                f"**Banker** {banker_hand} — **{coup['banker']}**\n"
+                f"-# You bet **{choice}** · **{outcome}** took the coup"
+            )
+            return won, multiplier, detail, {}
+
+        result = await self._play_bet_game(
+            ctx, game="baccarat", bet_amount=bet_amount, resolve=resolve
+        )
+        if result is None:
+            return
+        await self._post_result(
+            ctx,
+            "Baccarat",
+            result,
+            footer=f"Bet: {await self.formatter(result['amount'])} · player 2.05x · banker 2x · tie 9.5x",
+        )
+
+    async def _open_climb_game(self, ctx: Context, *, game: str, bet_amount: str, view_factory):
+        """Shared bet / session setup for the interactive local climbs.
+
+        ``view_factory`` is called with ``amount``, ``wallet_id`` and
+        ``session_id`` once the stake has been debited and a refund registered.
+        """
+        user_id = ctx.author.id
+        wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
+        balance = Decimal(str(await self.bot.database.get_wallet_balance(wallet_id)))
+
+        try:
+            amount = Decimal(await self.amount_handler(bet_amount, balance))
+        except ValueError as e:
+            await Embeds.error(ctx, description=str(e), delete_after=5)
+            return
+
+        max_allowed = await self.bot.database.get_max_gamble_amount(user_id, False)
+        if amount > max_allowed:
+            amount = max_allowed
+            await Embeds.warning(
+                ctx,
+                description="You are a high-roller, so your bet was auto-adjusted to the max allowed: "
+                f"**{await self.formatter(amount)} {self.currency_name}**.",
+                color=discord.Color.orange(),
+                delete_after=5,
+            )
+
+        try:
+            await self.bot.database.spend_from_wallet(
+                wallet_id=wallet_id, amount=amount, description=f"{game.title()} bet"
+            )
+        except ValueError as e:
+            await Embeds.error(ctx, description=f"🚫 {e}", delete_after=5)
+            return
+
+        session_id = await self._create_game_session(
+            ctx,
+            game,
+            owner_id=user_id,
+            wager_total=amount,
+            state={
+                "user_id": user_id,
+                "bet": str(amount),
+                "wallet_id": str(wallet_id),
+                "provider": "local",
+            },
+        )
+        await self._add_refund(
+            session_id,
+            user_id=user_id,
+            wallet_id=str(wallet_id),
+            amount=amount,
+            reason=f"{game}_bet",
+        )
+
+        view = view_factory(
+            bet=amount, wallet_id=wallet_id, session_id=session_id
+        )
+        await view.build_initial()
+        msg = await ctx.reply(view=view)
+        view.message = msg
+        self._register_session_handler(session_id, view.force_end)
+
+    @commands.command(
+        name="limbo",
+        aliases=["limbogame"],
+        description="Name a target multiplier and see whether the draw clears it.",
+        help=(
+            "Draws a uniform multiplier between 0 and ~99x. You win your staked "
+            "amount times your target whenever the draw lands on or above it.\n\n"
+            "**Usage**\n"
+            "`limbo <bet> [target]` — target defaults to `2`.\n"
+            "**Example** · `limbo 100 2.5`"
+        ),
+    )
+    @unified_cooldown(5)
+    async def limbo(self, ctx: Context, bet_amount: str, target: str = "2"):
+        """Resolve a Limbo bet with the local RNG. Usage: `!limbo 100 2.5`."""
+        try:
+            target_value = Decimal(target)
+        except (InvalidOperation, ValueError):
+            await Embeds.error(
+                ctx,
+                description="Target must be a number, e.g. `2`, `1.5` or `100`.",
+                delete_after=5,
+            )
+            return
+        if not (LIMBO_MIN_TARGET <= target_value <= LIMBO_MAX_TARGET):
+            await Embeds.error(
+                ctx,
+                description=(
+                    f"Target must be between `{LIMBO_MIN_TARGET}` and "
+                    f"`{LIMBO_MAX_TARGET:g}`."
+                ),
+                delete_after=5,
+            )
+            return
+
+        async def resolve(user_id: int):
+            result = self._draw_limbo_result()
+            won = result >= target_value
+            win_chance = float(LOCAL_RTP / target_value) * 100
+            detail = (
+                f"🎯 Target **{target_value:g}x** • Rolled **{result:g}x**\n"
+                f"-# Win chance {win_chance:.2f}%"
+            )
+            return won, (target_value if won else Decimal("0")), detail, {}
+
+        result = await self._play_local_bet_game(
+            ctx, game="limbo", bet_amount=bet_amount, resolve=resolve
+        )
+        if result is None:
+            return
+        await self._post_result(
+            ctx,
+            "Limbo",
+            result,
+            footer=f"Bet: {await self.formatter(result['amount'])} · 99% return",
+        )
+
+    @commands.command(
+        name="tower",
+        aliases=["dragontower", "dragon"],
+        description="Climb the Dragon Tower — pick eggs and dodge the dragons.",
+        help=(
+            "Climb 9 rows, picking one egg per row. A dragon in the row ends the "
+            "run; every safe row raises the multiplier. Cash out any time.\n\n"
+            "**Usage**\n"
+            "`tower <bet> [difficulty]` — easy/medium/hard/expert/master.\n"
+            "**Example** · `tower 100 medium`"
+        ),
+    )
+    @unified_cooldown(5)
+    async def tower(self, ctx: Context, bet_amount: str, difficulty: str = "medium"):
+        """Start a Dragon Tower climb. Usage: `!tower 100 hard`."""
+        choice = (difficulty or "medium").strip().lower()
+        if choice not in TOWER_DIFFICULTIES:
+            await Embeds.error(
+                ctx,
+                description="Difficulty must be one of: "
+                + ", ".join(f"`{name}`" for name in TOWER_DIFFICULTIES)
+                + ".",
+                delete_after=5,
+            )
+            return
+
+        await self._open_climb_game(
+            ctx,
+            game="tower",
+            bet_amount=bet_amount,
+            view_factory=lambda **kw: DragonTowerView(
+                bot=self.bot,
+                cog=self,
+                user_id=ctx.author.id,
+                currency_name=self.currency_name,
+                difficulty=choice,
+                **kw,
+            ),
+        )
+
+    @commands.command(
+        name="chicken",
+        aliases=["crossyroad"],
+        description="Cross the road lane by lane and cash out before a car hits.",
+        help=(
+            "Cross up to 9 lanes. Each lane is survived with the difficulty's "
+            "chance and raises the multiplier. Cash out any time.\n\n"
+            "**Usage**\n"
+            "`chicken <bet> [difficulty]` — easy/medium/hard/daredevil.\n"
+            "**Example** · `chicken 100 hard`"
+        ),
+    )
+    @unified_cooldown(5)
+    async def chicken(
+        self, ctx: Context, bet_amount: str, difficulty: str = "medium"
+    ):
+        """Start a Chicken run. Usage: `!chicken 100 daredevil`."""
+        choice = (difficulty or "medium").strip().lower()
+        if choice not in CHICKEN_DIFFICULTIES:
+            await Embeds.error(
+                ctx,
+                description="Difficulty must be one of: "
+                + ", ".join(f"`{name}`" for name in CHICKEN_DIFFICULTIES)
+                + ".",
+                delete_after=5,
+            )
+            return
+
+        await self._open_climb_game(
+            ctx,
+            game="chicken",
+            bet_amount=bet_amount,
+            view_factory=lambda **kw: ChickenView(
+                bot=self.bot,
+                cog=self,
+                user_id=ctx.author.id,
+                currency_name=self.currency_name,
+                difficulty=choice,
+                **kw,
+            ),
+        )
 
     @commands.hybrid_command(
         name="crash", description="Start a crash game in the current channel."
@@ -7932,6 +9463,15 @@ class Casino(commands.Cog):
             value=f"{view.current_multiplier:.2f}×",
             inline=False,
         )
+        embed.add_field(
+            name="Crash Limit",
+            value=(
+                f"{view.crash_limit:.2f}×"
+                if view.crash_limit is not None
+                else "Off (uncapped)"
+            ),
+            inline=False,
+        )
 
         lines = []
         for uid, bet in view.players.items():
@@ -7999,6 +9539,62 @@ class Casino(commands.Cog):
 
         win_btn.callback = win_cb
         admin_view.add_item(win_btn)
+
+        limit_btn = discord.ui.Button(
+            label="Set Crash Limit", style=discord.ButtonStyle.primary
+        )
+
+        async def limit_cb(inter: discord.Interaction):
+            if inter.user.id != admin_id:
+                return await inter.response.send_message(
+                    "Not allowed.", ephemeral=True
+                )
+
+            modal = discord.ui.Modal(title="Set Crash Limit")
+            limit_input = discord.ui.TextInput(
+                label="Max multiplier",
+                placeholder="e.g. 25, or 'off' to remove the limit",
+                required=True,
+                max_length=16,
+            )
+            modal.add_item(limit_input)
+
+            async def on_submit(sub: discord.Interaction):
+                raw = limit_input.value.strip().lower()
+                if raw in {"off", "none", "clear", "unlimited"}:
+                    view.crash_limit = None
+                    return await sub.response.send_message(
+                        "Crash limit cleared — the round can run uncapped again.",
+                        ephemeral=True,
+                    )
+                try:
+                    value = Decimal(raw)
+                except InvalidOperation:
+                    return await sub.response.send_message(
+                        "Enter a multiplier like `25` or `1.5`, or `off` to clear it.",
+                        ephemeral=True,
+                    )
+                if not value.is_finite() or value <= 1:
+                    return await sub.response.send_message(
+                        "The crash limit must be a number greater than 1.0×.",
+                        ephemeral=True,
+                    )
+                if not view.is_running or view.game_phase == "ended":
+                    return await sub.response.send_message(
+                        "This round has already ended.", ephemeral=True
+                    )
+                view.crash_limit = value
+                return await sub.response.send_message(
+                    f"Crash limit set to **{value:.2f}×** — the round will crash "
+                    "when the multiplier reaches it.",
+                    ephemeral=True,
+                )
+
+            modal.on_submit = on_submit
+            await inter.response.send_modal(modal)
+
+        limit_btn.callback = limit_cb
+        admin_view.add_item(limit_btn)
 
         await ctx.send(embed=embed, view=admin_view)
         if ctx.message:
@@ -8488,10 +10084,15 @@ class Casino(commands.Cog):
             view.add_item(container)
             await ctx.reply(view=view)
 
-    @commands.command(
+    @commands.hybrid_command(
         name="keno", description="Play Keno — pick numbers and match the draw."
     )
     async def keno(self, ctx: commands.Context, player_bet: str):
+        # Acknowledge before the FairGate proof and session bookkeeping below;
+        # otherwise the slash interaction blows Discord's three-second deadline
+        # and shows "this application took too long to respond".
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            await ctx.defer()
         try:
             user_id = ctx.author.id
 
@@ -8582,6 +10183,11 @@ class TableUI(discord.ui.LayoutView):
         self.returned = Decimal("0")
 
         self.selected_emoji = cog.currency_name
+        # Button components only accept a custom emoji when it belongs to the
+        # guild the interaction is happening in, so a hardcoded cross-guild
+        # emoji is rejected with 50035 "Invalid emoji". Use a unicode coin for
+        # the tiles; the custom emoji is still fine inside message text.
+        self.button_emoji = "🪙"
         self.selected_color = discord.ButtonStyle.blurple
         self.default_color = discord.ButtonStyle.gray
         self.win_color = discord.ButtonStyle.green
@@ -8605,6 +10211,25 @@ class TableUI(discord.ui.LayoutView):
             return False
         return True
 
+    async def on_error(
+        self, itn: discord.Interaction, error: Exception, item
+    ) -> None:
+        """Acknowledge and report a failed board interaction.
+
+        Without this an exception inside a number-button callback left the
+        interaction unanswered, which Discord surfaces as "the application did
+        not respond" and hides the real cause.
+        """
+        logger.exception("Keno board interaction failed for %r: %s", item, error)
+        try:
+            message = "❌ Something went wrong with that button. Try again."
+            if not itn.response.is_done():
+                await itn.response.send_message(message, ephemeral=True)
+            else:
+                await itn.followup.send(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     def get_all_buttons(self) -> list["NumberButton"]:
         buttons = []
         for row in self.container.children:
@@ -8619,7 +10244,7 @@ class TableUI(discord.ui.LayoutView):
         picks = set(picks)
         for index, button in enumerate(self.get_all_buttons()):
             if index in picks:
-                button.emoji = self.selected_emoji
+                button.emoji = self.button_emoji
                 button.style = self.selected_color
             else:
                 button.emoji = None
@@ -8628,7 +10253,7 @@ class TableUI(discord.ui.LayoutView):
     def paint_result(self, picks, drawn) -> None:
         picks, drawn = set(picks), set(drawn)
         for index, button in enumerate(self.get_all_buttons()):
-            button.emoji = self.selected_emoji if index in picks else None
+            button.emoji = self.button_emoji if index in picks else None
             if index in drawn:
                 button.style = self.win_color
             elif index in picks:
@@ -8731,7 +10356,7 @@ class NumberButton(discord.ui.Button):
             self.emoji = None
             self.style = table.default_color
         else:
-            self.emoji = table.selected_emoji
+            self.emoji = table.button_emoji
             self.style = table.selected_color
 
         await itn.response.edit_message(view=table)
@@ -8762,6 +10387,20 @@ class GameUI(discord.ui.LayoutView):
 
     async def interaction_check(self, itn: discord.Interaction) -> bool:
         return await self.table.interaction_check(itn)
+
+    async def on_error(
+        self, itn: discord.Interaction, error: Exception, item
+    ) -> None:
+        """Surface a failed control interaction instead of leaving it hanging."""
+        logger.exception("Keno controls interaction failed for %r: %s", item, error)
+        try:
+            message = "❌ Something went wrong with that button. Try again."
+            if not itn.response.is_done():
+                await itn.response.send_message(message, ephemeral=True)
+            else:
+                await itn.followup.send(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     async def push(self) -> None:
         if not self.message:
@@ -8907,7 +10546,15 @@ class BetButton(discord.ui.Button):
 
         async with table.lock:
             if table.phase != "betting" or table.rounds_played != pressed_on_round:
-                return
+                # Don't leave the press unanswered: tell the player why nothing
+                # happened instead of the button appearing dead.
+                return await Embeds.warning(
+                    itn,
+                    "That round has already moved on. Pick your numbers and bet again.",
+                    color=discord.Color.yellow(),
+                    ephemeral=True,
+                    reply=False,
+                )
             table.phase = "resolving"
             try:
                 await self.resolve(itn, container, table)
@@ -9039,15 +10686,22 @@ class BetButton(discord.ui.Button):
         is_winner = total_win > player_bet
         if is_winner:
             total_win, _, boost_text = await self.cog._apply_item_multipliers(
-                player_id, total_win, True
+                player_id, total_win, True, stake=player_bet
             )
         else:
             saved_amount, saved, boost_text = await self.cog._apply_item_multipliers(
-                player_id, player_bet, False
+                player_id, player_bet, False, stake=player_bet
             )
-            if saved:
+            if saved and saved_amount > total_win:
+                # Keno is the one game where a losing row still returns a
+                # fraction of the stake, so a save may only ever upgrade it.
                 total_win = saved_amount
                 is_winner = True
+            elif saved:
+                # The row already returned at least as much as a save would;
+                # keep its own figure and don't advertise a save that did
+                # nothing.
+                boost_text = ""
 
         total_win = AmountUtils.round_currency(total_win)
         payout = total_win if total_win > 0 else Decimal("0")

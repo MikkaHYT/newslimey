@@ -851,7 +851,7 @@ class Misc(commands.Cog, name="Misc"):
 
         await ctx.reply(embed=embed)
 
-    @commands.hybrid_command(name="karma", description="View a user's reputation score.")
+    @commands.command(name="karma", description="View a user's reputation score.")
     @commands.guild_only()
     @unified_cooldown(5)
     async def karma(self, ctx: Context, member: discord.Member = None) -> None:
@@ -1255,19 +1255,34 @@ class Misc(commands.Cog, name="Misc"):
         
         await Embeds.success(ctx, f"The juul flavor has been changed to **{flavor.capitalize()}** {flavor_emoji}", title="Flavor Changed!", reply=False)
 
-    @commands.hybrid_command(
-        name="tz", aliases=["timezone", "time"], description="Show your current timezone."
+    @commands.command(
+        name="tz",
+        aliases=["timezone", "time"],
+        description="Show your local time, or another member's.",
     )
     @commands.guild_only()
     @unified_cooldown(5)
-    async def show_time(self, ctx: Context):
+    async def show_time(self, ctx: Context, member: discord.Member = None):
+        target = member or ctx.author
+        is_self = target.id == ctx.author.id
+
+        if target.bot:
+            await ctx.reply("Bots don't have a local time.", delete_after=10)
+            return
+
         try:
-            user_timezone = await self.bot.database.get_user_timezone(ctx.author.id)
+            user_timezone = await self.bot.database.get_user_timezone(target.id)
             if not user_timezone:
-                await ctx.reply(
-                    "You haven't set your timezone yet! Use `!setloc <location>` to set it.",
-                    delete_after=10,
-                )
+                if is_self:
+                    await ctx.reply(
+                        "You haven't set your timezone yet! Use `!setloc <location>` to set it.",
+                        delete_after=10,
+                    )
+                else:
+                    await ctx.reply(
+                        f"**{target.display_name}** hasn't set up their location yet.",
+                        delete_after=10,
+                    )
                 return
             tz = pytz.timezone(user_timezone)
             current_time = discord.utils.utcnow().astimezone(tz)
@@ -1275,13 +1290,17 @@ class Misc(commands.Cog, name="Misc"):
             formatted_time = current_time.strftime("%I:%M %p")
 
             embed = discord.Embed(
-                title="Your Local Time",
-                description=f"Your current local time is: **{formatted_time}**",
+                title="Your Local Time" if is_self else f"{target.display_name}'s Local Time",
+                description=(
+                    f"Your current local time is: **{formatted_time}**"
+                    if is_self
+                    else f"Their current local time is: **{formatted_time}**"
+                ),
                 color=discord.Color.blurple(),
             )
             embed.set_author(
-                name=ctx.author.display_name,
-                icon_url=self.utils.get_avatar_url(ctx.author),
+                name=target.display_name,
+                icon_url=self.utils.get_avatar_url(target),
             )
             await ctx.reply(embed=embed)
 
@@ -1334,7 +1353,7 @@ class Misc(commands.Cog, name="Misc"):
         await self.bot.database.set_user_location(ctx.author.id, standardized_location)
         await ctx.reply(f"📍 Your location has been set.")
 
-    @commands.hybrid_command(
+    @commands.command(
         name="weather", aliases=["temp", "wind"], description="Check your local weather."
     )
     @commands.guild_only()

@@ -5,6 +5,8 @@ import asyncio
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 from discord.ext.commands import Context
+
+from utils.core.prefixes import render
 from collections import defaultdict
 from typing import Optional
 import humanfriendly
@@ -543,7 +545,7 @@ class Watchdog(commands.Cog, name="Watchdog"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}watchdog {name}`{aliases} — {desc}")
             else:

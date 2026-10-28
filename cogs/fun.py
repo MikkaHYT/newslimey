@@ -17,6 +17,79 @@ from utils.guardrails import check_slash_guardrails
 logger = logging.getLogger("discord.client")
 
 
+def timeout_blocked_reason(
+    guild: discord.Guild, member: discord.Member
+) -> str | None:
+    """Why the bot cannot time ``member`` out, or ``None`` when it can.
+
+    Holding Moderate Members is not enough on its own: Discord only lets a bot
+    act on members whose highest role sits *below* the bot's own highest role,
+    so somebody who outranks the bot is untouchable no matter which permissions
+    the bot has (Administrator included). On this server the bot's role sat
+    below `Members`, which made every draw look like a missing permission.
+    """
+    me = guild.me
+    if me is None:
+        return "I am not in this server"
+    if member.id == guild.owner_id:
+        return "they own the server"
+    if member.id == me.id:
+        return "that's me"
+    if member.top_role >= me.top_role:
+        return f"their {member.top_role.name} role outranks mine"
+    return None
+
+
+def describe_skipped(skipped: list[tuple[str, str]], limit: int = 10) -> str:
+    """A footer-ready list of the players the draw could not reach, and why."""
+    return ", ".join(f"{name} ({why})" for name, why in skipped[:limit])
+
+
+def timeout_blocked_note(guild: discord.Guild) -> str:
+    """The card shown when nobody who joined can actually be timed out."""
+    me = guild.me
+    mine = (
+        f"**{me.top_role.name}** (position {me.top_role.position})"
+        if me is not None and me.top_role is not None
+        else "my highest role"
+    )
+    return (
+        "Everyone who joined was safe — I can't time any of them out. It is "
+        "not my permissions (I have Moderate Members); it is role order: "
+        "Discord only lets me act on members whose highest role sits below "
+        f"mine, and my highest role is {mine}.\n\n"
+        "Fix it in **Server Settings → Roles**: drag my role above the roles "
+        "those players hold, then run the game again."
+    )
+
+
+#: The Gay Time clip handed out by `!gaytime`. This is a Discord CDN link, so
+#: it carries a signed expiry (`?ex=...`) - swap it here when it lapses.
+GAY_TIME_URL = (
+    "https://cdn.discordapp.com/attachments/865920571065892864/"
+    "1560757535131050026/Gay_Time.m4a?ex=6ad3e039&is=6ad28eb9"
+    "&hm=778b3cc207eae0eaf6bf24dbf2387016a311bc6b466f993a758c94f15aea7868"
+)
+
+
+class GayTimeView(discord.ui.View):
+    """The single link button that ships with `!gaytime`.
+
+    Link buttons are handled entirely by Discord's client, so the view holds
+    no state and never needs to expire.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="🎵 Gay Time",
+                url=GAY_TIME_URL,
+            )
+        )
+
+
 class Fun(commands.Cog, name="Fun"):
     def __init__(self, bot) -> None:
         self.bot = bot
@@ -191,6 +264,16 @@ class Fun(commands.Cog, name="Fun"):
     @commands.command(name="boom", aliases=["kaboom"], description="boom.")
     async def pow(self, ctx: Context):
         await ctx.reply("pow :boom:")
+
+    @commands.command(name="gaytime", description="Hand out the Gay Time clip.")
+    async def gaytime(self, ctx: Context):
+        """Post the Gay Time clip behind a button."""
+        embed = discord.Embed(
+            title="from pookie brux",
+            description="here you go",
+            color=discord.Color.blurple(),
+        )
+        await ctx.reply(embed=embed, view=GayTimeView())
 
     @commands.command(
         name="gay", aliases=["gayrate"], description="Estimates how homosexual a user is"
@@ -369,7 +452,7 @@ class Fun(commands.Cog, name="Fun"):
         await ctx.reply(embed=embed)
 
     @commands.command(
-        name="banroulette", aliases=["br"], description="Play a game of banroulette"
+        name="banroulette", aliases=["banrou"], description="Play a game of banroulette"
     )
     @commands.has_guild_permissions(ban_members=True)
     async def banroulette(self, ctx: Context):
@@ -433,7 +516,9 @@ class Fun(commands.Cog, name="Fun"):
     @commands.command(
         name="timeoutroulette", aliases=["tr"], description="Play a game of timeout roulette"
     )
+    @commands.guild_only()
     @commands.has_guild_permissions(moderate_members=True)
+    @commands.bot_has_permissions(moderate_members=True)
     async def timeoutroulette(self, ctx: Context):
         """Play a game of timeout roulette. Players react to join the game and one player is randomly selected to be timed out."""
         embed = discord.Embed(
@@ -463,38 +548,113 @@ class Fun(commands.Cog, name="Fun"):
             await message.edit(embed=embed)
             return
 
-        timeout_user = random.choice(list(users))
+        # Work out who the draw can actually touch before drawing. A member
+        # whose highest role outranks the bot's cannot be timed out whatever
+        # permissions the bot holds, so drawing them and reporting "no
+        # permission" was both wrong and untraceable.
+        candidates: list[discord.Member] = []
+        skipped: list[tuple[str, str]] = []
+        for candidate in users:
+            member = ctx.guild.get_member(candidate.id)
+            if member is None:
+                try:
+                    member = await ctx.guild.fetch_member(candidate.id)
+                except (discord.NotFound, discord.HTTPException):
+                    skipped.append((candidate.display_name, "they left the server"))
+                    continue
 
-        victim = await ctx.guild.fetch_member(timeout_user.id)
-        if not victim:
+            reason = timeout_blocked_reason(ctx.guild, member)
+            if reason:
+                skipped.append((member.display_name, reason))
+                continue
+            candidates.append(member)
+
+        timeout_duration = random.randint(60, 600)  # 1-10 minutes
+        victim = None
+
+        random.shuffle(candidates)
+
+        # Draw from the players the bot can act on. If Discord still refuses
+        # (a channel-level denial, or a role moved mid-game) try the next one.
+        for member in candidates:
+            try:
+                await member.timeout(
+                    discord.utils.utcnow() + timedelta(seconds=timeout_duration),
+                    reason="Lost Timeout Roulette",
+                )
+            except discord.HTTPException as e:
+                refused = getattr(e, "text", None) or str(e)
+                logger.warning(
+                    f"Timeout Roulette could not time out {member.id}: {e}"
+                )
+                skipped.append((member.display_name, f"Discord refused it ({refused})"))
+                continue
+
+            victim = member
+            break
+
+        if victim is None:
             embed = discord.Embed(
                 title="Timeout Roulette",
-                description="Could not find the selected user in the guild.",
+                description=timeout_blocked_note(ctx.guild),
                 color=discord.Color.red(),
             )
+            if skipped:
+                embed.set_footer(text="Passed over: " + describe_skipped(skipped))
             await message.edit(embed=embed)
             return
 
-        timeout_duration = random.randint(60, 600)  # 1-10 minutes
+        embed = discord.Embed(
+            title="Timeout Roulette",
+            description=(
+                f"{victim.mention} has been timed out for "
+                f"{timeout_duration // 60} minutes and "
+                f"{timeout_duration % 60} seconds! ⏰"
+            ),
+            color=discord.Color.orange(),
+        )
+        if skipped:
+            embed.set_footer(
+                text="Passed over (out of reach): " + describe_skipped(skipped)
+            )
+        await message.edit(embed=embed)
 
-        try:
-            await victim.timeout(
-                discord.utils.utcnow() + timedelta(seconds=timeout_duration),
-                reason="Lost Timeout Roulette",
+    @commands.hybrid_command(
+        name="randompick",
+        aliases=["pick", "choose"],
+        description="Pick one option at random from a comma-separated list.",
+    )
+    @unified_cooldown(3)
+    async def random_pick(self, ctx: Context, *, options: str = "") -> None:
+        """Pick one option at random from a comma-separated list.
+
+        Usage: `!random one,two,three,four,five`.
+        """
+        items = [part.strip() for part in options.split(",") if part.strip()]
+        if len(items) < 2:
+            await Embeds.error(
+                ctx,
+                "Give me at least two options separated by commas, "
+                "e.g. `!random one,two,three`.",
+                title="Not enough options",
+                reply=True,
             )
-            embed = discord.Embed(
-                title="Timeout Roulette",
-                description=f"{victim.mention} has been timed out for {timeout_duration // 60} minutes and {timeout_duration % 60} seconds! ⏰",
-                color=discord.Color.orange(),
-            )
-        except discord.Forbidden:
-            embed = discord.Embed(
-                title="Timeout Roulette",
-                description=f"{victim.mention} would have been timed out, but I don't have permission! ⏰",
-                color=discord.Color.red(),
-            )
-        except Exception as e:
-            await Embeds.error(ctx, f"Failed to timeout {victim.mention}: {str(e)}", title="Timeout Roulette", reply=False)
+            return
+
+        chosen = random.choice(items)
+        color = (
+            discord.Color.blurple()
+            if isinstance(ctx.channel, discord.DMChannel)
+            else (ctx.author.top_role.color or discord.Color.blurple())
+        )
+        embed = discord.Embed(
+            title="🎲 Random pick",
+            description=f"**{chosen}**",
+            color=color,
+        )
+        embed.set_footer(text=f"Chosen from {len(items)} option(s)")
+        await ctx.reply(embed=embed)
+
 
 async def setup(bot) -> None:
     await bot.add_cog(Fun(bot))

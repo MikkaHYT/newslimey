@@ -37,6 +37,14 @@ def _get_hash_key() -> bytes:
     return key.encode("utf-8")
 
 
+#: Characters of the digest kept in a scope-qualified hash. The rest of the
+#: 64-character budget is for the ``:g<scope>`` marker.
+_SCOPED_DIGEST_CHARS = 40
+
+#: Matches the scope-qualified form produced by :func:`scoped_user_hash`.
+_SCOPED_HASH_RE = re.compile(r"^[0-9a-fA-F]{40}:g\d+$")
+
+
 def hash_user_id(user_id: int) -> str:
     """Return a deterministic HMAC-SHA256 hex hash of a Discord user ID.
 
@@ -46,6 +54,26 @@ def hash_user_id(user_id: int) -> str:
     """
     key = _get_hash_key()
     return hmac.new(key, str(int(user_id)).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def scoped_user_hash(user_id: int, scope: int = 0) -> str:
+    """Hash a user ID for an economy scope.
+
+    Scope ``0`` is the shared bot-wide economy, so it returns the ordinary
+    :func:`hash_user_id` and every existing row and behaviour is unchanged.
+    Any other scope returns a distinct key that still fits the 64-character
+    columns the economy uses: a truncated digest plus a ``:g<scope>`` marker.
+    The marker is what lets a query pick out one scope's rows with a suffix
+    match, which the cross-user aggregates (leaderboards, supply totals) need.
+    """
+    scope = int(scope or 0)
+    if scope == 0:
+        return hash_user_id(user_id)
+    key = _get_hash_key()
+    digest = hmac.new(
+        key, f"{int(user_id)}:g{scope}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{digest[:_SCOPED_DIGEST_CHARS]}:g{scope}"
 
 
 def hash_user_id_analytics(user_id: int) -> str:
@@ -70,12 +98,17 @@ def hash_user_id_analytics(user_id: int) -> str:
     return hmac.new(key, str(int(user_id)).encode("utf-8"), hashlib.sha256).hexdigest()
 
 def is_hash(value: Any) -> bool:
-    """Return True if a stored user ID value is a HMAC-SHA256 hex hash."""
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(c in "0123456789abcdefABCDEF" for c in value)
-    )
+    """Return True if a stored user ID value is a user hash.
+
+    Covers both the plain 64-character HMAC hash and the scope-qualified form
+    from :func:`scoped_user_hash`, so scope-aware economy rows still resolve
+    back to a Discord user.
+    """
+    if not isinstance(value, str):
+        return False
+    if len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return True
+    return bool(_SCOPED_HASH_RE.match(value))
 
 
 async def resolve_id(database, value: Any) -> Optional[int]:

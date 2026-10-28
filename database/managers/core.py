@@ -4,7 +4,8 @@ from sqlalchemy.future import select
 from sqlalchemy import update, delete
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from sqlalchemy import func, case, text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+# SQLite dialect upsert (INSERT ... ON CONFLICT); the bot uses a local SQLite DB.
+from sqlalchemy.dialects.sqlite import insert as pg_insert
 from typing import List, Optional
 from utils.security import raise_if_url
 from ..models import (

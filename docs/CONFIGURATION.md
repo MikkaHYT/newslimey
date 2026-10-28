@@ -8,7 +8,7 @@ This document explains runtime and persistent configuration for TPNEBOT.
 Required:
 - `TOKEN`: Discord bot token.
 - `DB_PW`: Postgres password for the postgres user (used to build async URL).
-- `DEVELOPER_CHANNEL_ID`: Channel ID receiving internal error reports and stack traces.
+- `DEVELOPER_CHANNEL_ID`: Channel ID receiving the command log (every invocation, batched into digests: command, user, time, channel and server) plus internal error reports and stack traces. Servers are logged by default; keep one out of the log with `!admin logs exclude <server id>` and put it back with `!admin logs include <server id>`. The exclusion list lives in the `bot_settings` row `command_log_excluded_guilds`.
 
 Optional (future expansion): additional feature toggles may be added; update this file accordingly.
 
@@ -43,6 +43,9 @@ Stored in CommandCooldown table with expiry timestamp. Used by invocation logic 
 
 ### Blacklist
 Global user exclusion. Contains user_id and reason.
+
+### Bot Settings
+Bot-wide and per-server switches keyed by `(guild_id, key)`; guild id `0` holds the bot-wide ones. Relevant here: `bot_admins` (extra owner IDs) and `command_log_excluded_guilds` (servers left out of the developer-channel command log).
 
 ### Wallet and Seeds
 Wallet table contains server seed, previous server seed, client seed, nonce fields (names referenced in code comments). Used for fairness draws.

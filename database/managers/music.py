@@ -21,6 +21,27 @@ class MusicMixin(BaseManager):
             result = await session.execute(select(LastFMusers.lastfm_username))
             return result.scalars().all()
 
+    async def get_lastfm_accounts(self) -> list[tuple[str, str]]:
+        """Every stored Last.fm link, as ``(hashed discord id, username)``.
+
+        The raw Discord ids behind those hashes are recoverable from the
+        ``user_identities`` map, which is what the reference bot's local
+        scrobble store is keyed by.
+        """
+        try:
+            async with self.async_sessionmaker() as session:
+                result = await session.execute(
+                    select(LastFMusers.discord_id, LastFMusers.lastfm_username)
+                )
+                return [
+                    (str(hashed), str(username))
+                    for hashed, username in result.all()
+                    if hashed and username
+                ]
+        except SQLAlchemyError as e:
+            logging.error(f"Error fetching LastFM accounts: {e}")
+            return []
+
     async def get_lastfm_username(self, discord_id: str) -> str:
         discord_id = self.hash_user_id(discord_id)
         try:

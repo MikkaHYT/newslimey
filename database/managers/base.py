@@ -1,5 +1,7 @@
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import text, event
+# The bot runs on a local SQLite database, so upserts use the SQLite dialect's
+# INSERT ... ON CONFLICT support (PostgreSQL's pg_insert is no longer used).
+from sqlalchemy.dialects.sqlite import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.exc import (
     SQLAlchemyError,
@@ -15,7 +17,7 @@ from contextlib import asynccontextmanager
 import time
 import functools
 from typing import Optional
-from ..models import Base, UserIdentity
+from ..models import Base, EconomyIdentity, UserIdentity
 import logging
 
 
@@ -106,12 +108,50 @@ class BaseManager:
         """Hash a raw Discord user ID for storage or lookup."""
         return _hash_user_id(user_id)
 
+    @staticmethod
+    def econ_hash_user_id(user_id) -> str:
+        """Hash a raw Discord user ID for the economy scope this task is in.
+
+        Scope 0 (the default, and every background task) is the plain user hash,
+        so servers on the shared economy behave exactly as before. A server with
+        its own economy runs its commands under that scope, so its economy rows
+        are keyed separately and stay isolated - and because the scope is part
+        of the key, the same user keeps a different balance per server.
+        """
+        from utils.core.economy_scope import current_scope
+        from utils.security import scoped_user_hash
+
+        return scoped_user_hash(user_id, current_scope())
+
+    async def ensure_user_identity_hash(self, user_hash: str, user_id: int) -> None:
+        """Record an explicit ``user_hash -> user_id`` mapping.
+
+        :meth:`ensure_user_identity` derives the hash itself, so it can't record
+        a scope-qualified key - and ``user_identities.user_id`` is unique, so
+        scoped keys can't share that table anyway. Call this when a scoped
+        economy row is created so balance/history views can still name the user.
+        """
+        async with self.async_sessionmaker() as session:
+            async with session.begin():
+                await session.execute(
+                    pg_insert(EconomyIdentity)
+                    .values(user_hash=str(user_hash), user_id=int(user_id))
+                    .on_conflict_do_nothing(index_elements=["user_hash"])
+                )
+
     async def resolve_user_hash(self, user_hash: str) -> int | None:
-        """Look up the raw Discord ID for a stored hash, if it exists."""
+        """Look up the raw Discord ID for a stored hash, if it exists.
+
+        Checks the ordinary identity table first, then the scope-qualified
+        economy one, so a server's own economy can still name its users.
+        """
         if user_hash is None:
             return None
         async with self.async_sessionmaker() as session:
             row = await session.get(UserIdentity, user_hash)
+            if row is not None:
+                return row.user_id
+            row = await session.get(EconomyIdentity, user_hash)
             return row.user_id if row else None
 
     async def resolve_user_hashes(
@@ -125,6 +165,16 @@ class BaseManager:
                 select(UserIdentity).where(UserIdentity.user_hash.in_(user_hashes))
             )
             mapping = {r.user_hash: r.user_id for r in rows.scalars().all()}
+            missing = [h for h in user_hashes if h not in mapping]
+            if missing:
+                rows = await session.execute(
+                    select(EconomyIdentity).where(
+                        EconomyIdentity.user_hash.in_(missing)
+                    )
+                )
+                mapping.update(
+                    {r.user_hash: r.user_id for r in rows.scalars().all()}
+                )
         return {h: mapping.get(h) for h in user_hashes}
 
     async def ensure_user_identity(self, user_id: int) -> str:
@@ -146,25 +196,27 @@ class BaseManager:
     def __init__(self, database_url: str):
         # pool_pre_ping validates connections before checkout, which eliminates
         # most "connection closed unexpectedly" errors. pool_recycle forces old
-        # connections to be replaced, and the connect_args set sane timeouts.
+        # connections to be replaced, and the connect_args set a sane busy
+        # timeout. This is a local SQLite database, so no asyncpg server settings
+        # or oversized pool are needed.
         self.engine = create_async_engine(
             database_url,
             echo=False,
             pool_pre_ping=True,
             pool_recycle=1800,
-            pool_size=10,
-            max_overflow=20,
-            # Fail quickly when the pool is exhausted so an outage doesn't queue
-            # hundreds of coroutines waiting for connections.
-            pool_timeout=10,
-            connect_args={
-                # Keep connect attempts short; DNS/server blips should not hold a
-                # thread-pool worker for tens of seconds.
-                "timeout": 5,
-                "command_timeout": 30,
-                "server_settings": {"application_name": "tpnebot"},
-            },
+            connect_args={"timeout": 30},
         )
+        # SQLite needs WAL mode and a busy timeout so concurrent reads and writes
+        # do not raise "database is locked", and foreign keys are off by default.
+        if self.engine.dialect.name == "sqlite":
+
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def _sqlite_pragmas(dbapi_connection, _connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.close()
         self.async_sessionmaker = sessionmaker(
             bind=self.engine, class_=AsyncSession, expire_on_commit=False
         )
@@ -306,6 +358,8 @@ class BaseManager:
         when a Python enum gains new members but the database enum was created
         by an older Base.metadata.create_all().
         """
+        if self.engine.dialect.name != "postgresql":
+            return
 
         enum_fixes = {
             "itemtype": {"collectible", "redeemable", "consumable", "defensive", "offensive"},
@@ -346,6 +400,9 @@ class BaseManager:
         created these tables before user_hash existed, so Base.metadata.create_all()
         skips both the column and the constraint update.
         """
+        if self.engine.dialect.name != "postgresql":
+            return
+
         repairs = [
             {
                 "table": "command_usage_daily",
@@ -408,6 +465,9 @@ class BaseManager:
         are possible. Keep the latest expiry per user/command and add a unique
         index so set_cooldown() can use an atomic upsert via ON CONFLICT.
         """
+        if self.engine.dialect.name != "postgresql":
+            return
+
         async with self.engine.begin() as conn:
             try:
                 # 1. Keep only the latest expiry per user/command.
@@ -456,6 +516,9 @@ class BaseManager:
         Add item-shop expansion columns if they are missing on an older schema.
         New deployments get these from Base.metadata.create_all().
         """
+        if self.engine.dialect.name != "postgresql":
+            return
+
 
         async with self.engine.begin() as conn:
             item_columns = [
@@ -506,6 +569,9 @@ class BaseManager:
         Add payout columns to game_history if they are missing on an older schema.
         New deployments get these from Base.metadata.create_all().
         """
+        if self.engine.dialect.name != "postgresql":
+            return
+
         async with self.engine.begin() as conn:
             history_columns = [
                 ("payout_multiplier", "NUMERIC(38, 10)"),
@@ -528,6 +594,9 @@ class BaseManager:
         older schema. New deployments get it from Base.metadata.create_all().
         Snipe is off by default (opt-in per guild).
         """
+        if self.engine.dialect.name != "postgresql":
+            return
+
         async with self.engine.begin() as conn:
             settings_columns = [
                 ("snipe_enabled", "BOOLEAN DEFAULT FALSE"),
@@ -554,6 +623,9 @@ class BaseManager:
         guild_id set); NULL preserves the existing bot-wide / channel-scoped
         rows.
         """
+        if self.engine.dialect.name != "postgresql":
+            return
+
         async with self.engine.begin() as conn:
             try:
                 await conn.execute(

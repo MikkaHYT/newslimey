@@ -1,4 +1,6 @@
 import os
+import json
+import time
 import discord
 import logging
 import aiohttp
@@ -9,6 +11,8 @@ from zoneinfo import ZoneInfo
 from colorthief import ColorThief
 from discord.ext import commands, tasks
 from discord.ext.commands import Context
+
+from utils.core.prefixes import render
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from urllib.parse import quote
@@ -16,8 +20,20 @@ from urllib.parse import quote
 from humanfriendly.terminal import usage
 from utils.cache import Cache
 from utils.cooldown import unified_cooldown
+from utils.core import cache_registry, mp3_buttons
+from utils.core.cache_registry import CacheProvider, ReloadResult
+from utils.core.economy import format_cash
+from utils.core.eras import emoji_for_era, emoji_for_song
+from utils.core.groupbuys import (
+    CATALOG as GROUPBUY_CATALOG,
+    GROUPBUY_SHEET_ID,
+    Groupbuy,
+    format_price,
+    normalise_song_key,
+)
 from utils.embeds import Embeds
 from utils.guardrails import check_slash_guardrails
+from cogs.songinfo import SongInfoAPI
 from itertools import product
 from difflib import SequenceMatcher
 from moviepy import *
@@ -30,15 +46,167 @@ logger = logging.getLogger("discord.client")
 
 JUICEWRLD_API = "https://juicewrldapi.com"
 
+#: Storage resolver shared with the songinfo cog. Used as a fallback when that
+#: cog isn't loaded, so the leak card can still find original files.
+_FALLBACK_FILE_API: SongInfoAPI | None = None
+
+
+def _fallback_file_api() -> SongInfoAPI:
+    global _FALLBACK_FILE_API
+    if _FALLBACK_FILE_API is None:
+        _FALLBACK_FILE_API = SongInfoAPI()
+    return _FALLBACK_FILE_API
+
 DOWNLOAD_CACHE_FOLDER_NAME = "__download_cache"
 HEARDLE_GAME_DURATION = 20
 HEARDLE_CLIP_DURATION = 10
+#: Cash paid from the treasury to whoever guesses a round of Heardle first.
+HEARDLE_PRIZE = 2000
+#: How long players have to react with ✅ to join a Heardle tournament.
+HEARDLE_TOURNAMENT_JOIN_DURATION = 30
+#: Upper bound so a tournament can't run indefinitely.
+HEARDLE_TOURNAMENT_MAX_ROUNDS = 20
+HEARDLE_TOURNAMENT_MIN_PLAYERS = 2
 DEFAULT_SNIPPET_DURATION = 15
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 MAX_NAME_TRANSFORMATIONS = 6
 GENIUS_API_TOKEN = os.getenv("GENIUS_API_KEY")
+#: The songs endpoint pages 20 at a time by default (100 max). A search that
+#: matches a common word can rank the intended track well past the first page
+#: — e.g. searching "Time" returns "Charcoal" at position 32 — so ask for the
+#: full page, then rank the results client-side (including alternate names).
+SEARCH_PAGE_SIZE = 100
+
+#: Reverse-lyrics search (``!lyricfind``). Every song record carries its own
+#: lyrics, but the API's ``search`` parameter only looks at titles — so the
+#: full corpus is swept once into a local cache and searched there.
+LYRICS_INDEX_PATH = "data/lyrics_index.json"
+LYRICS_INDEX_TTL = 24 * 60 * 60
+#: Lines shorter than this are too common to be a useful lyric "fingerprint".
+LYRICS_INDEX_MIN_PHRASE = 4
+
+#: How many `lf` subcommands one index page shows. The group carries sixty-odd
+#: entries once cogs.lastfm attaches its own, so the index is paged instead of
+#: being squeezed into a single embed description.
+LF_HELP_PER_PAGE = 10
+
+
+class LastFMHelpView(discord.ui.View):
+    """Pages through the `lf` subcommand index, ten entries at a time."""
+
+    def __init__(self, embeds: list[discord.Embed], *, author_id: int):
+        super().__init__(timeout=120)
+        self.embeds = embeds
+        self.author_id = author_id
+        self.current = 0
+
+        self.prev_button = discord.ui.Button(emoji="⬅", style=discord.ButtonStyle.gray)
+        self.next_button = discord.ui.Button(emoji="➡", style=discord.ButtonStyle.gray)
+        self.prev_button.callback = self.go_back
+        self.next_button.callback = self.go_forward
+
+        if len(embeds) > 1:
+            self.add_item(self.prev_button)
+            self.add_item(self.next_button)
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.prev_button.disabled = self.current <= 0
+        self.next_button.disabled = self.current >= len(self.embeds) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "That index belongs to someone else — run `lf` for your own.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def go_back(self, interaction: discord.Interaction) -> None:
+        self.current = max(0, self.current - 1)
+        self._update_buttons()
+        await interaction.response.edit_message(
+            embed=self.embeds[self.current], view=self
+        )
+
+    async def go_forward(self, interaction: discord.Interaction) -> None:
+        self.current = min(len(self.embeds) - 1, self.current + 1)
+        self._update_buttons()
+        await interaction.response.edit_message(
+            embed=self.embeds[self.current], view=self
+        )
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+
+def build_lastfm_help_pages(
+    subcmds, prefix: str, group: str
+) -> list[discord.Embed]:
+    """Build the paged index of ``lf`` subcommands, ten per embed.
+
+    ``subcmds`` is whatever ends up on the group (Discord's ``Command`` s or the
+    prefix-only commands :mod:`cogs.lastfm` attaches), so only the attributes
+    shared by both are read.
+    """
+    chunk = max(1, LF_HELP_PER_PAGE)
+    total_pages = max(1, (len(subcmds) + chunk - 1) // chunk)
+    pages: list[discord.Embed] = []
+
+    for index in range(0, len(subcmds), chunk):
+        page_number = index // chunk + 1
+        embed = discord.Embed(
+            title="Last.fm — Available Commands",
+            description=(
+                f"`{prefix}{group} <subcommand>` for details · "
+                f"page {page_number} of {total_pages}"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"Use {prefix}{group} <subcommand> for details.")
+
+        for cmd in subcmds[index : index + chunk]:
+            aliases = (
+                f" (or: {', '.join(cmd.aliases)})"
+                if getattr(cmd, "aliases", None)
+                else ""
+            )
+            desc = render(
+                getattr(cmd, "short_doc", None)
+                or getattr(cmd, "description", "")
+                or "No description available.",
+                prefix,
+            ).strip()
+            if len(desc) > 200:
+                desc = desc[:197].rstrip() + "…"
+            embed.add_field(
+                name=f"`{prefix}{group} {cmd.name}`{aliases}",
+                value=f"↳ {desc}",
+                inline=False,
+            )
+
+        pages.append(embed)
+
+    return pages
+
 
 class Music(commands.Cog, name="Music"):
+    async def cog_load(self) -> None:
+        cache_registry.register(
+            CacheProvider(
+                name="lyrics",
+                label="Lyric search index",
+                aliases=("lyric", "lyricfind", "lyrics_index"),
+                describe=self._describe_lyrics_cache,
+                reload=self._reload_lyrics_cache,
+            )
+        )
+        # The lyric corpus takes a while to sweep, so warm it in the background
+        # rather than making the first `!lyricfind` wait on it.
+        self._lyrics_warm_task = asyncio.create_task(self._warm_lyrics_index())
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session = aiohttp.ClientSession()
@@ -56,6 +224,11 @@ class Music(commands.Cog, name="Music"):
         self._cover_inflight: dict[str, asyncio.Task] = {}
         self._cover_bg_tasks: set[asyncio.Task] = set()
         self.COVER_THUMB_SIZE = 1024
+
+        self._lyrics_cache: list[dict] = []
+        self._lyrics_ready = False
+        self._lyrics_index_lock = asyncio.Lock()
+        self._groupbuy_api_index_cache: dict[str, dict] | None = None
 
         self.valid_names = set()
         self.producer_counts = {}
@@ -189,11 +362,14 @@ class Music(commands.Cog, name="Music"):
         return ImageFont.truetype(font_path, 8)
 
     async def cog_unload(self):
+        cache_registry.unregister("lyrics")
         self._auto_cache_clean.cancel()
         for task in self._cover_bg_tasks:
             task.cancel()
         self._cover_bg_tasks.clear()
         await self.session.close()
+        if _FALLBACK_FILE_API is not None:
+            await _FALLBACK_FILE_API.close()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Delegate slash guardrails to the bot's centralized check."""
@@ -253,139 +429,9 @@ class Music(commands.Cog, name="Music"):
 
         await asyncio.gather(*[warm(u) for u in urls], return_exceptions=True)
 
-    async def _search_cover_files(self, song_name: str) -> list[tuple[str, str, str]] | None:
-        """Search the cover-art file tree with query variants and fuzzy scoring.
-
-        The browse endpoint is exact-substring-ish; retry with stripped quotes,
-        leading small words moved, and no-parentheses forms, then score file
-        names against the query to keep the best matches.
-        Returns None when the API request itself fails.
-        """
-
-        def normalize(text: str) -> str:
-            return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
-
-        def score(name: str, query_norm: str) -> float:
-            return SequenceMatcher(None, query_norm, normalize(name)).ratio()
-
-        queries = [song_name]
-        stripped = song_name.strip("'")
-        if stripped != song_name:
-            queries.append(stripped)
-        parts = song_name.split()
-        if len(parts) > 1 and len(parts[0]) <= 2 and parts[0] != "go":
-            queries.append(" ".join(parts[1:]))
-            queries.append(" ".join(parts[1:]) + " " + parts[0])
-        no_parens = re.sub(r"\s*\([^)]*\)", "", song_name).strip()
-        if no_parens and no_parens != song_name:
-            queries.append(no_parens)
-
-        seen_paths = set()
-        all_files: list[tuple[str, str, str]] = []
-        for q in queries:
-            async with self.session.get(
-                f"{JUICEWRLD_API}/juicewrld/files/browse/",
-                params={"search": q},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as response:
-                if response.status != 200:
-                    return None
-                data = await response.json()
-
-            for item in data.get("items", []):
-                if item.get("type") != "file":
-                    continue
-                if not (item.get("mime_type") or "").startswith("image/"):
-                    continue
-                path = item.get("path", "")
-                parts = path.split("/")
-                if len(parts) < 3 or parts[0] != "Cover Arts":
-                    continue
-                if path in seen_paths:
-                    continue
-                seen_paths.add(path)
-                artist = parts[1]
-                name = item.get("name", parts[-1])
-                all_files.append((artist, path, name))
-
-        query_norm = normalize(song_name)
-        scored = sorted(
-            ((score(name, query_norm), artist, path, name) for artist, path, name in all_files),
-            key=lambda x: x[0],
-            reverse=True,
-        )
-
-        if scored and scored[0][0] >= 0.4:
-            return [(a, p, n) for _, a, p, n in scored if _ >= 0.25]
-        return all_files
-
-    @commands.hybrid_command(
-        name="cover",
-        aliases=["covers"],
-        description="Search for available covers of a song",
-    )
-    @unified_cooldown(10)
-    async def cover(self, ctx: commands.Context, *, song_name: Optional[str] = None):
-        """Search for song covers in the Juice WRLD API database, grouped by artist."""
-        await ctx.defer(ephemeral=False)
-
-        if not song_name:
-            await Embeds.error(
-                ctx,
-                "🚫 Please provide a song name to search for covers.",
-                delete_after=None,
-            )
-            return
-
-        song_name = song_name.strip().replace('’', "'")
-
-        if len(song_name) < 3:
-            await Embeds.error(
-                ctx,
-                "🚫 Please enter at least 3 characters to search for covers.",
-                delete_after=None,
-            )
-            return
-
-        progress_msg = await Embeds.custom(
-            ctx,
-            f"🔍 Searching for covers of **{song_name}**...",
-            color=discord.Color.blurple(),
-            delete_after=None,
-        )
-
-        cover_files = await self._search_cover_files(song_name)
-
-        if cover_files is None:
-            await progress_msg.edit(embed=discord.Embed(
-                description="❌ Couldn't reach the cover database. Please try again later.",
-                color=discord.Color.red(),
-            ))
-            await asyncio.sleep(10)
-            await progress_msg.delete()
-            return
-
-        if not cover_files:
-            await progress_msg.edit(embed=discord.Embed(
-                description=f"❌ No covers found for **{song_name}**.",
-                color=discord.Color.red(),
-            ))
-            await asyncio.sleep(10)
-            await progress_msg.delete()
-            return
-
-        covers_by_artist: dict[str, list[tuple[str, str]]] = {}
-        for artist, path, name in cover_files:
-            url = f"{JUICEWRLD_API}/juicewrld/files/download/?path=" + quote(path, safe="/")
-            covers_by_artist.setdefault(artist, []).append((url, name))
-
-        for covers in covers_by_artist.values():
-            covers.sort(key=lambda cover: cover[1].lower())
-
-        await progress_msg.delete()
-
-        view = CoverArtistView(self, song_name, covers_by_artist, ctx.author.id)
-        view.message = await ctx.send(view=view)
+    # The ``cover`` / ``covers`` command now lives in the ported
+    # :mod:`cogs.covers` cog, which is the reference bot's richer gallery
+    # implementation.
 
     def can_test(ctx: commands.Context, cog=None):
         if cog is None:
@@ -575,30 +621,21 @@ class Music(commands.Cog, name="Music"):
             if isinstance(prefix, list):
                 prefix = prefix[0]
 
-        subcmds = getattr(ctx.command, "commands", []) or []
-        lines = []
-        for cmd in sorted(subcmds, key=lambda c: c.name):
-            name = cmd.name
-            aliases = (
-                f" (or: {', '.join(cmd.aliases)})"
-                if getattr(cmd, "aliases", None)
-                else ""
-            )
-            desc = (cmd.help or cmd.description or "").strip()
-            if desc:
-                lines.append(f"`{prefix}lastfm {name}`{aliases} — {desc}")
-            else:
-                lines.append(f"`{prefix}lastfm {name}`{aliases}")
-
-        description = "\n".join(lines) if lines else "No subcommands available."
-
-        embed = discord.Embed(
-            title="Last.fm — Available Commands",
-            description=description,
-            color=discord.Color.blurple(),
+        group = ctx.command.qualified_name
+        subcmds = sorted(
+            getattr(ctx.command, "commands", []) or [], key=lambda c: c.name
         )
-        embed.set_footer(text=f"Use {prefix}lastfm <subcommand> for details.")
-        await ctx.reply(embed=embed, mention_author=False)
+
+        if not subcmds:
+            await ctx.reply("No subcommands available.", mention_author=False)
+            return
+
+        # cogs.lastfm attaches its own commands to this group once the bot is
+        # up, so the index is built at invoke time rather than import time. The
+        # list is far past one embed's worth, so it is paged ten at a time.
+        pages = build_lastfm_help_pages(subcmds, prefix, group)
+        view = LastFMHelpView(pages, author_id=ctx.author.id)
+        await ctx.reply(embed=pages[0], view=view, mention_author=False)
 
     @lastfm.command(name="set", description="Set your Last.fm username.")
     @unified_cooldown(10)
@@ -1591,7 +1628,7 @@ class Music(commands.Cog, name="Music"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}jwapi {name}`{aliases} — {desc}")
             else:
@@ -2076,15 +2113,54 @@ class Music(commands.Cog, name="Music"):
         def normalize(text: str) -> str:
             return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
 
+        def alt_names(song: dict) -> list[str]:
+            """Every alternate title the song is known by, minus its main name."""
+            names: list[str] = []
+            for key in (
+                "track_titles",
+                "trackTitles",
+                "alt_names",
+                "altNames",
+                "alternative_titles",
+                "alternativeTitles",
+                "alternate_titles",
+                "alternateTitles",
+            ):
+                value = song.get(key)
+                if not value:
+                    continue
+                entries = value if isinstance(value, (list, tuple, set)) else [value]
+                for entry in entries:
+                    if isinstance(entry, str) and entry.strip():
+                        names.append(entry.strip())
+            primary = normalize(song.get("name", ""))
+            return [name for name in names if normalize(name) != primary]
+
         def score(song: dict, query_norm: str) -> float:
-            candidates = [
-                normalize(song.get("name", "")),
-                normalize(" ".join(song.get("track_titles", []) or [])),
-            ]
-            return max(
-                SequenceMatcher(None, query_norm, cand).ratio()
-                for cand in candidates
-            )
+            """How well a song matches the query, counting alternate names.
+
+            Each title is scored on its own (instead of joining every
+            ``track_titles`` entry into one string and diluting the match), so
+            searching an alternate name such as "Stomp 'Em Out" still ranks
+            "Burberry Timbs" at the top.
+            """
+            if not query_norm:
+                return 0.0
+
+            candidates = [normalize(song.get("name", ""))]
+            candidates.extend(normalize(name) for name in alt_names(song))
+
+            phrase = rf"(?<!\w){re.escape(query_norm)}(?!\w)"
+            best = 0.0
+            for cand in candidates:
+                if not cand:
+                    continue
+                if cand == query_norm:
+                    return 1.0
+                if re.search(phrase, cand):
+                    best = max(best, 0.9)
+                best = max(best, SequenceMatcher(None, query_norm, cand).ratio())
+            return best
 
         def keep(song: dict) -> bool:
             leak_type = (song.get("leak_type") or "").lower()
@@ -2113,7 +2189,8 @@ class Music(commands.Cog, name="Music"):
         all_results: list[dict] = []
         for q in queries:
             async with self.session.get(
-                JUICEWRLD_API + "/juicewrld/songs/", params={"search": q}
+                JUICEWRLD_API + "/juicewrld/songs/",
+                params={"search": q, "page_size": SEARCH_PAGE_SIZE},
             ) as response:
                 if response.status != 200:
                     return None
@@ -2140,7 +2217,9 @@ class Music(commands.Cog, name="Music"):
         # so completely unrelated songs don't appear.
         if scored and scored[0][0] >= 0.4:
             return [s for score_val, s in scored if score_val >= 0.25]
-        return all_results
+        # No confident match: still hand back every candidate, best-first, so an
+        # alternate-name match is not buried after unrelated results.
+        return [s for _, s in scored] if scored else all_results
 
     async def fetch_random_playable_song(self, max_retries: int = 8) -> dict | None:
         """Hit /juicewrld/radio/random/ until we get a song with audio.
@@ -2218,35 +2297,6 @@ class Music(commands.Cog, name="Music"):
 
         return session_paths, session_edits
 
-    async def fetch_snippet(self, name: str):
-        valid_snippets = []
-
-        for folder in (f'Snippets/{name}', f'Snippets-Old/{name}'):
-            async with self.session.get(
-                JUICEWRLD_API + "/juicewrld/files/browse/", params={"path": folder}
-            ) as response:
-                if response.status != 200:
-                    continue
-
-                data = await response.json()
-
-            for item in data.get("items", []):
-                if item.get("type") != "file":
-                    continue
-
-                mime = item.get("mime_type", "")
-
-            if mime and mime.startswith("video/"):
-                path = item.get("path")
-                
-                fixed_path = quote(path, safe="/") 
-                valid_snippets.append(
-                    "https://juicewrldapi.com/juicewrld/files/download/?path="
-                    + fixed_path
-                )
-
-        return valid_snippets
-
     def get_file_names(self, file_names: str) -> list[str]:
         lines = [line.strip() for line in file_names.splitlines() if line.strip()]
 
@@ -2263,26 +2313,35 @@ class Music(commands.Cog, name="Music"):
             and any(x in line for x in ("File Name", "Clean", "Explicit"))
         ]
     
-    async def get_downloads(self, file_names: list[str], length: str) -> list[str]:
-        target_seconds = self.duration_to_seconds(length)
-        if target_seconds == 0:
+    async def get_downloads(
+        self, file_names: list[str], length: str, era_hint: str | None = None
+    ) -> list[str]:
+        """Resolve the original (OG) file paths behind a song's metadata names.
+
+        Shares the songinfo storage resolver so *every* stored copy of a take is
+        found. The old exact-search plus ±1s duration filter missed files whose
+        metadata name/version differed from the archive (No Hands) or whose
+        length didn't line up with the entry (GoPro).
+        """
+        if not file_names:
             return []
 
-        results = []
+        cog = self.bot.get_cog("SongInfo")
+        api = getattr(cog, "api", None) if cog is not None else None
+        if api is None:
+            api = _fallback_file_api()
 
+        results: list[str] = []
+        seen: set[str] = set()
         for file_name in file_names:
-            async with self.session.get(JUICEWRLD_API + "/juicewrld/files/browse/", params={"search": file_name + '.'}) as response:
-                if response.status != 200:
+            for path in await api.resolve_storage_paths(file_name, era_hint):
+                if "original files" not in path.lower():
                     continue
-
-                data = await response.json()
-
-            results.extend(
-                song["path"]
-                for song in data.get("items", [])
-                if abs(self.duration_to_seconds(song.get("duration")) - target_seconds) <= 1
-                and "Original Files" in song.get("path", "")
-            )
+                key = path.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(path)
 
         return results
 
@@ -2318,6 +2377,8 @@ class Music(commands.Cog, name="Music"):
         random_leak: bool = False,
         session_downloads: list[str] | None = None,
         session_edits: list[str] | None = None,
+        guild_id: int | None = None,
+        author_id: int | None = None,
     ):
         class SongContainer(discord.ui.Container):
             ALBUMS = {
@@ -2376,6 +2437,11 @@ class Music(commands.Cog, name="Music"):
                 random_leak: bool = False,
                 session_downloads = None,
                 session_edits = None,
+                bot = None,
+                guild_id = None,
+                unsurfaced: bool = False,
+                expanded: bool = False,
+                author_id: int | None = None,
             ):
                 name = song.get('name')
                 track_titles = [t for t in song.get('track_titles', []) if t != name]
@@ -2389,6 +2455,24 @@ class Music(commands.Cog, name="Music"):
                 accent_color = int(album['color'].lstrip('#'), 16) if album else 0x2B2D31
                 
                 super().__init__(accent_color=accent_color)
+
+                # The mp3 button mode is read per server when the buttons are
+                # built, so the container has to know where it was posted.
+                self.bot = bot
+                self.guild_id = guild_id
+                self.unsurfaced = unsurfaced
+                # The Info button belongs to whoever the card was posted for;
+                # anyone else pressing it is turned away.
+                self.author_id = author_id
+                # The metadata block is hidden behind the Info button by default
+                # so the card stays short; these hold everything needed to
+                # rebuild it once that button is pressed.
+                self._expanded = expanded
+                self._song = song
+                self._downloads = downloads
+                self._random_leak = random_leak
+                self._session_downloads = session_downloads
+                self._session_edits = session_edits
 
                 self._build_container(
                     song, downloads, random_leak,
@@ -2413,46 +2497,104 @@ class Music(commands.Cog, name="Music"):
                     )
                 )
                 self.add_item(thumbnail)
-                self.add_item(discord.ui.Separator())
+                self._add_separator()
 
-                if era_name != '':
-                    self.add_item(
-                        discord.ui.TextDisplay(
-                            f'**Era**\n{album['name'] if album else era_name}\n'
+                # Everything below the header is metadata, and it only shows
+                # once the Info button has been pressed.
+                if self._expanded:
+                    if era_name != '':
+                        self.add_item(
+                            discord.ui.TextDisplay(
+                                f'**Era**\n{album['name'] if album else era_name}\n'
+                            )
                         )
-                    )
 
-                field_map = self.FIELDS if not random_leak else self.RANDOM_LEAK_FIELDS
-                self._add_song_fields(song, field_map)
+                    field_map = self.FIELDS if not random_leak else self.RANDOM_LEAK_FIELDS
+                    self._add_song_fields(song, field_map)
 
                 MAIN_URL = f'{JUICEWRLD_API}/juicewrld/files/download/?path='
                 TRACKER = discord.ui.Button(
                     label='Tracker', 
-                    emoji='<:fart:1445127619744890911>', 
+                    emoji='\U0001F517', 
                     url=f'{JUICEWRLD_API}/'
                 )
 
-                download_budget = max(0, 40 - self._total_count - 4)
-                rows, omitted = self._create_download_rows(
-                    downloads, song, MAIN_URL, download_budget,
-                    session_downloads, session_edits
-                )
-
-                for row in rows:
-                    self.add_item(row)
-
-                if omitted:
+                if self.unsurfaced:
+                    # Unsurfaced tracks are metadata only and have no audio
+                    # on the server; their file rows point at whatever else
+                    # the archive matched, so hide every download button.
                     self.add_item(
                         discord.ui.TextDisplay(
-                            f'-# +{omitted} more file(s) not shown — '
-                            f'[view all on the tracker]({JUICEWRLD_API}/)'
+                            '-# No files available — this track is **unsurfaced** (metadata only).'
                         )
                     )
+                else:
+                    download_budget = max(0, 40 - self._total_count - 4)
+                    rows, omitted = self._create_download_rows(
+                        downloads, song, MAIN_URL, download_budget,
+                        session_downloads, session_edits
+                    )
 
-                self.add_item(discord.ui.Separator())
-                tracker_row = discord.ui.ActionRow()
-                tracker_row.add_item(TRACKER)
-                self.add_item(tracker_row)
+                    for row in rows:
+                        self._add(row)
+
+                    if omitted:
+                        self.add_item(
+                            discord.ui.TextDisplay(
+                                f'-# +{omitted} more file(s) not shown — '
+                                f'[view all on the tracker]({JUICEWRLD_API}/)'
+                            )
+                        )
+
+                self._add_separator()
+                action_row = discord.ui.ActionRow()
+                action_row.add_item(TRACKER)
+                info_button = discord.ui.Button(
+                    label='Info',
+                    emoji='⬆️' if self._expanded else '⬇️',
+                    style=discord.ButtonStyle.secondary,
+                )
+                info_button.callback = self._on_info
+                action_row.add_item(info_button)
+                self.add_item(action_row)
+
+            def _add(self, item):
+                """Add ``item``, skipping a divider that would double up."""
+                if isinstance(item, discord.ui.Separator):
+                    if self.children and isinstance(
+                        self.children[-1], discord.ui.Separator
+                    ):
+                        return
+                self.add_item(item)
+
+            def _add_separator(self):
+                self._add(discord.ui.Separator())
+
+            async def _on_info(self, interaction: discord.Interaction):
+                """Expand or collapse the card's metadata block in place."""
+                if self.author_id is not None and interaction.user.id != self.author_id:
+                    await interaction.response.send_message(
+                        '❌ Only the person who ran the command can use this button.',
+                        ephemeral=True,
+                    )
+                    return
+                expanded = not self._expanded
+                layout = discord.ui.LayoutView(timeout=None)
+                layout.add_item(
+                    self.__class__(
+                        self._song,
+                        self._downloads,
+                        self._random_leak,
+                        self._session_downloads,
+                        self._session_edits,
+                        bot=self.bot,
+                        guild_id=self.guild_id,
+                        unsurfaced=self.unsurfaced,
+                        expanded=expanded,
+                        author_id=self.author_id,
+                    )
+                )
+                await interaction.response.edit_message(view=layout)
 
             def _add_song_fields(self, song: dict, field_map: dict):
                 for field_key, field_label in field_map.items():
@@ -2501,9 +2643,18 @@ class Music(commands.Cog, name="Music"):
                             else:
                                 rows.append(discord.ui.TextDisplay('**Tagged File(s)**'))
                             main_row = discord.ui.ActionRow()
-                            main_row.add_item(
-                                discord.ui.Button(label=ext, url=main_url + quote(download))
+                            main_button = mp3_buttons.make_download_button(
+                                self.bot,
+                                guild_id=self.guild_id,
+                                label=ext,
+                                url=main_url + quote(download),
+                                is_mp3=ext.lower() == "mp3",
+                                filename=mp3_buttons.mp3_filename(
+                                    os.path.basename(download), "song"
+                                ),
                             )
+                            if main_button:
+                                main_row.add_item(main_button)
                             rows.append(main_row)
                             used += 4
                         else:
@@ -2545,123 +2696,197 @@ class Music(commands.Cog, name="Music"):
                     for path in chunk:
                         ext = path.rsplit('.', 1)[-1].upper()
                         label = label_func(path, ext) if label_func else ext
-                        row.add_item(
-                            discord.ui.Button(label=label, url=main_url + quote(path))
+                        button = mp3_buttons.make_download_button(
+                            self.bot,
+                            guild_id=self.guild_id,
+                            label=label,
+                            url=main_url + quote(path),
+                            is_mp3=path.rsplit('.', 1)[-1].lower() == "mp3",
+                            filename=mp3_buttons.mp3_filename(
+                                os.path.basename(path), "song"
+                            ),
                         )
+                        if button:
+                            row.add_item(button)
                     rows.append(row)
                     used += cost
                     idx += len(chunk)
                 return rows, used, len(paths) - idx
 
+        unsurfaced = self._is_unsurfaced(song_data)
         file_names = self.get_file_names(song_data.get('file_names'))
-        downloads = await self.get_downloads(file_names, song_data.get('length', ''))
+        era_raw = song_data.get('era')
+        era_hint = era_raw.get('name') if isinstance(era_raw, dict) else None
+        # Unsurfaced tracks have no audio, so skip the storage sweep entirely
+        # rather than risk matching a different song's files.
+        downloads = [] if unsurfaced else await self.get_downloads(
+            file_names, song_data.get('length', ''), era_hint
+        )
 
         layout_view = discord.ui.LayoutView(timeout=None)
         layout_view.add_item(
             SongContainer(
-                song_data, downloads, random_leak, session_downloads, session_edits
+                song_data, downloads, random_leak, session_downloads, session_edits,
+                bot=self.bot, guild_id=guild_id,
+                unsurfaced=unsurfaced,
+                author_id=author_id,
             )
         )
 
         return layout_view
 
-    async def create_snippet_view(self, song: dict):
-        class Container(discord.ui.Container):
-            def __init__(self, song: dict, valid_snippets: dict):
-                super().__init__(accent_color=0x2B2D31)
-
-                name = song.get("name")
-                engineers = song.get("engineers")
-                producers = song.get("producers")
-
-                alt_names = [t for t in song.get("track_titles", []) if t != name]
-
-                image_url = song.get("image_url")
-
-                thumb = discord.ui.Section(
-                    accessory=discord.ui.Thumbnail(media=JUICEWRLD_API + image_url)
-                )
-                thumb.add_item(
-                    discord.ui.TextDisplay(
-                        f"### {name}\n-# Alt Name(s): **{', '.join(alt_names) if alt_names else 'N/A'}**\n-# Engineer(s): **{engineers}**\n-# Producer(s): **{producers}**"
-                    )
-                )
-
-                self.add_item(thumb)
-                self.add_item(discord.ui.Separator())
-
-                media_gallery = discord.ui.MediaGallery()
-                amt = 0
-                if valid_snippets:
-                    for url in valid_snippets:
-                        if amt >= 10:
-                            break
-
-                        media_gallery.add_item(media=url)
-                        amt += 1
-
-                self.add_item(media_gallery)
-
-        name = song.get("name")
-
-        valid_snippets = await self.fetch_snippet(name)
-
-        layout_view = discord.ui.LayoutView(timeout=None)
-        layout_view.add_item(Container(song, valid_snippets))
-
-        return layout_view if valid_snippets else None
-
-    @commands.hybrid_command(name='groupbuy', aliases=['gb', 'gbinfo', 'groupbuyinfo'], description='Find a songs groupbuy information')
+    @commands.hybrid_command(name='groupbuy', aliases=['gb', 'gbinfo', 'groupbuyinfo'], description='Look up a track in the GB/PB tracker')
     @commands.guild_only()
     @unified_cooldown(10)
     async def groupbuy(self, ctx: commands.Context, *, query: str = None):
-        if not query:
-            await Embeds.error(
-                ctx,
-                f"**Missing argument:** query\n**Usage:** {usage}",
-                title="Error!",
-                delete_after=5,
-                reply=True,
-            )
-            return
-        songs = await self.fetch_song(ctx, query, allow_unsurfaced=True)
-        if songs is None:
-            return
+        async with ctx.typing():
+            try:
+                entries = await GROUPBUY_CATALOG.load(self.session)
+            except Exception:
+                logger.warning("Could not load the GB/PB tracker", exc_info=True)
+                entries = []
 
-        if len(songs) == 1:
-            async with ctx.typing():
-                song = songs[0]
-
-                if song['groupbuy_info']['price'] == '':
-                    return await Embeds.send_warning_embed(ctx, ctx.author, f'**{song['name']}** has no **groupbuy** information')
-
-                layout_view = discord.ui.LayoutView()
-                layout_view.add_item(GroupbuyContainer(self, song))
-
-                msg = await ctx.send(view=layout_view)
-                layout_view.message = msg
-
-        elif len(songs) > 1:
-            sorted_songs = sorted(songs, key=lambda s: s.get('track_titles'))[:25]
-            song_map = {str(song['id']): song for song in sorted_songs}
-
-            options = [
-                discord.SelectOption(label=( lambda t: f'{t[0]} ({", ".join(t[1:])})' if len(t) > 1 else (t[0] if t else 'Unknown'))(song.get('track_titles', []))[:100], value=str(song['id']))
-                for song in sorted_songs
-            ]
-
-            view = discord.ui.View(timeout=None)
-            view.add_item(GroupbuySongSelect(self, ctx.author, options, song_map))
-
-            embed = discord.Embed(description=f'{ctx.author.mention}: Multiple **selections** found with your **search**', color=None)
-            await ctx.reply(embed=embed, view=view)
-        
-        else:
+        if not entries:
             return await Embeds.send_warning_embed(
                 ctx.channel,
                 ctx.author,
-                f'I couldnt find a song with the name: `{query}`',
+                'The **GB/PB tracker** is unavailable right now — try again shortly.',
             )
+
+        if not query:
+            view = GroupbuyView(
+                self,
+                ctx.author,
+                entries,
+                years=GROUPBUY_CATALOG.years(entries),
+                hint='### GB/PB Tracker\n-# Choose a song or year below.',
+            )
+            view.message = await ctx.send(view=view)
+            return
+
+        matches = GROUPBUY_CATALOG.search(entries, query)
+        if not matches:
+            return await Embeds.send_warning_embed(
+                ctx.channel,
+                ctx.author,
+                f'I couldnt find a track, era or year matching: `{query}`',
+            )
+
+        # A year or era is a browse request, so open on the whole list instead
+        # of on whichever track happens to sort first.
+        browsing = (query.isdigit() and len(query) == 4) or bool(
+            GROUPBUY_CATALOG.for_era(entries, query)
+        )
+        if browsing:
+            view = GroupbuyView(
+                self,
+                ctx.author,
+                entries,
+                candidates=matches,
+                hint=f'### {query} Group Buys / Personal Buys\n-# Choose a track below.',
+            )
+        else:
+            view = GroupbuyView(self, ctx.author, entries, current=matches[0], candidates=matches)
+
+        view.message = await ctx.send(view=view)
+
+    # --- GB/PB tracker helpers ---------------------------------------------
+    #: Sheet era codes that don't line up with the album keys in ``ALBUMS``.
+    _GROUPBUY_ERA_ALBUMS = {
+        'JUTE': 'jute',
+        'AFF': 'afflictions',
+        'BDM': 'bdm',
+        'ND </3': 'ND',
+        'JW 9 9 9': 'jw 999',
+        'HIH 999': 'HIH 999',
+    }
+
+    def groupbuy_era_colour(self, era: str) -> int:
+        album = self.ALBUMS.get(era) or self.ALBUMS.get(self._GROUPBUY_ERA_ALBUMS.get(era, ''))
+        if album:
+            return int(album['color'].lstrip('#'), 16)
+        return 0x2B2D31
+
+    def groupbuy_era_emoji(self, era: str):
+        try:
+            return emoji_for_era(self.bot, self._GROUPBUY_ERA_ALBUMS.get(era, era))
+        except Exception:
+            return None
+
+    def groupbuy_option_label(self, entry: Groupbuy) -> str:
+        label = entry.name
+        if entry.akas:
+            label = f"{entry.name} ({', '.join(entry.akas)})"
+        return label[:100] or 'Unknown'
+
+    def _groupbuy_api_index(self) -> dict[str, dict]:
+        """Map normalised API titles to songs so a sheet row can borrow its art."""
+        if self._groupbuy_api_index_cache is None:
+            index: dict[str, dict] = {}
+            for song in Cache.get_songs() or []:
+                titles = [song.get('name'), *(song.get('track_titles') or [])]
+                for title in titles:
+                    key = normalise_song_key(title)
+                    if key and key not in index:
+                        index[key] = song
+            self._groupbuy_api_index_cache = index
+        return self._groupbuy_api_index_cache
+
+    def _resolve_groupbuy_song(self, entry: Groupbuy) -> dict | None:
+        return self._groupbuy_api_index().get(normalise_song_key(entry.name))
+
+    def groupbuy_card_view(self, entry: Groupbuy) -> discord.ui.LayoutView:
+        """A one-off view holding just the card, used for other users' copies."""
+        view = discord.ui.LayoutView(timeout=300)
+        container = discord.ui.Container(accent_color=self.groupbuy_era_colour(entry.era))
+        self.build_groupbuy_card(container, entry)
+        view.add_item(container)
+        return view
+
+    def build_groupbuy_card(self, container: discord.ui.Container, entry: Groupbuy) -> None:
+        """Render one tracker row in the layout the tracker bot's card uses."""
+        song = self._resolve_groupbuy_song(entry)
+        # The sheet's AKA names win; when a row has none, borrow the API's.
+        akas = list(entry.akas)
+        if not akas and song:
+            akas = [t for t in (song.get('track_titles') or []) if t and t != song.get('name')]
+
+        header = [f'### {entry.name}']
+        if akas:
+            header.append(f'AKA: {", ".join(akas)}')
+        if entry.price:
+            header.append(f'Price: **{format_price(entry.price)}**')
+        if entry.sold_with:
+            header.append(f'Sold with: {", ".join(entry.sold_with)}')
+        header_text = "\n".join(header)
+
+        image_url = None
+        if song:
+            raw = song.get('image_url')
+            if raw:
+                image_url = raw if str(raw).startswith('http') else f'{JUICEWRLD_API}{raw}'
+
+        if image_url:
+            section = discord.ui.Section(accessory=discord.ui.Thumbnail(media=image_url))
+            section.add_item(discord.ui.TextDisplay(header_text))
+            container.add_item(section)
+        else:
+            container.add_item(discord.ui.TextDisplay(header_text))
+
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(f'**Era**\n{entry.era}'))
+        if entry.start_date:
+            container.add_item(discord.ui.TextDisplay(f'**Start Date**\n{entry.start_date}'))
+        if entry.end_date:
+            container.add_item(discord.ui.TextDisplay(f'**End Date**\n{entry.end_date}'))
+        container.add_item(discord.ui.TextDisplay(
+            '**Info**\n'
+            f'Finished: {_groupbuy_flag(entry.finished)}\n'
+            f'OG File: {_groupbuy_flag(entry.og_file)}\n'
+            f'Blind: {_groupbuy_flag(entry.blind)}'
+        ))
+        if entry.notes:
+            container.add_item(discord.ui.TextDisplay(f'**Notes**\n{entry.notes}'))
 
     @commands.hybrid_command("leak", description="Search for a Juice WRLD leak by name")
     @commands.guild_only()
@@ -2681,11 +2906,18 @@ class Music(commands.Cog, name="Music"):
             return
 
         if len(song_list) == 1:
-            layout_view = await self.create_song_view(song_list[0])
+            layout_view = await self.create_song_view(
+                song_list[0],
+                guild_id=ctx.guild.id if ctx.guild else None,
+                author_id=ctx.author.id,
+            )
             await ctx.reply(view=layout_view)
 
         elif len(song_list) > 1:
-            results = sorted(song_list, key=lambda s: s.get("track_titles"))[:25]
+            # ``_search_songs`` already returns the closest match first, so the
+            # order is kept rather than re-sorted by track title (which could
+            # push an alternate-name match past the 25-option limit).
+            results = song_list[:25]
             song_map = {str(song["id"]): song for song in results}
 
             options = [
@@ -2694,6 +2926,7 @@ class Music(commands.Cog, name="Music"):
                         lambda t: f"{t[0]} ({', '.join(t[1:])})" if len(t) > 1 else (t[0] if t else "Unknown")
                     )(song.get("track_titles", []))[:100],
                     value=str(song["id"]),
+                    emoji=emoji_for_song(self.bot, song),
                 )
                 for song in results
             ]
@@ -2714,7 +2947,9 @@ class Music(commands.Cog, name="Music"):
                     song_id = self.values[0]
                     song = self.song_map[song_id]
 
-                    view = await self.cog.create_song_view(song)
+                    view = await self.cog.create_song_view(
+                        song, guild_id=itn.guild_id, author_id=itn.user.id
+                    )
 
                     if self.author != itn.user:
                         return await itn.response.send_message(
@@ -2739,7 +2974,7 @@ class Music(commands.Cog, name="Music"):
                 f"I couldnt find a song with the name: `{query}`",
             )
 
-    @commands.hybrid_command("session", description="Search for a Juice WRLD session by name")
+    @commands.hybrid_command("session", aliases=["sessions"], description="Search for a Juice WRLD session by name")
     @commands.guild_only()
     @unified_cooldown(10)
     async def session(self, ctx: commands.Context, *, query: str = None):
@@ -2764,6 +2999,8 @@ class Music(commands.Cog, name="Music"):
                 song_list[0],
                 session_downloads=session_downloads,
                 session_edits=session_edits,
+                guild_id=ctx.guild.id if ctx.guild else None,
+                author_id=ctx.author.id,
             )
             await ctx.reply(view=layout_view)
 
@@ -2777,6 +3014,7 @@ class Music(commands.Cog, name="Music"):
                         lambda t: f"{t[0]} ({', '.join(t[1:])})" if len(t) > 1 else (t[0] if t else "Unknown")
                     )(song.get("track_titles", []))[:100],
                     value=str(song["id"]),
+                    emoji=emoji_for_song(self.bot, song),
                 )
                 for song in results
             ]
@@ -2804,6 +3042,8 @@ class Music(commands.Cog, name="Music"):
                         song,
                         session_downloads=session_downloads,
                         session_edits=session_edits,
+                        guild_id=itn.guild_id,
+                        author_id=itn.user.id,
                     )
 
                     if self.author != itn.user:
@@ -2920,6 +3160,7 @@ class Music(commands.Cog, name="Music"):
                     discord.SelectOption(
                         label=_label(song),
                         value=str(song["id"]),
+                        emoji=emoji_for_song(self.bot, song),
                     )
                     for song in results
                 ]
@@ -2990,6 +3231,277 @@ class Music(commands.Cog, name="Music"):
                 f"The lyrics command crashed: `{type(e).__name__}: {e}`",
             )
             raise
+
+    # ------------------------------------------------------------------
+    # Reverse lyrics search (!lyricfind)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalise_lyrics(text: str) -> str:
+        text = (text or "").lower().replace("’", "'").replace("‘", "'")
+        text = re.sub(r"[^a-z0-9\s']", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    async def _fetch_song_by_id(self, song_id: int) -> dict | None:
+        try:
+            async with self.session.get(
+                f"{JUICEWRLD_API}/juicewrld/songs/{int(song_id)}/"
+            ) as response:
+                if response.status != 200:
+                    return None
+                return await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
+    def _read_lyrics_index_file(self) -> list[dict] | None:
+        try:
+            with open(LYRICS_INDEX_PATH, "r", encoding="utf-8") as handle:
+                blob = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        built = float(blob.get("built_at") or 0)
+        if time.time() - built > LYRICS_INDEX_TTL:
+            return None
+        songs = blob.get("songs")
+        return songs if isinstance(songs, list) and songs else None
+
+    def _write_lyrics_index_file(self, songs: list[dict]) -> None:
+        try:
+            directory = os.path.dirname(LYRICS_INDEX_PATH)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(LYRICS_INDEX_PATH, "w", encoding="utf-8") as handle:
+                json.dump({"built_at": time.time(), "songs": songs}, handle)
+        except OSError:
+            logger.warning("Could not write the lyrics index cache")
+
+    def _describe_lyrics_cache(self) -> str:
+        """What the lyric corpus looks like right now, for the opening card."""
+        try:
+            age = max(0.0, time.time() - os.path.getmtime(LYRICS_INDEX_PATH)) / 3600
+        except OSError:
+            return "not built yet"
+        loaded = (
+            f"{len(self._lyrics_cache)} song(s) in memory"
+            if self._lyrics_cache
+            else "on disk, not loaded"
+        )
+        return f"{loaded} · file written {age:.1f}h ago"
+
+    async def _reload_lyrics_cache(
+        self,
+        target: Optional[str],
+        full: bool,
+        progress: cache_registry.ProgressFn,
+    ) -> ReloadResult:
+        """Delete the lyric corpus and sweep the API for it again.
+
+        The corpus is one blob rather than per-song records, so a reload is
+        all-or-nothing and a targeted query has nothing smaller to work with.
+        """
+        result = ReloadResult(label="Lyric search index")
+        if target is not None:
+            result.note = "the corpus is one blob; nothing to target"
+            return result
+        warm = getattr(self, "_lyrics_warm_task", None)
+        if warm is not None and not warm.done():
+            result.note = "the startup sweep is still running; try again shortly"
+            return result
+
+        result.scope = "the whole lyric corpus"
+        self._lyrics_cache = []
+        self._lyrics_ready = False
+        try:
+            os.remove(LYRICS_INDEX_PATH)
+            result.forgotten = 1
+        except OSError:
+            pass
+
+        await progress("Sweeping every song for lyrics (this one is slow)...")
+        corpus = await self._lyrics_index()
+        result.restored = len(corpus)
+        if not corpus:
+            result.note = "the sweep came back with no lyrics"
+        logger.info("[Music] Lyrics index reloaded (%d songs)", result.restored)
+        return result
+
+    async def _build_lyrics_index(self) -> list[dict]:
+        """Sweep every song once, keeping the ones that have lyrics."""
+        songs: list[dict] = []
+        page = 1
+        while True:
+            async with self.session.get(
+                JUICEWRLD_API + "/juicewrld/songs/",
+                params={"page": page, "page_size": SEARCH_PAGE_SIZE},
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}")
+                data = await response.json()
+            results = data.get("results") or []
+            for song in results:
+                lyrics = song.get("lyrics")
+                if lyrics and lyrics.strip():
+                    songs.append(
+                        {
+                            "id": song.get("id"),
+                            "name": song.get("name") or "Unknown",
+                            "lyrics": lyrics,
+                        }
+                    )
+            if not results or not data.get("next"):
+                break
+            page += 1
+        return songs
+
+    async def _lyrics_index(self) -> list[dict]:
+        """The cached lyric corpus, rebuilt lazily (once a day at most)."""
+        if self._lyrics_ready and self._lyrics_cache:
+            return self._lyrics_cache
+        async with self._lyrics_index_lock:
+            if self._lyrics_ready and self._lyrics_cache:
+                return self._lyrics_cache
+            corpus = self._read_lyrics_index_file()
+            if corpus is None:
+                corpus = await self._build_lyrics_index()
+                self._write_lyrics_index_file(corpus)
+            for song in corpus:
+                song["_norm"] = self._normalise_lyrics(song.get("lyrics", ""))
+            self._lyrics_cache = corpus
+            self._lyrics_ready = True
+            return corpus
+
+    async def _warm_lyrics_index(self) -> None:
+        try:
+            await self._lyrics_index()
+            logger.info("Lyrics index ready (%d songs)", len(self._lyrics_cache))
+        except Exception:
+            logger.warning("Could not pre-build the lyrics index", exc_info=True)
+
+    @staticmethod
+    def _score_lyrics(phrases: list[str], normalised: str) -> int:
+        score = 0
+        for phrase in phrases:
+            if phrase and phrase in normalised:
+                score += 1000 + min(normalised.count(phrase), 50)
+        return score
+
+    async def _search_lyrics(self, query: str, limit: int = 25) -> list[dict]:
+        """Songs whose lyrics contain the query, best match first."""
+        corpus = await self._lyrics_index()
+        lines = [self._normalise_lyrics(line) for line in (query or "").splitlines()]
+        lines = [line for line in lines if len(line) >= LYRICS_INDEX_MIN_PHRASE]
+        whole = self._normalise_lyrics(query)
+        if whole and whole not in lines:
+            lines.append(whole)
+        # Longest lines first: they carry the most signal and are far less
+        # likely to appear in a hundred different songs.
+        phrases = sorted(set(lines), key=len, reverse=True)[:5]
+        if not phrases:
+            return []
+        scored = [
+            (self._score_lyrics(phrases, song.get("_norm", "")), song)
+            for song in corpus
+        ]
+        scored = [pair for pair in scored if pair[0] > 0]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [song for _, song in scored[:limit]]
+
+    @commands.hybrid_command(
+        name="lyricfind",
+        aliases=["findlyrics", "lyricsearch", "whatsong"],
+        description="Find a Juice WRLD song from a line of its lyrics",
+    )
+    @commands.guild_only()
+    @unified_cooldown(15)
+    async def lyricfind(self, ctx: commands.Context, *, query: str = None):
+        """Reverse-search Juice WRLD's catalogue by a line of lyrics."""
+        if not query or not query.strip():
+            await Embeds.error(
+                ctx,
+                "**Missing argument:** lyrics\n"
+                "Give me a line or two of the song's lyrics.",
+                title="Error!",
+                delete_after=5,
+                reply=True,
+            )
+            return
+        try:
+            async with ctx.typing():
+                matches = await self._search_lyrics(query)
+        except Exception as error:
+            logger.exception("lyricfind search failed")
+            await Embeds.send_error_embed(
+                ctx.channel,
+                ctx.author,
+                f"The lyric search crashed: `{type(error).__name__}: {error}`",
+            )
+            return
+
+        if not matches:
+            await Embeds.send_warning_embed(
+                ctx.channel,
+                ctx.author,
+                "I couldn't find a song with those lyrics.",
+            )
+            return
+
+        if len(matches) == 1:
+            song = await self._fetch_song_by_id(matches[0]["id"])
+            if song is None:
+                await Embeds.send_error_embed(
+                    ctx.channel,
+                    ctx.author,
+                    "I found a match but couldn't load the song details.",
+                )
+                return
+            view = await self.create_song_view(
+                song, guild_id=ctx.guild.id if ctx.guild else None, author_id=ctx.author.id
+            )
+            await ctx.reply(view=view)
+            return
+
+        results = matches[:25]
+
+        class LyricsSongSelect(discord.ui.Select):
+            def __init__(self, options, author, cog):
+                self.author = author
+                self.cog = cog
+                super().__init__(
+                    placeholder="Select a song...",
+                    min_values=1,
+                    max_values=1,
+                    options=options,
+                )
+
+            async def callback(self, itn: discord.Interaction):
+                song = await self.cog._fetch_song_by_id(int(self.values[0]))
+                if song is None:
+                    return await itn.response.send_message(
+                        "I couldn't load that song.", ephemeral=True
+                    )
+                view = await self.cog.create_song_view(
+                    song, guild_id=itn.guild_id, author_id=itn.user.id
+                )
+                if self.author != itn.user:
+                    return await itn.response.send_message(view=view, ephemeral=True)
+                await itn.response.edit_message(embed=None, view=view)
+
+        options = [
+            discord.SelectOption(
+                label=(song.get("name") or "Unknown")[:100],
+                value=str(song["id"]),
+            )
+            for song in results
+        ]
+        view = discord.ui.View(timeout=None)
+        view.add_item(LyricsSongSelect(options, ctx.author, self))
+        embed = discord.Embed(
+            description=(
+                f"{ctx.author.mention}: I found **{len(results)}** songs matching "
+                "those lyrics. Pick one below."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await ctx.reply(embed=embed, view=view)
 
     @tasks.loop(hours=1)
     async def cache_songs(self):
@@ -3125,89 +3637,6 @@ class Music(commands.Cog, name="Music"):
         except Exception as e:
             await ctx.send(e)
         
-    @commands.hybrid_command("snippet", aliases=["snip"], description="Search for a Juice WRLD song snippet.")
-    @unified_cooldown(15)
-    async def snippet(self, ctx: commands.Context, *, query: Optional[str] = None):
-        if not query:
-            await Embeds.custom(
-                ctx,
-                "Please provide a song name to search for.",
-                title="Error",
-                color=0x36393E,
-                reply=True,
-            )
-            return
-        song_list = await self.fetch_song(ctx, query, allow_unsurfaced=False)
-        if song_list is None:
-            return
-
-        if len(song_list) == 1:
-            if ctx.interaction and not ctx.interaction.response.is_done():
-                await ctx.defer()
-            layout_view = await self.create_snippet_view(song_list[0])
-            if layout_view is None:
-                return await Embeds.send_warning_embed(ctx, ctx.author, f'**{song_list[0]['name']}** has no **snippets** available')
-
-            await ctx.reply(view=layout_view)
-
-        elif len(song_list) > 1:
-            results = sorted(song_list, key=lambda s: s.get("track_titles"))[:25]
-            song_map = {str(song["id"]): song for song in results}
-
-            options = [
-                discord.SelectOption(
-                    label=(
-                        lambda t: f"{t[0]} ({', '.join(t[1:])})" if len(t) > 1 else (t[0] if t else "Unknown")
-                    )(song.get("track_titles", []))[:100],
-                    value=str(song["id"]),
-                )
-                for song in results
-            ]
-
-            class SongSelect(discord.ui.Select):
-                def __init__(self, options, song_map, author, cog: Music):
-                    self.song_map = song_map
-                    self.author = author
-                    self.cog = cog
-                    super().__init__(
-                        placeholder="Select a song...",
-                        min_values=1,
-                        max_values=1,
-                        options=options,
-                    )
-
-                async def callback(self, itn: discord.Interaction):
-                    song_id = self.values[0]
-                    song = self.song_map[song_id]
-
-                    layout_view = await self.cog.create_snippet_view(song)
-
-                    if layout_view is None:
-                        return await Embeds.send_warning_embed(ctx, ctx.author, f'**{song['name']}** has no **snippets** available')
-
-                    if self.author != itn.user:
-                        return await itn.response.send_message(
-                            view=layout_view, ephemeral=True
-                        )
-
-                    await itn.response.edit_message(embed=None, view=layout_view)
-
-            view = discord.ui.View(timeout=None)
-            view.add_item(SongSelect(options, song_map, ctx.author, self))
-
-            embed = discord.Embed(
-                description=f"{ctx.author.mention}: Multiple **selections** found with your **search**",
-                color=None,
-            )
-            await ctx.reply(embed=embed, view=view)
-
-        else:
-            return await Embeds.send_warning_embed(
-                ctx.channel,
-                ctx.author,
-                f"I couldnt find a song with the name: `{query}`",
-            )
-
     @commands.hybrid_command(
         name="randomleak", aliases=["rleak"], description="Get a random Juice WRLD leak"
     )
@@ -3223,7 +3652,10 @@ class Music(commands.Cog, name="Music"):
 
         song_data = data.get("song")
 
-        layout_view = await self.create_song_view(song_data, True)
+        layout_view = await self.create_song_view(
+            song_data, True, guild_id=ctx.guild.id if ctx.guild else None,
+            author_id=ctx.author.id,
+        )
 
         message = await ctx.send(view=layout_view)
 
@@ -3309,12 +3741,47 @@ class Music(commands.Cog, name="Music"):
 
         return sorted(results)
 
-    def handle_user_done_heardle(self, user_id: int):
-        self.heardle_answers[user_id] = None
-        if user_id in self.ongoing_heardle:
-            self.ongoing_heardle.remove(user_id)
+    def handle_channel_done_heardle(self, channel_id: int):
+        """Release the per-channel Heardle lock once a round is finished."""
+        self.heardle_answers.pop(channel_id, None)
+        if channel_id in self.ongoing_heardle:
+            self.ongoing_heardle.remove(channel_id)
 
-        self.clear_user_cache(user_id, ["_heardle"])
+    async def _collect_tournament_players(
+        self, message: discord.Message
+    ) -> list[discord.User]:
+        """Return the users who reacted ✅ to a tournament join message."""
+        try:
+            fresh = await message.channel.fetch_message(message.id)
+        except discord.DiscordException:
+            fresh = message
+
+        guild = message.guild
+        players: dict[int, discord.User] = {}
+        for reaction in fresh.reactions:
+            if str(reaction.emoji) != "✅":
+                continue
+            try:
+                async for user in reaction.users():
+                    if user.bot:
+                        continue
+                    # Prefer the guild member (display name/colour), but never
+                    # drop someone just because they are missing from the cache.
+                    member = guild.get_member(user.id) if guild else None
+                    players[user.id] = member or user
+            except discord.DiscordException:
+                logger.exception("Could not read tournament join reactions")
+        return list(players.values())
+
+    @staticmethod
+    def _normalize_heardle_guess(text: str) -> str:
+        """Fold a guess to lowercase words so casing/punctuation don't matter."""
+        text = (text or "").lower()
+        # Drop apostrophes entirely ("ain't" -> "aint") before turning other
+        # punctuation into spaces, so both spellings compare equal.
+        text = re.sub(r"['’]", "", text)
+        text = re.sub(r"[^\w\s]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
 
     def handle_user_done_snippet(self, user_id: int):
         self.snippet_debounce[user_id] = False
@@ -3740,13 +4207,13 @@ class Music(commands.Cog, name="Music"):
     @commands.hybrid_command(name="heardle", description="Play a game of Heardle. Juice WRLD songs only.")
     @unified_cooldown(60)
     async def heardle(self, ctx: commands.Context):
-        if ctx.author.id in self.ongoing_heardle:
+        if ctx.channel.id in self.ongoing_heardle:
             await Embeds.send_error_embed(
-                ctx.channel, ctx.author, "You already have an ongoing game of Heardle!"
+                ctx.channel,
+                ctx.author,
+                "A Heardle round is already running in this channel!",
             )
             return
-
-        self.handle_user_done_heardle(ctx.author.id)
 
         async def handle_request_failed(ctx, code=None):
             embed = discord.Embed(
@@ -3769,7 +4236,7 @@ class Music(commands.Cog, name="Music"):
             await handle_request_failed(ctx)
             return
 
-        self.ongoing_heardle.append(ctx.author.id)
+        self.ongoing_heardle.append(ctx.channel.id)
         track_titles = song_data.get("track_titles", []) or []
         path = data.get("path", "")
         raw_track_title = song_data.get("name", "Unknown Title")
@@ -3779,134 +4246,519 @@ class Music(commands.Cog, name="Music"):
         acceptable_answers = set(self.get_acceptable_track_names(raw_track_title))
         for title in track_titles:
             acceptable_answers.update(self.get_acceptable_track_names(title))
-        self.heardle_answers[ctx.author.id] = best_track_title
+        self.heardle_answers[ctx.channel.id] = best_track_title
 
-        async with ctx.typing():
-            image_file_name = f"{DOWNLOAD_CACHE_FOLDER_NAME}/{ctx.author.id}_temp_image_heardle.png"
-            cover_slug = best_track_title.lower().replace(" ", "")
-            await self._fetch_best_cover(
-                cover_url=f"{JUICEWRLD_API}/juicewrld/cover/{cover_slug}.png",
-                album_art_url=f"{JUICEWRLD_API}/juicewrld/files/cover-art/",
-                album_art_params={"path": path},
-                avatar_url=str(ctx.author.display_avatar.url),
-                target_path=image_file_name,
-            )
+        image_file_name = f"{DOWNLOAD_CACHE_FOLDER_NAME}/{ctx.author.id}_temp_image_heardle.png"
+        message = None
+        update_task = None
+        try:
+            async with ctx.typing():
+                cover_slug = best_track_title.lower().replace(" ", "")
+                await self._fetch_best_cover(
+                    cover_url=f"{JUICEWRLD_API}/juicewrld/cover/{cover_slug}.png",
+                    album_art_url=f"{JUICEWRLD_API}/juicewrld/files/cover-art/",
+                    album_art_params={"path": path},
+                    avatar_url=str(ctx.author.display_avatar.url),
+                    target_path=image_file_name,
+                )
 
-            download_url = f"{JUICEWRLD_API}/juicewrld/files/download-compressed/"
-            result, payload = await self.make_snippet(
-                image_file_name,
-                download_url,
-                f"{ctx.author.id}_heardle",
-                HEARDLE_CLIP_DURATION,
-                path=path,
-            )
-            if result == False:
-                await handle_request_failed(ctx, payload)
-                self.handle_user_done_heardle(ctx.author.id)
-                return
+                download_url = f"{JUICEWRLD_API}/juicewrld/files/download-compressed/"
+                result, payload = await self.make_snippet(
+                    image_file_name,
+                    download_url,
+                    f"{ctx.author.id}_heardle",
+                    HEARDLE_CLIP_DURATION,
+                    path=path,
+                )
+                if result == False:
+                    await handle_request_failed(ctx, payload)
+                    return
 
-            message = await ctx.send(file=discord.File(payload))
-            self.remove_file(payload)
+                message = await ctx.send(
+                    content=(
+                        "🎧 **Heardle** — name this Juice WRLD song!\n"
+                        "Anyone in this channel can answer — the first correct "
+                        f"guess wins {format_cash(HEARDLE_PRIZE)}."
+                    ),
+                    file=discord.File(payload),
+                )
+                self.remove_file(payload)
 
-        # Clean up the cover image if it was saved to the cache.
-        if image_file_name.startswith(DOWNLOAD_CACHE_FOLDER_NAME):
-            self.remove_file(image_file_name)
+            has_guessed = False
+            attempts = 0
+            winner = None
+            last_hint = None
+            start_time = asyncio.get_event_loop().time()
 
-        has_guessed = False
-        attempt = 1
-        last_hint = None
-        start_time = asyncio.get_event_loop().time()
+            async def update_timer_message(
+                message: discord.Message, full_name, start_time
+            ):
+                nonlocal last_hint
+                try:
+                    while True:
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        hint_chars = int(elapsed // 3)
+                        if hint_chars > 3:
+                            return
 
-        async def update_timer_message(
-            message: discord.Message, full_name, start_time, author
-        ):
-            nonlocal last_hint
-            try:
-                while True:
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    hint_chars = int(elapsed // 3)
-                    if hint_chars > 3:
-                        return
-
-                    hint_chars = min(hint_chars, len(full_name))
-                    hint = ""
-                    for i, ch in enumerate(full_name):
-                        if i < hint_chars:
-                            hint += ch
-                        elif ch == " ":
-                            hint += " "
-                        else:
-                            hint += "?"
-                    if hint != last_hint:
-                        last_hint = hint
-                        await message.edit(
-                            embed=discord.Embed(
-                                title="Heardle",
-                                description=f"{author.mention} Hint ({hint_chars}/3): {hint}",
-                                color=author.color,
+                        hint_chars = min(hint_chars, len(full_name))
+                        hint = ""
+                        for i, ch in enumerate(full_name):
+                            if i < hint_chars:
+                                hint += ch
+                            elif ch == " ":
+                                hint += " "
+                            else:
+                                hint += "?"
+                        if hint != last_hint:
+                            last_hint = hint
+                            await message.edit(
+                                embed=discord.Embed(
+                                    title="Heardle",
+                                    description=f"Hint ({hint_chars}/3): {hint}",
+                                    color=discord.Color.blurple(),
+                                )
                             )
-                        )
-                    await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                return
+                        await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    return
 
-        update_task = asyncio.create_task(
-            update_timer_message(message, best_track_title, start_time, ctx.author)
-        )
+            update_task = asyncio.create_task(
+                update_timer_message(message, best_track_title, start_time)
+            )
 
-        def check_guess(m):
-            return m.author == ctx.author and m.channel == ctx.channel
+            def check_guess(m):
+                return m.channel == ctx.channel and not m.author.bot
 
-        while not has_guessed:
-            try:
+            while not has_guessed:
                 elapsed = asyncio.get_event_loop().time() - start_time
                 remaining_time = HEARDLE_GAME_DURATION - elapsed
                 if remaining_time <= 0:
-                    raise TimeoutError
+                    await Embeds.send_warning_embed(
+                        ctx.channel,
+                        ctx.author,
+                        f"Time's up! Nobody guessed the song ({best_track_title} [{raw_track_title}]).",
+                    )
+                    await self.bot.database.add_heardle_loss(ctx.author.id)
+                    return
 
-                guess_msg = await self.bot.wait_for(
-                    "message", check=check_guess, timeout=remaining_time
+                try:
+                    guess_msg = await self.bot.wait_for(
+                        "message", check=check_guess, timeout=remaining_time
+                    )
+                except TimeoutError:
+                    await Embeds.send_warning_embed(
+                        ctx.channel,
+                        ctx.author,
+                        f"Time's up! Nobody guessed the song ({best_track_title} [{raw_track_title}]).",
+                    )
+                    await self.bot.database.add_heardle_loss(ctx.author.id)
+                    return
+
+                guess = guess_msg.content.strip().lower()
+                if guess == "exit" and guess_msg.author.id == ctx.author.id:
+                    await guess_msg.add_reaction("👋")
+                    await self.bot.database.add_heardle_loss(ctx.author.id)
+                    return
+                elif guess in acceptable_answers:
+                    has_guessed = True
+                    winner = guess_msg.author
+                else:
+                    attempts += 1
+
+            elapsed = asyncio.get_event_loop().time() - start_time
+            await Embeds.send_success_embed(
+                ctx.channel,
+                winner,
+                f"You guessed the song correctly: **{best_track_title}** "
+                f"in {round(elapsed)} seconds ({attempts + 1} attempts)! "
+                f"Prize: {format_cash(HEARDLE_PRIZE)}.",
+            )
+            await self.bot.database.add_heardle_win(winner.id)
+            try:
+                await self.bot.economy.add(
+                    winner.id, HEARDLE_PRIZE, description="Heardle win"
                 )
-            except TimeoutError:
-                await update_task
+            except Exception:
+                logger.exception("Could not pay the Heardle prize to %s", winner.id)
+        finally:
+            if update_task is not None:
+                update_task.cancel()
+                try:
+                    await update_task
+                except asyncio.CancelledError:
+                    pass
+            if image_file_name.startswith(DOWNLOAD_CACHE_FOLDER_NAME):
+                self.remove_file(image_file_name)
+            await self._safe_delete(message)
+            self.clear_user_cache(ctx.author.id, ["_heardle"])
+            self.handle_channel_done_heardle(ctx.channel.id)
+
+    @commands.group(
+        name="heardletournament",
+        aliases=["heardletourney", "htournament"],
+        invoke_without_command=True,
+        description="Start a multi-round Heardle tournament.",
+    )
+    async def heardletournament(self, ctx: commands.Context):
+        await Embeds.error(
+            ctx,
+            f"Usage: `!heardletournament rounds <1-{HEARDLE_TOURNAMENT_MAX_ROUNDS}>`",
+            reply=True,
+            delete_after=10,
+        )
+
+    @heardletournament.command(
+        name="rounds",
+        description="Start a Heardle tournament with the given number of rounds.",
+    )
+    @unified_cooldown(60)
+    async def heardletournament_rounds(self, ctx: commands.Context, rounds: int):
+        if not 1 <= rounds <= HEARDLE_TOURNAMENT_MAX_ROUNDS:
+            await Embeds.send_error_embed(
+                ctx,
+                ctx.author,
+                f"Rounds must be between 1 and {HEARDLE_TOURNAMENT_MAX_ROUNDS}.",
+            )
+            return
+
+        if ctx.channel.id in self.ongoing_heardle:
+            await Embeds.send_error_embed(
+                ctx,
+                ctx.author,
+                "A Heardle game or tournament is already running in this channel!",
+            )
+            return
+
+        self.ongoing_heardle.append(ctx.channel.id)
+        join_message = None
+        round_message = None
+        try:
+            join_embed = discord.Embed(
+                title="🎧 Heardle Tournament",
+                description=(
+                    "React with ✅ to join! The host is automatically in.\n\n"
+                    f"The tournament starts in **{HEARDLE_TOURNAMENT_JOIN_DURATION} "
+                    f"seconds** and runs for **{rounds}** "
+                    f"round{'s' if rounds != 1 else ''}.\n"
+                    "Each round plays a short Juice WRLD clip — everyone who "
+                    "names the song before the timer runs out scores a point. "
+                    "Most points at the end wins."
+                ),
+                color=discord.Color.blurple(),
+            )
+            join_embed.set_footer(text=f"Hosted by {ctx.author.display_name}")
+            join_message = await ctx.send(embed=join_embed)
+            await join_message.add_reaction("✅")
+            await asyncio.sleep(HEARDLE_TOURNAMENT_JOIN_DURATION)
+
+            players = await self._collect_tournament_players(join_message)
+            players_by_id = {member.id: member for member in players}
+            players_by_id[ctx.author.id] = ctx.author
+            players = list(players_by_id.values())
+            if len(players) < HEARDLE_TOURNAMENT_MIN_PLAYERS:
                 await Embeds.send_warning_embed(
                     ctx.channel,
                     ctx.author,
-                    f"Time's up! You didn't guess the song ({best_track_title} [{raw_track_title}]) in time.",
+                    f"Not enough players joined — at least "
+                    f"{HEARDLE_TOURNAMENT_MIN_PLAYERS} are required.",
                 )
-                await self._safe_delete(message)
-                self.handle_user_done_heardle(ctx.author.id)
-                await self.bot.database.add_heardle_loss(ctx.author.id)
                 return
 
-            guess = guess_msg.content.strip().lower()
-            if guess == "exit":
-                await guess_msg.add_reaction("👋")
-                await update_task
-                await self._safe_delete(message)
-                await self.bot.database.add_heardle_loss(ctx.author.id)
-                self.handle_user_done_heardle(ctx.author.id)
-                return
-            elif guess in acceptable_answers:
-                has_guessed = True
+            players.sort(key=lambda member: member.display_name.lower())
+            scores = {member.id: 0 for member in players}
+
+            await ctx.send(
+                f"🎧 **Heardle Tournament** — **{len(players)}** players, "
+                f"**{rounds}** round{'s' if rounds != 1 else ''}. "
+                "Everyone who gets a round right scores a point!"
+            )
+
+            used_songs = set()
+
+            for round_number in range(1, rounds + 1):
+                data = None
+                for _ in range(3):
+                    candidate = await self.fetch_random_playable_song()
+                    if not candidate or not candidate.get("song"):
+                        continue
+                    song = candidate["song"]
+                    key = (
+                        song.get("id")
+                        or song.get("name")
+                        or candidate.get("path")
+                    )
+                    if key in used_songs:
+                        continue
+                    used_songs.add(key)
+                    data = candidate
+                    break
+
+                if data is None:
+                    await Embeds.warning(
+                        ctx,
+                        f"⚠️ Could not load a song for round {round_number} — skipping.",
+                    )
+                    continue
+
+                song_data = data["song"]
+                path = data.get("path", "")
+                raw_track_title = song_data.get("name", "Unknown Title")
+                best_track_title = self.get_most_acceptable_track_name(
+                    raw_track_title
+                )
+
+                acceptable_answers = {
+                    self._normalize_heardle_guess(name)
+                    for name in self.get_acceptable_track_names(raw_track_title)
+                }
+                for title in song_data.get("track_titles") or []:
+                    acceptable_answers.update(
+                        self._normalize_heardle_guess(name)
+                        for name in self.get_acceptable_track_names(title)
+                    )
+                acceptable_answers.discard("")
+
+                image_file_name = (
+                    f"{DOWNLOAD_CACHE_FOLDER_NAME}/"
+                    f"{ctx.author.id}_temp_image_tournament_{round_number}.png"
+                )
+                clip_name = f"{ctx.author.id}_tournament_{round_number}"
+                update_task = None
+                payload = None
+
+                try:
+                    async with ctx.typing():
+                        cover_slug = best_track_title.lower().replace(" ", "")
+                        await self._fetch_best_cover(
+                            cover_url=f"{JUICEWRLD_API}/juicewrld/cover/{cover_slug}.png",
+                            album_art_url=f"{JUICEWRLD_API}/juicewrld/files/cover-art/",
+                            album_art_params={"path": path},
+                            avatar_url=self.default_avatar_url,
+                            target_path=image_file_name,
+                        )
+                        success, payload = await self.make_snippet(
+                            image_file_name,
+                            f"{JUICEWRLD_API}/juicewrld/files/download-compressed/",
+                            clip_name,
+                            HEARDLE_CLIP_DURATION,
+                            path=path,
+                        )
+
+                    if not success:
+                        await Embeds.warning(
+                            ctx,
+                            f"⚠️ Could not load audio for round {round_number} — skipping.",
+                        )
+                        continue
+
+                    round_message = await ctx.send(
+                        embed=discord.Embed(
+                            title=(
+                                f"🎧 Heardle Tournament — Round "
+                                f"{round_number}/{rounds}"
+                            ),
+                            description=(
+                                "Name this Juice WRLD song! Everyone who gets it "
+                                "right before the timer ends scores a point.\n\n"
+                                "*Hint appears after a few seconds.*"
+                            ),
+                            color=discord.Color.blurple(),
+                        ),
+                        file=discord.File(payload),
+                    )
+                    self.remove_file(payload)
+                    payload = None
+
+                    start_time = asyncio.get_event_loop().time()
+                    last_hint = None
+
+                    async def update_timer_message(
+                        message: discord.Message, full_name: str, start_time: float
+                    ):
+                        nonlocal last_hint
+                        try:
+                            while True:
+                                elapsed = (
+                                    asyncio.get_event_loop().time() - start_time
+                                )
+                                hint_chars = int(elapsed // 3)
+                                if hint_chars > 3:
+                                    return
+
+                                hint_chars = min(hint_chars, len(full_name))
+                                hint = "".join(
+                                    ch if i < hint_chars or ch == " " else "?"
+                                    for i, ch in enumerate(full_name)
+                                )
+                                if hint != last_hint:
+                                    last_hint = hint
+                                    await message.edit(
+                                        embed=discord.Embed(
+                                            title=(
+                                                f"🎧 Heardle Tournament — Round "
+                                                f"{round_number}/{rounds}"
+                                            ),
+                                            description=(
+                                                f"Hint ({hint_chars}/3): `{hint}`\n\n"
+                                                "Everyone who gets it right scores a point!"
+                                            ),
+                                            color=discord.Color.blurple(),
+                                        )
+                                    )
+                                await asyncio.sleep(1)
+                        except asyncio.CancelledError:
+                            return
+                        except discord.DiscordException:
+                            return
+
+                    update_task = asyncio.create_task(
+                        update_timer_message(
+                            round_message, best_track_title, start_time
+                        )
+                    )
+
+                    round_scorers: list[discord.User] = []
+                    round_scorer_ids: set[int] = set()
+
+                    def check_guess(m: discord.Message) -> bool:
+                        return (
+                            m.channel == ctx.channel
+                            and not m.author.bot
+                            and m.author.id in scores
+                            and m.author.id not in round_scorer_ids
+                        )
+
+                    while len(round_scorer_ids) < len(scores):
+                        remaining_time = HEARDLE_GAME_DURATION - (
+                            asyncio.get_event_loop().time() - start_time
+                        )
+                        if remaining_time <= 0:
+                            break
+                        try:
+                            guess_message = await self.bot.wait_for(
+                                "message",
+                                check=check_guess,
+                                timeout=remaining_time,
+                            )
+                        except (asyncio.TimeoutError, TimeoutError):
+                            break
+
+                        normalized_guess = self._normalize_heardle_guess(
+                            guess_message.content
+                        )
+                        if normalized_guess not in acceptable_answers:
+                            continue
+
+                        round_scorer_ids.add(guess_message.author.id)
+                        round_scorers.append(guess_message.author)
+                        scores[guess_message.author.id] += 1
+                        try:
+                            await guess_message.add_reaction("✅")
+                        except discord.DiscordException:
+                            pass
+
+                    if round_scorers:
+                        await Embeds.success(
+                            ctx,
+                            f"Round {round_number} — the song was "
+                            f"**{best_track_title}** [{raw_track_title}].\n"
+                            f"Point{'s' if len(round_scorers) != 1 else ''} to: "
+                            + ", ".join(
+                                f"{member.mention} (**{scores[member.id]}**)"
+                                for member in round_scorers
+                            ),
+                        )
+                        for member in round_scorers:
+                            try:
+                                await self.bot.database.add_heardle_win(
+                                    member.id
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Could not record Heardle tournament win "
+                                    "for %s",
+                                    member.id,
+                                )
+                    else:
+                        await Embeds.send_warning_embed(
+                            ctx.channel,
+                            ctx.author,
+                            f"Round {round_number} over! Nobody guessed "
+                            f"**{best_track_title}** [{raw_track_title}].",
+                        )
+                finally:
+                    if update_task is not None:
+                        update_task.cancel()
+                        try:
+                            await update_task
+                        except asyncio.CancelledError:
+                            pass
+                    if payload:
+                        self.remove_file(payload)
+                    self.remove_file(image_file_name)
+                    await self._safe_delete(round_message)
+                    round_message = None
+
+            ranked = sorted(
+                players,
+                key=lambda member: (
+                    -scores[member.id],
+                    member.display_name.lower(),
+                ),
+            )
+            lines = []
+            previous_score = None
+            rank = 0
+            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+            for index, member in enumerate(ranked, start=1):
+                score = scores[member.id]
+                if score != previous_score:
+                    rank = index
+                    previous_score = score
+                marker = medals.get(rank, f"**{rank}.**")
+                lines.append(
+                    f"{marker} {member.mention} — **{score}** "
+                    f"point{'s' if score != 1 else ''}"
+                )
+
+            leaderboard = discord.Embed(
+                title="🏆 Heardle Tournament — Final Leaderboard",
+                description="\n".join(lines),
+                color=discord.Color.gold(),
+            )
+            top_score = scores[ranked[0].id]
+            top_players = [
+                member for member in ranked if scores[member.id] == top_score
+            ]
+            if top_score == 0:
+                leaderboard.description += (
+                    "\n\n*Nobody scored — better luck next time!*"
+                )
+            elif len(top_players) == 1:
+                leaderboard.description = (
+                    f"👑 {top_players[0].mention} wins!\n\n"
+                    + leaderboard.description
+                )
             else:
-                attempt += 1
-
-        update_task.cancel()
-        try:
-            await update_task
-        except asyncio.CancelledError:
-            pass
-
-        elapsed = asyncio.get_event_loop().time() - start_time
-        await Embeds.send_success_embed(
-            ctx.channel,
-            ctx.author,
-            f"Congratulations! You guessed the song correctly: **{best_track_title}** in {round(elapsed)} seconds ({attempt} attempts)!",
-        )
-        await self.bot.database.add_heardle_win(ctx.author.id)
-        await self._safe_delete(message)
-        self.handle_user_done_heardle(ctx.author.id)
+                leaderboard.description = (
+                    "👑 Tie between "
+                    + ", ".join(member.mention for member in top_players)
+                    + "!\n\n"
+                    + leaderboard.description
+                )
+            leaderboard.set_footer(
+                text=(
+                    f"{rounds} round{'s' if rounds != 1 else ''} • "
+                    f"Hosted by {ctx.author.display_name}"
+                )
+            )
+            await ctx.send(embed=leaderboard)
+        finally:
+            await self._safe_delete(join_message)
+            await self._safe_delete(round_message)
+            self.clear_user_cache(ctx.author.id, ["_tournament"])
+            self.handle_channel_done_heardle(ctx.channel.id)
 
     @commands.command(name="makesnippet", aliases=["makesnip"], description="Create a snippet from a Juice WRLD song.")
     async def makesnippet(self, ctx: commands.Context, *, query: Optional[str] = None):
@@ -4524,7 +5376,7 @@ class LatestSurfacesView(discord.ui.LayoutView):
         nav = discord.ui.ActionRow()
         nav.add_item(discord.ui.Button(label='Previous', style=discord.ButtonStyle.grey, custom_id='latest_prev'))
         nav.add_item(discord.ui.Button(label='Next', style=discord.ButtonStyle.grey, custom_id='latest_next'))
-        nav.add_item(discord.ui.Button(label='Tracker', emoji='<:fart:1445127619744890911>', url=f'{JUICEWRLD_API}/'))
+        nav.add_item(discord.ui.Button(label='Tracker', emoji='\U0001F517', url=f'{JUICEWRLD_API}/'))
         
         container.add_item(discord.ui.Separator())
         container.add_item(nav)
@@ -4563,101 +5415,135 @@ class LatestSurfacesView(discord.ui.LayoutView):
         except discord.HTTPException:
             pass
 
-class GroupbuySongSelect(discord.ui.Select):
-    """Select menu for choosing a song."""
-    
-    def __init__(
-        self, 
-        cog: Music, 
-        author: discord.User, 
-        options: list[discord.SelectOption], 
-        song_map: dict, 
-    ):
-        self.cog = cog
-        self.author = author
-        self.song_map = song_map
-        
+def _groupbuy_flag(value: bool | None) -> str:
+    """👍/👎/❔ for the Info section — the tracker mirrors the plain boolean."""
+    if value is None:
+        return '\u2754'
+    return '\U0001F44D' if value else '\U0001F44E'
+
+
+class GroupbuySelect(discord.ui.Select):
+    """Dropdown that browses the tracker by song or year."""
+
+    def __init__(self, view: "GroupbuyView", options: list[discord.SelectOption]):
+        self.groupbuy_view = view
         super().__init__(
-            placeholder='Select a song...',
-            min_values=1, 
-            max_values=1, 
-            options=options
+            placeholder='Choose a song or year...',
+            min_values=1,
+            max_values=1,
+            options=options,
         )
 
     async def callback(self, itn: discord.Interaction):
-        song_id = self.values[0]
-        song = self.song_map[song_id]
+        view = self.groupbuy_view
+        value = self.values[0]
 
-        layout_view = discord.ui.LayoutView()
-        layout_view.add_item(GroupbuyContainer(self.cog, song))
-
-        if self.author != itn.user:
-            if song['groupbuy_info']['price'] == '':
-                return await Embeds.custom(
-                    itn,
-                    f'⚠️ {itn.user.mention}: **{song['name']}** has no **groupbuy** information',
-                    color=discord.Color.yellow(),
-                    ephemeral=True,
+        if itn.user != view.author:
+            # Anyone else gets their own copy instead of hijacking the card.
+            if value.startswith('song:'):
+                entry = view.candidates[int(value.split(':', 1)[1])]
+                return await itn.response.send_message(
+                    view=view.cog.groupbuy_card_view(entry), ephemeral=True
                 )
-        
-        if song['groupbuy_info']['price'] == '':
-            return await itn.response.edit_message(embed=discord.Embed(
-                description=f'⚠️ {itn.user.mention}: **{song['name']}** has no **groupbuy** information',
-                color=discord.Color.yellow(),
-            ), view=None)
+            return await itn.response.send_message(
+                'Run `gb` to browse the tracker yourself.', ephemeral=True
+            )
 
-        await itn.response.edit_message(view=layout_view, embed=None)
+        if value.startswith('year:'):
+            year = int(value.split(':', 1)[1])
+            view.current = None
+            view.years = []
+            view.candidates = GROUPBUY_CATALOG.for_year(view.entries, year)
+            view.hint = f'### {year} Group Buys / Personal Buys\n-# Choose a track below.'
+        else:
+            view.current = view.candidates[int(value.split(':', 1)[1])]
+            view.hint = None
 
-class GroupbuyContainer(discord.ui.Container):
-    def __init__(self, cog: Music, song: dict):
-        name = song['name']
-        engineers = song['engineers']
-        producers = song['producers']
-        track_titles = [t for t in song['track_titles'] if t != name]
-        image_url = song['image_url']
-        era_name = song['era']['name']
-        album = cog.ALBUMS.get(era_name)
-        date_leaked = song['date_leaked'].replace('Surfaced', '').strip()
+        view._build()
+        await itn.response.edit_message(view=view)
 
-        accent_color = int(album['color'].lstrip('#'), 16) if album else 0x2B2D31
-        super().__init__(accent_color=accent_color)
 
-        groupbuy = song['groupbuy_info']
-        gb_price = groupbuy['price']
+class GroupbuyView(discord.ui.LayoutView):
+    """A tracker card, plus a dropdown to jump between songs and years."""
 
-        gb_start_date = groupbuy['start_date'].replace('Start Date', '').strip()
-        gb_end_date = groupbuy['end_date'].replace('End Date', '').strip()
-        gb_finished = groupbuy['finished']
-        if gb_finished == '':
-            gb_finished = False
+    def __init__(
+        self,
+        cog: Music,
+        author: discord.abc.User,
+        entries: list[Groupbuy],
+        *,
+        current: Groupbuy | None = None,
+        candidates: list[Groupbuy] | None = None,
+        years: list[int] | None = None,
+        hint: str | None = None,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.author = author
+        self.entries = entries
+        self.current = current
+        self.candidates = list(candidates or [])
+        self.years = list(years or [])
+        self.hint = hint
+        self.message = None
+        self._build()
 
-        gb_extra_info = groupbuy['additional_info']
+    def _accent(self) -> int:
+        if self.current is None:
+            return 0x2B2D31
+        return self.cog.groupbuy_era_colour(self.current.era)
 
-        section = discord.ui.Section(accessory=discord.ui.Thumbnail(media=JUICEWRLD_API + image_url))
-        section.add_item(discord.ui.TextDisplay(
-            f'### {name}\n'
-            f'-# Alt Name(s): **{', '.join(track_titles) if track_titles else 'N/A'}**\n'
-            f'-# Engineer(s): **{engineers}**\n'
-            f'-# Producer(s): **{producers}**'
+    def _options(self) -> list[discord.SelectOption]:
+        if self.years and not self.candidates:
+            return [
+                discord.SelectOption(label=str(year), value=f'year:{year}')
+                for year in self.years[:25]
+            ]
+        options: list[discord.SelectOption] = []
+        for index, entry in enumerate(self.candidates[:25]):
+            option = discord.SelectOption(
+                label=self.cog.groupbuy_option_label(entry),
+                value=f'song:{index}',
+            )
+            if entry.price:
+                option.description = format_price(entry.price)
+            emoji = self.cog.groupbuy_era_emoji(entry.era)
+            if emoji is not None:
+                option.emoji = emoji
+            options.append(option)
+        return options
+
+    def _build(self) -> None:
+        self.clear_items()
+
+        container = discord.ui.Container(accent_color=self._accent())
+        if self.current is not None:
+            self.cog.build_groupbuy_card(container, self.current)
+        else:
+            container.add_item(discord.ui.TextDisplay(self.hint or '### GB/PB Tracker'))
+        self.add_item(container)
+
+        options = self._options()
+        if options:
+            row = discord.ui.ActionRow()
+            row.add_item(GroupbuySelect(self, options))
+            self.add_item(row)
+
+        link_row = discord.ui.ActionRow()
+        link_row.add_item(discord.ui.Button(
+            label='Tracker',
+            emoji='\U0001F517',
+            url=f'https://docs.google.com/spreadsheets/d/{GROUPBUY_SHEET_ID}/',
         ))
+        self.add_item(link_row)
 
-        self.add_item(section)
-        self.add_item(discord.ui.Separator())
-        self.add_item(discord.ui.TextDisplay(f'**Era**\n{album['name'] if album else era_name}'))
-        self.add_item(discord.ui.TextDisplay(f'**Price**\n{gb_price}'))
-        self.add_item(discord.ui.TextDisplay(f'**Start Date**\n{gb_start_date}'))
-        self.add_item(discord.ui.TextDisplay(f'**End Date**\n{gb_end_date}'))
-        
-        if date_leaked != '':
-            self.add_item(discord.ui.TextDisplay(f'**Surfaced**\n{date_leaked}'))
-
-        self.add_item(discord.ui.TextDisplay(f'**Completed**\n{gb_finished}'))
-
-        if gb_extra_info != '':
-            self.add_item(discord.ui.TextDisplay(f'**Notes**\n{gb_extra_info}'))
-        
-        action_row = discord.ui.ActionRow()
-        action_row.add_item(discord.ui.Button(label='Tracker', emoji='<:fart:1445127619744890911>', url=f'{JUICEWRLD_API}/'))
-
-        self.add_item(discord.ui.Separator())
-        self.add_item(action_row)
+    async def on_timeout(self) -> None:
+        if self.message is None:
+            return
+        self.years = []
+        self.candidates = []
+        self._build()
+        try:
+            await self.message.edit(view=self)
+        except (discord.NotFound, discord.HTTPException):
+            pass

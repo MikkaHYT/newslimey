@@ -2,7 +2,8 @@ from .base import BaseManager, db_safe
 
 from sqlalchemy.future import select
 from sqlalchemy import update, delete
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+# SQLite dialect upsert (INSERT ... ON CONFLICT); the bot uses a local SQLite DB.
+from sqlalchemy.dialects.sqlite import insert as pg_insert
 from typing import List, Optional
 from utils.security import raise_if_url
 from ..models import (
@@ -13,6 +14,7 @@ from ..models import (
     TempVoiceChannel,
     LockdownChannel,
     Juul,
+    StickyMessage,
 )
 from datetime import timedelta
 import discord
@@ -306,6 +308,54 @@ class GuildMixin(BaseManager):
             status = result.scalars().first()
 
             return status.enabled if status else True
+
+    @db_safe(default=None)
+    async def get_command_status_explicit(
+        self, command_name: str, channel_id: int = None, guild_id: int = None
+    ) -> Optional[bool]:
+        """Like :meth:`get_command_status`, but ``None`` when no row exists.
+
+        The defaulting version can't tell "explicitly enabled" from "never set",
+        which a forced server-wide enable needs in order to take precedence over
+        per-channel disables.
+        """
+        async with self.async_sessionmaker() as session:
+            query = select(CommandStatus.enabled).filter_by(
+                command_name=command_name,
+            )
+            if channel_id:
+                query = query.filter(CommandStatus.channel_id == channel_id)
+            else:
+                query = query.filter(CommandStatus.channel_id.is_(None))
+            if guild_id is None:
+                query = query.filter(CommandStatus.guild_id.is_(None))
+            else:
+                query = query.filter(CommandStatus.guild_id == guild_id)
+
+            result = await session.execute(query)
+            value = result.scalars().first()
+            return None if value is None else bool(value)
+
+    async def clear_channel_command_statuses(
+        self, command_name: str, channel_ids: list[int]
+    ) -> int:
+        """Drop per-channel overrides for *command_name* in the given channels.
+
+        Used so ``admin enable <command>`` can clear channel-level disables and
+        let the server-wide enable take effect for everyone.
+        """
+        channel_ids = [cid for cid in channel_ids if cid is not None]
+        if not channel_ids:
+            return 0
+        async with self.get_session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    delete(CommandStatus).where(
+                        CommandStatus.command_name == command_name,
+                        CommandStatus.channel_id.in_(channel_ids),
+                    )
+                )
+                return result.rowcount or 0
 
     @db_safe(default=[])
     async def get_disabled_commands(self) -> list:
@@ -721,6 +771,80 @@ class GuildMixin(BaseManager):
             except Exception as e:
                 print(f"Error retrieving lockdown channels for guild {guild_id}: {e}")
                 return []
+
+    # ------------------------------------------------------------------
+    # Sticky messages
+    # ------------------------------------------------------------------
+
+    async def set_sticky_message(
+        self,
+        channel_id: int,
+        guild_id: int,
+        content: str,
+        message_id: Optional[int] = None,
+    ) -> None:
+        """Create or replace the sticky message for a channel."""
+        async with self.async_sessionmaker() as session:
+            async with session.begin():
+                sticky = await session.get(StickyMessage, channel_id)
+                if sticky:
+                    sticky.guild_id = guild_id
+                    sticky.content = content
+                    if message_id is not None:
+                        sticky.message_id = message_id
+                else:
+                    sticky = StickyMessage(
+                        channel_id=channel_id,
+                        guild_id=guild_id,
+                        content=content,
+                        message_id=message_id,
+                    )
+                    session.add(sticky)
+
+    async def update_sticky_message_id(
+        self, channel_id: int, message_id: Optional[int]
+    ) -> None:
+        """Record which message is currently the channel's sticky copy."""
+        async with self.async_sessionmaker() as session:
+            async with session.begin():
+                await session.execute(
+                    update(StickyMessage)
+                    .where(StickyMessage.channel_id == channel_id)
+                    .values(message_id=message_id)
+                )
+
+    @db_safe(default=None)
+    async def get_sticky_message(self, channel_id: int) -> Optional[StickyMessage]:
+        """Return the sticky configured for a channel, if any."""
+        async with self.async_sessionmaker() as session:
+            return await session.get(StickyMessage, channel_id)
+
+    async def remove_sticky_message(self, channel_id: int) -> bool:
+        """Delete a channel's sticky. Returns True if one existed."""
+        async with self.async_sessionmaker() as session:
+            async with session.begin():
+                result = await session.execute(
+                    delete(StickyMessage).where(
+                        StickyMessage.channel_id == channel_id
+                    )
+                )
+                return result.rowcount > 0
+
+    @db_safe(default=[])
+    async def get_guild_stickies(self, guild_id: int) -> List[StickyMessage]:
+        """Return every sticky configured in a guild."""
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                select(StickyMessage).where(StickyMessage.guild_id == guild_id)
+            )
+            return list(result.scalars().all())
+
+    @db_safe(default=[])
+    async def get_sticky_channel_ids(self) -> List[int]:
+        """Return the channel ids of every configured sticky (all guilds)."""
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(select(StickyMessage.channel_id))
+            return list(result.scalars().all())
 
     async def get_juul(self, guild_id: int) -> Optional[Juul]:
         """

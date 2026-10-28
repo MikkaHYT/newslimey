@@ -60,6 +60,14 @@ Docker run --env-file .env --name tpnebot --restart unless-stopped tpnebot:lates
 ```
 Note: Ensure Postgres hostname inside URL references service name or external host.
 
+## Optional: Local Vocal Separation (Karaoke)
+- Karaoke plays a real instrumental when one can be made. `utils/core/separate.py` runs Demucs in a background subprocess and caches the result beside the song as `<name>.karaoke.ai.m4a`; with no separator installed, karaoke uses the DSP chain in `utils/core/radio.py` exactly as before.
+- Install it with the project's own interpreter: `venv/bin/python scripts/install_local_separator.py` (`--check` only reports). The script refuses any other interpreter, because a venv copied from another project can carry a `pip` that installs into *that* project.
+- Everything it downloads stays under `<project>/.cache` — wheels, the Rust toolchain, model weights and the scratch tree — so the host's root partition is not touched. `utils/core/separate.py` points `TORCH_HOME`, `HF_HOME` and `TMPDIR` at the same place at runtime.
+- The script handles the awkward parts of ARM64: torch comes from the CPU wheel index (the default wheel pulls in CUDA packages), `sphn` has no aarch64 wheel so it is compiled with a project-local Rust, and Opus is linked through `OPUS_LIB_DIR` instead of requiring `libopus-dev` and CMake.
+- Demucs runs through `utils/core/vocals.py` rather than `-m demucs`, because torchaudio on this host writes files only through TorchCodec, which does not load here; that module swaps the one call for a WAV writer from the standard library.
+- Separation is CPU-bound and serialized: 20 s of audio takes about 20 s, a full 3:33 song took 479 s on a 2-core ARM host. It never blocks playback — the DSP render plays until the file lands, and the file is then reused forever.
+
 ## Environment Separation
 - Use distinct tokens and seeds per environment (dev, staging, production).
 - Avoid running development fairness seed rotation in production without auditing.

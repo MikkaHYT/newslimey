@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from utils.core.prefixes import render
 from discord.ext.commands import Context
 from typing import Optional
 import logging
@@ -9,6 +10,10 @@ from utils.embeds import Embeds
 from utils.guardrails import check_slash_guardrails
 
 logger = logging.getLogger("discord.client")
+
+#: Per-server snapshot of the roles `!strip` removed, as a JSON object mapping
+#: member id -> [role id]. `!restore` reads it back (and clears it).
+STRIPPED_ROLES_KEY = "stripped_roles"
 
 
 class RolesPaginator(discord.ui.View):
@@ -154,6 +159,9 @@ class RoleTools(commands.Cog, name="Roles"):
         self.bot = bot
         self.default_avatar_url = "https://cdn.discordapp.com/embed/avatars/1.png"
         self.forced_roles = {}
+        # Fallback when the settings store is unavailable, keyed by
+        # (guild id, member id). The settings store is the durable copy.
+        self._stripped_roles: dict[tuple[int, int], list[int]] = {}
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -1224,7 +1232,7 @@ class RoleTools(commands.Cog, name="Roles"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}autorole {name}`{aliases} — {desc}")
             else:
@@ -1308,6 +1316,197 @@ class RoleTools(commands.Cog, name="Roles"):
         except Exception as e:
             logger.error(f"Failed to clear autoroles: {e}")
             await Embeds.error(ctx, "🚫 Failed to clear autoroles.", reply=True)
+
+    # -- !strip / !restore -------------------------------------------------
+    def _saved_stripped_roles(self, guild_id: int, member_id: int) -> list[int]:
+        """The role ids `!strip` took from a member, newest snapshot first."""
+        settings = getattr(self.bot, "dash_settings", None)
+        if settings is not None:
+            stored = settings.stored(STRIPPED_ROLES_KEY, guild_id=int(guild_id))
+            if isinstance(stored, dict):
+                raw = stored.get(str(member_id))
+                try:
+                    return [int(role_id) for role_id in (raw or [])]
+                except (TypeError, ValueError):
+                    return []
+        return list(self._stripped_roles.get((int(guild_id), int(member_id)), []))
+
+    async def _save_stripped_roles(
+        self, guild_id: int, member_id: int, role_ids: list[int]
+    ) -> None:
+        """Remember (or clear, with an empty list) a member's pre-strip roles."""
+        self._stripped_roles[(int(guild_id), int(member_id))] = [
+            int(role_id) for role_id in role_ids
+        ]
+        settings = getattr(self.bot, "dash_settings", None)
+        if settings is None:
+            return
+        stored = settings.stored(STRIPPED_ROLES_KEY, guild_id=int(guild_id))
+        data = dict(stored) if isinstance(stored, dict) else {}
+        if role_ids:
+            data[str(member_id)] = [int(role_id) for role_id in role_ids]
+        else:
+            data.pop(str(member_id), None)
+        await settings.set_value(
+            STRIPPED_ROLES_KEY, data or None, guild_id=int(guild_id)
+        )
+
+    @commands.command(
+        name="strip",
+        aliases=["striproles", "removeroles"],
+        description="Remove every role from a member (administrator only).",
+    )
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    @discord.app_commands.default_permissions(administrator=True)
+    @unified_cooldown(10)
+    async def strip_command(
+        self, ctx: Context, member: discord.Member | None = None
+    ):
+        """Take every role off ``member`` and save them for `!restore`.
+
+        Usage: `!strip @member`. Only roles the bot is allowed to manage are
+        touched; the snapshot is saved after Discord accepts the change.
+        """
+        if member is None:
+            return await Embeds.error(
+                ctx, "🚫 Pick who to strip: `!strip @member`.", reply=True
+            )
+        if member.id == ctx.guild.owner_id:
+            return await Embeds.error(
+                ctx, "🚫 I cannot strip the server owner.", reply=True
+            )
+        if member.id == self.bot.user.id:
+            return await Embeds.error(
+                ctx, "🚫 I cannot strip my own roles.", reply=True
+            )
+        if member.top_role.position >= ctx.me.top_role.position:
+            return await Embeds.error(
+                ctx,
+                "🚫 That member's highest role is above mine, so I cannot change "
+                "their roles.",
+                reply=True,
+            )
+
+        removable = [
+            role
+            for role in member.roles
+            if role != ctx.guild.default_role
+            and not role.managed
+            and role.position < ctx.me.top_role.position
+        ]
+        if not removable:
+            return await Embeds.error(
+                ctx,
+                f"⚠️ {member.mention} has no roles I can remove.",
+                reply=False,
+            )
+
+        try:
+            await member.remove_roles(
+                *removable, reason=f"Stripped by {ctx.author}"
+            )
+        except discord.Forbidden:
+            return await Embeds.error(
+                ctx, "🚫 I do not have permission to remove those roles.", reply=True
+            )
+        except discord.HTTPException as exc:
+            return await Embeds.error(
+                ctx, f"🚫 Discord rejected the change: `{exc}`", reply=True
+            )
+
+        await self._save_stripped_roles(
+            ctx.guild.id, member.id, [role.id for role in removable]
+        )
+        await ctx.send(
+            embed=discord.Embed(
+                description=(
+                    f"✅ Stripped **{len(removable)}** role(s) from "
+                    f"{member.mention}.\n"
+                    f"-# Put them back with `!restore {member.mention}`."
+                ),
+                color=discord.Color.red(),
+            )
+        )
+
+    @commands.command(
+        name="restore",
+        aliases=["restoreroles", "unstrip"],
+        description="Give a stripped member their roles back (administrator only).",
+    )
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    @discord.app_commands.default_permissions(administrator=True)
+    @unified_cooldown(10)
+    async def restore_command(
+        self, ctx: Context, member: discord.Member | None = None
+    ):
+        """Give ``member`` the roles the last `!strip` took from them.
+
+        Usage: `!restore @member`. The saved snapshot is cleared afterwards so
+        running it twice does not re-add roles that were removed on purpose.
+        """
+        if member is None:
+            return await Embeds.error(
+                ctx, "🚫 Pick who to restore: `!restore @member`.", reply=True
+            )
+
+        saved = self._saved_stripped_roles(ctx.guild.id, member.id)
+        if not saved:
+            return await Embeds.error(
+                ctx,
+                f"⚠️ There are no stripped roles saved for {member.mention}.",
+                reply=False,
+            )
+
+        roles: list[discord.Role] = []
+        skipped = 0
+        for role_id in saved:
+            role = ctx.guild.get_role(role_id)
+            if (
+                role is None
+                or role.managed
+                or role.position >= ctx.me.top_role.position
+            ):
+                skipped += 1
+                continue
+            if role not in member.roles:
+                roles.append(role)
+
+        if roles:
+            try:
+                await member.add_roles(
+                    *roles, reason=f"Roles restored by {ctx.author}"
+                )
+            except discord.Forbidden:
+                return await Embeds.error(
+                    ctx,
+                    "🚫 I do not have permission to add those roles back.",
+                    reply=True,
+                )
+            except discord.HTTPException as exc:
+                return await Embeds.error(
+                    ctx, f"🚫 Discord rejected the change: `{exc}`", reply=True
+                )
+
+        # Clear the snapshot so a second !restore cannot re-add stale roles.
+        await self._save_stripped_roles(ctx.guild.id, member.id, [])
+
+        lines = [f"✅ Restored **{len(roles)}** role(s) to {member.mention}."]
+        if skipped:
+            lines.append(
+                f"-# ⚠️ {skipped} saved role(s) no longer exist or are above my "
+                "highest role."
+            )
+        if not roles and not skipped:
+            lines.append("-# They already had every saved role.")
+        await ctx.send(
+            embed=discord.Embed(
+                description="\n".join(lines), color=discord.Color.green()
+            )
+        )
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):

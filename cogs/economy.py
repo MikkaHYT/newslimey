@@ -11,12 +11,14 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from discord import Button, Interaction
 from discord.ui import View, Button
 from discord.ext import commands, tasks
+from utils.core.prefixes import render
 from utils.misc import MiscUtils
 from utils.embeds import Embeds
 from utils.amount import AmountUtils
 from utils.cooldown import unified_cooldown
 from utils.guardrails import check_slash_guardrails
 from utils.security import resolve_id, resolve_ids
+from utils.core.settings import GUILD_ECONOMY_KEY
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -90,8 +92,8 @@ class DropView(discord.ui.View):
                 interaction.user.id
             )
             economic_multiplier = await self.cog.bot.database.get_dynamic_reward_multiplier()
-            payout_amount = (Decimal(self.amount) * economic_multiplier).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
+            payout_amount = AmountUtils.round_currency(
+                Decimal(self.amount) * economic_multiplier
             )
             await self.cog.bot.database.process_treasury_transaction(
                 wallet_id=claim_wallet,
@@ -202,8 +204,9 @@ class AirDropView(discord.ui.View):
 
         else:
             economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
-            share = (self.amount / Decimal(len(self.joiners))) * economic_multiplier
-            share = share.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            share = AmountUtils.round_currency(
+                (self.amount / Decimal(len(self.joiners))) * economic_multiplier
+            )
             for user_id in self.joiners:
                 recipient_wallet = await self.bot.database.get_wallet_id_for_user(
                     user_id
@@ -319,7 +322,8 @@ class ShopView(View):
             )
         else:
             item = self.shop_items[self.current_index]
-            item_price = Decimal(item.price)
+            # Fixed catalogue price: the same figure for every member.
+            item_price = await self.bot.database.get_shop_price(item)
             embed = discord.Embed(
                 title=f"{item.name}",
                 description=item.description or "No description provided.",
@@ -385,9 +389,10 @@ class ShopView(View):
             return
 
         item = self.shop_items[self.current_index]
-        wallet_id = await self.bot.database.get_wallet_id_for_user(self.user_id)
-        user_balance = await self.bot.database.get_wallet_balance(wallet_id)
-        item_price = Decimal(item.price)
+        # The price can be paid out of the wallet or the bank, so the
+        # affordability check has to look at both.
+        user_balance = await self.bot.database.get_spendable_balance(self.user_id)
+        item_price = await self.bot.database.get_shop_price(item)
 
         if user_balance < item_price:
             await interaction.response.send_message(
@@ -483,7 +488,7 @@ class ConfirmPurchaseView(View):
             )
             return
 
-        item_price = AmountUtils.round_currency(Decimal(self.item.price))
+        item_price = await self.bot.database.get_shop_price(self.item)
         try:
             async with self.bot.database.get_session() as session:
                 await self.bot.database.purchase_shop_item(
@@ -1050,8 +1055,8 @@ class BalanceView(discord.ui.View):
         await interaction.response.edit_message(embed=self.original_embed, view=self)
 
 class TransactionPaginator(discord.ui.View):
-    def __init__(self, cog, transactions, member, requesting_user):
-        super().__init__(timeout=60)
+    def __init__(self, cog, transactions, member, requesting_user, timeout: int = 60):
+        super().__init__(timeout=timeout)
         self.cog = cog
         self.transactions = transactions
         self.member = member
@@ -1110,10 +1115,19 @@ class TransactionPaginator(discord.ui.View):
             else:
                 direction = "🔄 Internal"
 
+            # Show the other party so a page is readable on its own.
+            counterparty = raw_from if raw_from != self.member.id else raw_to
+            with_line = (
+                f"**With:** <@{counterparty}>\n"
+                if counterparty and counterparty != self.member.id
+                else ""
+            )
+
             embed.add_field(
                 name=f"{direction} • {timestamp}",
                 value=(
                     f"**Amount:** {self.cog.currency_name} **{formatted_amount}**\n"
+                    f"{with_line}"
                     f"**Details:** {description}\n"
                     f"**ID:** `{tx.id}`"
                 ),
@@ -1336,7 +1350,7 @@ class Economy(commands.Cog):
         if max_frac < 0:
             max_frac = 0
         quant = Decimal(1).scaleb(-max_frac) if max_frac else Decimal(1)
-        xq = x.quantize(quant, rounding=rounding)
+        xq = AmountUtils.quantize(x, quant, rounding=rounding)
         s = f"{xq:,.{max_frac}f}"
         if "." in s:
             s = s.rstrip("0").rstrip(".")
@@ -1526,6 +1540,80 @@ class Economy(commands.Cog):
     async def before_fire_inactive_employees_task(self):
         await self.bot.wait_until_ready()
 
+    @commands.command(
+        name="guildeconomy",
+        aliases=["servereconomy", "localeconomy", "guildbank"],
+        description="Switch this server between the shared economy and its own.",
+    )
+    @commands.guild_only()
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_guild=True))
+    async def guildeconomy_command(
+        self, ctx: commands.Context, mode: str | None = None
+    ) -> None:
+        """Give this server its own economy, or put it back on the shared one.
+
+        Usage:
+          `!guildeconomy`      — show which economy this server is on
+          `!guildeconomy on`   — use this server's own economy
+          `!guildeconomy off`  — back to the shared economy (kept, not deleted)
+        """
+        settings = getattr(self.bot, "dash_settings", None)
+        if settings is None:
+            return await ctx.reply(
+                "The settings store isn't ready yet — try again in a moment.",
+                mention_author=False,
+            )
+
+        from utils.core.economy_scope import guild_economy_enabled
+
+        token = (mode or "").strip().lower()
+        if token in {"on", "enable", "enabled", "true", "yes", "start", "own"}:
+            await settings.set_flag(
+                GUILD_ECONOMY_KEY, True, guild_id=ctx.guild.id
+            )
+            return await ctx.reply(
+                "✅ This server now uses **its own economy**, separate from the "
+                "bot-wide one.\nTurning it off later keeps this economy — flip "
+                "it back on and everyone picks up where they left off.",
+                mention_author=False,
+            )
+        if token in {
+            "off",
+            "disable",
+            "disabled",
+            "false",
+            "no",
+            "stop",
+            "global",
+            "shared",
+        }:
+            await settings.set_flag(
+                GUILD_ECONOMY_KEY, False, guild_id=ctx.guild.id
+            )
+            return await ctx.reply(
+                "✅ This server is back on the **shared bot-wide economy**.\n"
+                "Its own economy has been kept, so `!guildeconomy on` resumes it.",
+                mention_author=False,
+            )
+        if token and token not in {"status", "show", "view", "info"}:
+            return await ctx.reply(
+                "Usage: `!guildeconomy on`, `!guildeconomy off`, or "
+                "`!guildeconomy` to see the current mode.",
+                mention_author=False,
+            )
+
+        enabled = guild_economy_enabled(self.bot, ctx.guild.id)
+        where = (
+            "**its own economy**"
+            if enabled
+            else "the **shared bot-wide economy**"
+        )
+        await ctx.reply(
+            f"🏦 **{ctx.guild.name}** is on {where}.\n"
+            "Switch with `!guildeconomy on` or `!guildeconomy off`.",
+            mention_author=False,
+        )
+
     @commands.hybrid_command(
         name="balance", aliases=["bal"], description="Check your current balance."
     )
@@ -1626,9 +1714,16 @@ class Economy(commands.Cog):
                     inline=False
                 )
 
-            embed.set_footer(
-                text=f"Total Balance: {await self.formatter(wallet_balance + bank_balance)}"
-            )
+            total_balance = wallet_balance + bank_balance
+            footer = f"Total Balance: {await self.formatter(total_balance)}"
+            # Nudge anyone the charity is open to, right under their total. Only
+            # on your own balance - "you can get money" reads wrong on someone
+            # else's, where the reader is not the one who would be claiming.
+            if member.id == ctx.author.id:
+                hint = await self._charity_hint(total_balance)
+                if hint:
+                    footer = f"{footer}\n{hint}"
+            embed.set_footer(text=footer)
 
             if view:
                 await ctx.reply(embed=embed, view=view)
@@ -1946,7 +2041,11 @@ class Economy(commands.Cog):
             # Apply dynamic reward multiplier based on economic conditions
             multiplier = await self.bot.database.get_dynamic_reward_multiplier()
             earning_multiplier = await self.bot.database.get_earning_multiplier(ctx.author.id)
-            daily_amount = int((Decimal(base_amount) * multiplier * earning_multiplier).quantize(Decimal("1")))
+            daily_amount = int(
+                AmountUtils.quantize(
+                    Decimal(base_amount) * multiplier * earning_multiplier, Decimal("1")
+                )
+            )
 
             wallet_id = await self.bot.database.get_wallet_id_for_user(ctx.author.id)
             try:
@@ -2021,7 +2120,11 @@ class Economy(commands.Cog):
             # Apply dynamic reward multiplier based on economic conditions
             multiplier = await self.bot.database.get_dynamic_reward_multiplier()
             earning_multiplier = await self.bot.database.get_earning_multiplier(ctx.author.id)
-            weekly_amount = int((Decimal(base_amount) * multiplier * earning_multiplier).quantize(Decimal("1")))
+            weekly_amount = int(
+                AmountUtils.quantize(
+                    Decimal(base_amount) * multiplier * earning_multiplier, Decimal("1")
+                )
+            )
 
             wallet_id = await self.bot.database.get_wallet_id_for_user(ctx.author.id)
             try:
@@ -2094,7 +2197,11 @@ class Economy(commands.Cog):
             base_amount = secrets.randbelow(9799990 - 3399990) + 3399990
             multiplier = await self.bot.database.get_dynamic_reward_multiplier()
             earning_multiplier = await self.bot.database.get_earning_multiplier(ctx.author.id)
-            monthly_amount = int((Decimal(base_amount) * multiplier * earning_multiplier).quantize(Decimal("1")))
+            monthly_amount = int(
+                AmountUtils.quantize(
+                    Decimal(base_amount) * multiplier * earning_multiplier, Decimal("1")
+                )
+            )
             wallet_id = await self.bot.database.get_wallet_id_for_user(ctx.author.id)
             try:
                 await self.bot.database.process_treasury_transaction(
@@ -2264,7 +2371,7 @@ class Economy(commands.Cog):
                 # Apply dynamic economic multiplier
                 economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
                 amount = amount * economic_multiplier
-                amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                amount = AmountUtils.round_currency(amount)
 
                 try:
                     await self.bot.database.process_treasury_transaction(
@@ -2454,7 +2561,7 @@ class Economy(commands.Cog):
             economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
             earning_multiplier = await self.bot.database.get_earning_multiplier(user_id)
             salary = salary * economic_multiplier * earning_multiplier
-            salary = salary.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            salary = AmountUtils.round_currency(salary)
 
             # Pay the user via treasury
             wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
@@ -2598,6 +2705,279 @@ class Economy(commands.Cog):
         except ValueError as e:
             await Embeds.error(ctx, str(e), delete_after=5, reply=True)
 
+    # -- charity ---------------------------------------------------------
+    @staticmethod
+    def _charity_claimable(fund: dict, net_worth: Decimal) -> Decimal:
+        """How much ``net_worth`` may take from ``fund`` right now (0 if not).
+
+        The poorer the member, the bigger the slice: at zero net worth they can
+        take up to ``max_claim``, and the amount falls in a straight line to
+        ``min_claim`` as net worth approaches ``claim_threshold``. Nobody at or
+        above the threshold may take anything, and a claim can never exceed the
+        pot itself.
+        """
+        if not fund.get("enabled"):
+            return Decimal("0.00")
+        balance = Decimal(str(fund.get("balance") or 0))
+        if balance <= 0:
+            return Decimal("0.00")
+        threshold = Decimal(str(fund.get("claim_threshold") or 0))
+        if threshold <= 0 or net_worth >= threshold:
+            return Decimal("0.00")
+        maximum = Decimal(str(fund.get("max_claim") or 0))
+        minimum = Decimal(str(fund.get("min_claim") or 0))
+        if maximum <= 0:
+            return Decimal("0.00")
+        if minimum > maximum:
+            minimum = maximum
+        progress = net_worth / threshold
+        claim = maximum - (maximum - minimum) * progress
+        claim = max(minimum, min(claim, maximum))
+        claim = AmountUtils.round_currency(claim)
+        if claim > balance:
+            claim = AmountUtils.round_currency(balance)
+        return claim if claim > 0 else Decimal("0.00")
+
+    async def _charity_hint(self, net_worth: Decimal) -> str | None:
+        """The ``!charity`` nudge for ``!balance``, or ``None`` when it doesn't apply.
+
+        Shown under the total balance while the member's whole balance is under
+        the fund's claim threshold - the rule the claim itself uses - and only
+        while staff have claims switched on, so the line never appears for a
+        fund that is closed to claims.
+        """
+        try:
+            fund = await self.bot.database.get_charity_fund()
+        except Exception:
+            # The nudge is cosmetic: a charity lookup must never break `!balance`.
+            logger.warning(
+                "[Economy] Could not read the charity fund for the balance hint",
+                exc_info=True,
+            )
+            return None
+        if not fund.get("enabled"):
+            return None
+        threshold = Decimal(str(fund.get("claim_threshold") or 0))
+        if threshold <= 0 or net_worth >= threshold:
+            return None
+        return (
+            "You're under the charity threshold - you can get money from the "
+            "charity fund with !charity"
+        )
+
+    async def _charity_snapshot(self, member: discord.Member) -> dict:
+        """The fund plus ``member``'s net worth and current claim allowance."""
+        fund = await self.bot.database.get_charity_fund()
+        wallet_id = await self.bot.database.get_wallet_id_for_user(member.id)
+        wallet_balance = Decimal(
+            str(await self.bot.database.get_wallet_balance(wallet_id) or 0)
+        )
+        bank_balance = Decimal(
+            str(await self.bot.database.get_bank_balance(wallet_id) or 0)
+        )
+        net_worth = wallet_balance + bank_balance
+        return {
+            "fund": fund,
+            "net_worth": net_worth,
+            "claim": self._charity_claimable(fund, net_worth),
+        }
+
+    @commands.group(name="charity", invoke_without_command=True)
+    async def charity(self, ctx: commands.Context):
+        """The community charity fund: give what you can, take what you need.
+
+        Usage:
+          `!charity`                 — the fund, its rules and your eligibility
+          `!charity donate <amount>` — give currency from your wallet
+          `!charity take`            — claim a small slice if you're short
+          `!charity stats`           — totals and the current rules
+        """
+        if ctx.invoked_subcommand is not None:
+            return
+
+        snapshot = await self._charity_snapshot(ctx.author)
+        fund = snapshot["fund"]
+        threshold = Decimal(str(fund.get("claim_threshold") or 0))
+        claim = snapshot["claim"]
+
+        embed = discord.Embed(
+            title="🤝 Charity Fund", color=discord.Color.green()
+        )
+        embed.add_field(
+            name="In the pot",
+            value=f"{self.currency_name} **{await self.short_formatter(fund['balance'])}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Your net worth",
+            value=f"{self.currency_name} **{await self.short_formatter(snapshot['net_worth'])}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="You can claim",
+            value=(
+                f"{self.currency_name} **{await self.short_formatter(claim)}**"
+                if claim > 0
+                else "Nothing right now"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Rules",
+            value=(
+                f"Claimable while your net worth is under "
+                f"{self.currency_name} **{await self.short_formatter(threshold)}**; "
+                "the poorer you are, the more you may take."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text="!charity donate <amount> to give  •  !charity take to claim"
+        )
+        await ctx.reply(embed=embed)
+
+    @charity.command(
+        name="donate",
+        aliases=["give"],
+        description="Donate currency from your wallet to the charity fund.",
+    )
+    async def charity_donate(self, ctx: commands.Context, amount: str):
+        """Give currency from your wallet to the community charity fund."""
+        wallet_id = await self.bot.database.get_wallet_id_for_user(ctx.author.id)
+        balance = Decimal(
+            str(await self.bot.database.get_wallet_balance(wallet_id) or 0)
+        )
+        try:
+            amount = await self.amount_handler(amount, balance)
+        except ValueError as e:
+            return await Embeds.error(ctx, str(e), delete_after=5, reply=True)
+
+        try:
+            await self.bot.database.charity_donate(
+                wallet_id, amount, f"Charity donation from {ctx.author.display_name}"
+            )
+        except ValueError as e:
+            return await Embeds.error(ctx, str(e), delete_after=5, reply=True)
+
+        fund = await self.bot.database.get_charity_fund()
+        await Embeds.success(
+            ctx,
+            f"You donated {self.currency_name} **{await self.formatter(amount)}** "
+            f"to charity. The fund now holds "
+            f"{self.currency_name} **{await self.formatter(fund['balance'])}**.",
+            reply=True,
+        )
+
+    @charity.command(
+        name="take",
+        aliases=["claim"],
+        description="Claim a small slice of the charity fund if you're eligible.",
+    )
+    async def charity_take(self, ctx: commands.Context):
+        """Claim a little help from the fund while your balance is low.
+
+        How much you get shrinks as your net worth grows and stops entirely at
+        the threshold (`!bank charity threshold`). Claims are rate-limited, so
+        the fund is a trickle rather than a jackpot.
+        """
+        fund = await self.bot.database.get_charity_fund()
+        if not fund.get("enabled"):
+            return await Embeds.error(
+                ctx,
+                "The charity fund isn't accepting claims right now.",
+                delete_after=5,
+                reply=True,
+            )
+
+        remaining = await self.bot.database.get_cooldown(
+            ctx.author.id, "charity take"
+        )
+        if remaining > 0:
+            embed = await self.bot.cooldowns.get_cooldown_embed(remaining)
+            return await ctx.reply(embed=embed)
+
+        snapshot = await self._charity_snapshot(ctx.author)
+        threshold = Decimal(str(fund.get("claim_threshold") or 0))
+        if threshold > 0 and snapshot["net_worth"] >= threshold:
+            return await Embeds.error(
+                ctx,
+                "You can't claim from charity — your net worth is above the "
+                f"{self.currency_name} **{await self.formatter(threshold)}** "
+                "threshold.",
+                delete_after=8,
+                reply=True,
+            )
+
+        claim = snapshot["claim"]
+        if claim <= 0:
+            return await Embeds.error(
+                ctx,
+                "The charity fund is empty right now. Try again later.",
+                delete_after=5,
+                reply=True,
+            )
+
+        wallet_id = await self.bot.database.get_wallet_id_for_user(ctx.author.id)
+        try:
+            await self.bot.database.charity_claim(
+                wallet_id, claim, "Charity claim"
+            )
+        except ValueError as e:
+            return await Embeds.error(ctx, str(e), delete_after=5, reply=True)
+
+        cooldown = int(fund.get("cooldown_seconds") or 0)
+        if cooldown > 0:
+            await self.bot.database.set_cooldown(
+                ctx.author.id, "charity take", cooldown
+            )
+
+        await Embeds.success(
+            ctx,
+            f"You claimed {self.currency_name} **{await self.formatter(claim)}** "
+            "from charity.",
+            reply=True,
+        )
+
+    @charity.command(
+        name="stats",
+        aliases=["info"],
+        description="See the charity fund's balance, totals and rules.",
+    )
+    async def charity_stats(self, ctx: commands.Context):
+        """Show how much the fund holds and the rules that govern claims."""
+        fund = await self.bot.database.get_charity_fund()
+        embed = discord.Embed(title="🤝 Charity Fund", color=discord.Color.green())
+        embed.add_field(
+            name="Balance",
+            value=f"{self.currency_name} **{await self.formatter(fund['balance'])}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Total donated",
+            value=f"{self.currency_name} **{await self.formatter(fund['total_donated'])}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Total claimed",
+            value=f"{self.currency_name} **{await self.formatter(fund['total_claimed'])}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Claim rules",
+            value=(
+                f"**Threshold:** {self.currency_name} "
+                f"{await self.formatter(fund['claim_threshold'])}\n"
+                f"**Claim range:** {self.currency_name} "
+                f"{await self.formatter(fund['min_claim'])}–"
+                f"{await self.formatter(fund['max_claim'])}\n"
+                f"**Cooldown:** {int(fund['cooldown_seconds'])}s\n"
+                f"**Status:** {'open' if fund['enabled'] else 'claims paused'}"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Configured by staff with the !bank charity commands")
+        await ctx.reply(embed=embed)
+
     @commands.group(name="loan", aliases=["loans"], invoke_without_command=True)
     async def loan(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Group command for managing loans. Defaults to your own loan."""
@@ -2675,8 +3055,8 @@ class Economy(commands.Cog):
         
             interest_rate = Decimal("0.10")
 
-            total_repay = (amount_decimal * (Decimal("1") + interest_rate)).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
+            total_repay = AmountUtils.round_currency(
+                amount_decimal * (Decimal("1") + interest_rate)
             )
             await self.bot.database.process_treasury_transaction(
                 wallet_id=wallet_id, amount=amount_decimal, description="Loan Disbursement"
@@ -2981,9 +3361,7 @@ class Economy(commands.Cog):
                     return
                 bonus = (target_balance * Decimal("0.01"))
                 economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
-                bonus = (bonus * economic_multiplier).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                bonus = AmountUtils.round_currency(bonus * economic_multiplier)
                 multiplier_text = f" (Econ ×{economic_multiplier:.2f})" if economic_multiplier != Decimal("1.0") else ""
                 result_message = (
                     f"💥 **You failed** to rob {target.mention} and were fined "
@@ -3017,9 +3395,11 @@ class Economy(commands.Cog):
                     )
 
                 percentage = Decimal(secrets.randbelow(11) + 10) / Decimal("100")
-                amount_stolen = (
-                    target_bank_balance * percentage * robbery_debuff
-                ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                amount_stolen = AmountUtils.quantize(
+                    target_bank_balance * percentage * robbery_debuff,
+                    Decimal("1"),
+                    rounding=ROUND_HALF_UP,
+                )
                 if amount_stolen > 0:
                     await self.bot.database.withdraw_from_bank(
                         wallet_id=target_wallet_id,
@@ -3413,7 +3793,7 @@ class Economy(commands.Cog):
 
         gift_amount = Decimal(str(user_id)) / Decimal("4")
         economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
-        gift_amount = (gift_amount * economic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        gift_amount = AmountUtils.round_currency(gift_amount * economic_multiplier)
 
         try:
             await self.bot.database.process_treasury_transaction(
@@ -3466,7 +3846,7 @@ class Economy(commands.Cog):
         wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
         gift_amount = Decimal(str(user_id)) / Decimal("3")
         economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
-        gift_amount = (gift_amount * economic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        gift_amount = AmountUtils.round_currency(gift_amount * economic_multiplier)
         try:
             await self.bot.database.process_treasury_transaction(
                 wallet_id=wallet_id,
@@ -3495,7 +3875,7 @@ class Economy(commands.Cog):
         wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
         gift_amount = Decimal(str(user_id)) / Decimal("4")
         economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
-        gift_amount = (gift_amount * economic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        gift_amount = AmountUtils.round_currency(gift_amount * economic_multiplier)
         try:
             await self.bot.database.process_treasury_transaction(
                 wallet_id=wallet_id,
@@ -3524,7 +3904,7 @@ class Economy(commands.Cog):
         wallet_id = await self.bot.database.get_wallet_id_for_user(user_id)
         gift_amount = Decimal(str(user_id)) / Decimal("4")
         economic_multiplier = await self.bot.database.get_dynamic_reward_multiplier()
-        gift_amount = (gift_amount * economic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        gift_amount = AmountUtils.round_currency(gift_amount * economic_multiplier)
         try:
             await self.bot.database.process_treasury_transaction(
                 wallet_id=wallet_id,
@@ -3558,7 +3938,7 @@ class Economy(commands.Cog):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}crypto {name}`{aliases} — {desc}")
             else:
@@ -4151,7 +4531,7 @@ class Economy(commands.Cog):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}bounty {name}`{aliases} — {desc}")
             else:
@@ -4259,6 +4639,7 @@ class Economy(commands.Cog):
                 currency_name=self.currency_name,
             )
             item = shop_items[0]
+            item_price = await self.bot.database.get_shop_price(item)
             embed = discord.Embed(
                 title=item.name,
                 description=item.description or "No description available.",
@@ -4266,7 +4647,7 @@ class Economy(commands.Cog):
             )
             embed.add_field(
                 name="Price",
-                value=f"{self.currency_name} **{await self.formatter(Decimal(item.price))}**",
+                value=f"{self.currency_name} **{await self.formatter(item_price)}**",
             )
             qty_text = (
                 "∞"
@@ -4278,6 +4659,161 @@ class Economy(commands.Cog):
 
             await interaction.response.send_message(
                 "Welcome to the shop!", embed=embed, view=view, ephemeral=True
+            )
+
+    @commands.command(name="shop", aliases=["store", "market"])
+    @unified_cooldown(10)
+    async def shop_prefix(self, ctx: commands.Context):
+        """View the shop and buy items."""
+        shop_items = await self.bot.database.list_shop_items()
+        if not shop_items:
+            await Embeds.error(
+                ctx,
+                "There are no items in the shop currently. Check back later!",
+                delete_after=5,
+                reply=True,
+            )
+            return
+        view = ShopView(
+            bot=self.bot,
+            shop_items=shop_items,
+            user_id=ctx.author.id,
+            currency_name=self.currency_name,
+        )
+        item = shop_items[0]
+        item_price = await self.bot.database.get_shop_price(item)
+        embed = discord.Embed(
+            title=item.name,
+            description=item.description or "No description available.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Price",
+            value=f"{self.currency_name} **{await self.formatter(item_price)}**",
+        )
+        qty_text = (
+            "∞"
+            if getattr(item, "unlimited", False)
+            else f"**{item.quantity}** left in stock."
+        )
+        embed.add_field(name="Quantity", value=qty_text, inline=True)
+        embed.set_footer(text=f"Item 1 of {len(shop_items)} • {BETA_FOOTER}")
+        await ctx.reply(embed=embed, view=view)
+
+    @commands.command(name="inventory", aliases=["inv", "bag"])
+    @unified_cooldown(10)
+    async def inventory_prefix(
+        self, ctx: commands.Context, member: discord.Member = None
+    ):
+        """View your items."""
+        member = member or ctx.author
+
+        entries = await self.bot.database.get_user_inventory_grouped(member.id)
+        if not entries:
+            await Embeds.error(
+                ctx,
+                "Your inventory is empty.",
+                title="Inventory",
+                reply=True,
+                delete_after=None,
+                footer=BETA_FOOTER,
+            )
+            return
+
+        paginator = ItemPaginator(
+            self.bot,
+            entries,
+            user_id=member.id,
+            title=f"{member.display_name}'s Inventory",
+        )
+        embed = await paginator.send_page()
+        await ctx.send(embed=embed, view=paginator)
+
+    @commands.command(name="use", aliases=["useitem", "consume"])
+    @unified_cooldown(10)
+    async def use_prefix(
+        self,
+        ctx: commands.Context,
+        item_id: int,
+        target: discord.Member = None,
+    ):
+        """Use an item from your inventory: `{prefix}use <item id> [@user]`."""
+        item = await self.bot.database.get_user_item(ctx.author.id, item_id)
+        if not item:
+            await Embeds.warning(
+                ctx,
+                "You don't own that item or the ID is invalid.",
+                title="Use Item",
+                reply=True,
+                delete_after=None,
+            )
+            return
+
+        # Targetable/offensive items require a valid target
+        if item.targetable or item.item_type.value in ("offensive",):
+            if target is None or target.bot or target.id == ctx.author.id:
+                await Embeds.warning(
+                    ctx,
+                    f"**{item.name}** must be used on another user. "
+                    f"Provide a target: `{ctx.prefix}use {item_id} @user`.",
+                    title="Use Item",
+                    reply=True,
+                    delete_after=None,
+                )
+                return
+
+            try:
+                result = await self.bot.database.use_targeted_item(
+                    ctx.author.id, item_id, target.id
+                )
+                embed = discord.Embed(
+                    title="Item Used",
+                    description=result["message"],
+                    color=discord.Color.red(),
+                )
+                embed.set_footer(text=BETA_FOOTER)
+                await ctx.reply(embed=embed)
+            except Exception as e:
+                await Embeds.error(
+                    ctx, str(e), title="Use Item", reply=True, delete_after=None
+                )
+            return
+
+        # Self-use path for consumables, redeemables, defensive auras, collectibles
+        try:
+            remaining = await self.bot.database.get_item_cooldown(
+                ctx.author.id, item.name
+            )
+            if remaining > 0:
+                mins, secs = divmod(remaining, 60)
+                await Embeds.warning(
+                    ctx,
+                    f"**{item.name}** is on cooldown. Time remaining: {mins}m {secs}s",
+                    title="Use Item",
+                    reply=True,
+                    delete_after=None,
+                )
+                return
+
+            result = await self.bot.database.use_inventory_item_with_effects(
+                ctx.author.id, item_id
+            )
+
+            message = result.get("message", "Item used successfully!")
+            if result.get("cooldown_seconds"):
+                mins, secs = divmod(result["cooldown_seconds"], 60)
+                message += f"\nCooldown: {mins}m {secs}s"
+
+            embed = discord.Embed(
+                title="Item Used",
+                description=message,
+                color=discord.Color.green(),
+            )
+            embed.set_footer(text=BETA_FOOTER)
+            await ctx.reply(embed=embed)
+        except Exception as e:
+            await Embeds.error(
+                ctx, str(e), title="Use Item", reply=True, delete_after=None
             )
 
     @app_commands.command(name="inventory", description="View your items")
@@ -4629,7 +5165,7 @@ class Economy(commands.Cog):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}vip {name}`{aliases} — {desc}")
             else:
@@ -4657,7 +5193,7 @@ class Economy(commands.Cog):
             current_tier = vip_info.get("current_tier")
             next_tier = vip_info.get("next_tier")
             total_wagered = vip_info.get("total_wagered", Decimal("0"))
-            rakeback_rate = vip_info.get("rakeback_rate", Decimal("0.01"))
+            rakeback_rate = vip_info.get("rakeback_rate", Decimal("0.02"))
 
             if current_tier is None:
                 # Ensure default VIP tiers exist
@@ -4666,7 +5202,7 @@ class Economy(commands.Cog):
                 current_tier = vip_info.get("current_tier")
                 next_tier = vip_info.get("next_tier")
                 total_wagered = vip_info.get("total_wagered", Decimal("0"))
-                rakeback_rate = vip_info.get("rakeback_rate", Decimal("0.01"))
+                rakeback_rate = vip_info.get("rakeback_rate", Decimal("0.02"))
 
             tier_colors = {
                 "Unranked": discord.Color.dark_grey(),
@@ -4864,7 +5400,7 @@ class Economy(commands.Cog):
             )
 
     @vip_group.command(name="claim", description="Claim your accumulated rakeback")
-    @unified_cooldown(3600)
+    @unified_cooldown(60)
     async def claim_rakeback(self, ctx: commands.Context):
         """Claim accumulated rakeback."""
         try:

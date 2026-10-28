@@ -12,7 +12,7 @@ import concurrent.futures
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ext.commands import Context
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from dotenv import load_dotenv
 from pathlib import Path
 from utils.cooldown import CooldownUtils, UnifiedCooldownManager
@@ -22,6 +22,10 @@ from database.manager import DatabaseManager
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from utils.cache import Cache
+from utils import refcompat
+from utils.core.economy_scope import install_interaction_scope
+from utils.core.settings import BOT_ADMINS_KEY, COMMAND_LOG_EXCLUDED_KEY
+from utils.core.eras import load_application_emojis
 from utils.security import hash_user_id_analytics as hash_user_id
 
 _DB_ERROR_TYPES: tuple[type[Exception], ...] = (SQLAlchemyError,)
@@ -82,6 +86,31 @@ def _command_has_owner_check(cmd) -> bool:
         checks.extend(getattr(parent, "checks", []))
         parent = getattr(parent, "parent", None)
     return any(_is_owner_predicate(c) for c in checks)
+
+
+#: Developer-channel command log tuning. Invocations are buffered and posted in
+#: digests, because a busy bot would otherwise trip Discord's per-channel rate
+#: limit (5 messages / 5 seconds) and every log line would arrive late.
+_COMMAND_LOG_BATCH_SIZE = 10  # entries per digest message
+_COMMAND_LOG_BUFFER_LIMIT = 100  # entries held before the oldest are dropped
+_COMMAND_LOG_FLUSH_INTERVAL = 5.0  # seconds; a full batch flushes immediately
+
+
+def _command_log_place(channel, channel_id, guild, guild_id) -> str:
+    """Describe where a command ran: its channel and, when there is one, server."""
+    name = getattr(channel, "name", None)
+    if name:
+        where = f"#{name} (`{getattr(channel, 'id', channel_id)}`)"
+    elif channel is not None:
+        # A DM channel renders as "Direct Message with <user>".
+        where = str(channel)
+    elif channel_id is not None:
+        where = f"`{channel_id}`"
+    else:
+        where = "unknown channel"
+    if guild is None:
+        return where
+    return f"{where} in {guild.name} (`{guild_id}`)"
 
 
 def _should_audit_owner_command(cmd) -> bool:
@@ -206,29 +235,21 @@ class DiscordBot(commands.Bot):
         # Database connection. Defaults preserve the original `localhost` / `postgres` /
         # `postgres` behavior for bare-metal runs; Docker compose sets these to reach the
         # `db` service. Password is URL-quoted so special characters don't break the DSN.
-        self.db_user = os.getenv("DB_USER", "postgres")
-        self.db_name = os.getenv("DB_NAME", "postgres")
-        self.db_host = os.getenv("DB_HOST", "localhost")
-        self.db_port = os.getenv("DB_PORT", "5432")
-        # Docker Compose uses the service name 'db'. If .env still has the bare-metal
-        # default 'localhost' but the compose network can resolve 'db', prefer 'db' so
-        # production deployments don't crash with a stale .env default.
-        if self.db_host == "localhost":
-            try:
-                import socket
-
-                socket.getaddrinfo("db", int(self.db_port))
-                self.logger.info(
-                    "DB_HOST was 'localhost' but 'db' resolves on this network; using 'db'"
-                )
-                self.db_host = "db"
-            except (socket.gaierror, ValueError):
-                pass
-        self.db_pw = urllib.parse.quote_plus(os.getenv("DB_PW", ""))
-        db_url = f"postgresql+asyncpg://{self.db_user}:{self.db_pw}@{self.db_host}:{self.db_port}/{self.db_name}"
-        masked_url = db_url.replace(self.db_pw, "***" if self.db_pw else "")
-        self.logger.info(f"Connecting to database at host={self.db_host} ({masked_url})")
+        # Local SQLite database. No Postgres credentials are needed, so nothing
+        # is read from .env or Infisical for the database. The file lives under
+        # data/ next to the logs and can be overridden with SQLITE_PATH.
+        self.db_path = Path(os.getenv("SQLITE_PATH", "data/tpnebot.db"))
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_url = f"sqlite+aiosqlite:///{self.db_path.as_posix()}"
+        self.logger.info(f"Connecting to local SQLite database at {self.db_path}")
         self.database = DatabaseManager(db_url)
+        # Back-reference so database helpers can consult bot-wide switches
+        # (e.g. the gambling bet cap) without threading the bot object through
+        # every call site.
+        self.database.bot = self
+        # The ported refcogs (mixtapes, radio, levels, ...) keep their own
+        # tables in a second local SQLite file, opened in setup_hook.
+        self.ref_db_path = Path(os.getenv("REFBOT_DB_PATH", "data/refbot.db"))
         self.cooldowns = UnifiedCooldownManager(self)
         self._context_start_times: dict[int, float] = {}
         self._interaction_start_times: dict[int, float] = {}
@@ -236,8 +257,17 @@ class DiscordBot(commands.Bot):
         self._config_task: asyncio.Task | None = None
         self.config = None
         self.debug_mode_active = False
+        #: A status pinned with `admin status`, which cancels the rotation until
+        #: the process restarts. Deliberately in-memory: it does not outlive a
+        #: restart, when `status_task` takes the presence back on its own.
+        self.custom_status: str | None = None
         self.version = "2026824"
         self.cool_guys = None
+        #: Extra user IDs granted the owner/admin commands, on top of the
+        #: application team members Discord reports. Persisted in
+        #: ``bot_settings`` under :data:`BOT_ADMINS_KEY` and managed with
+        #: ``!admin allow`` / ``!admin deny``.
+        self.bot_admin_ids: set[int] = set()
         # Per-interaction guardrail cache so centralized tree checks and per-cog
         # interaction_check don't duplicate DB work or send double responses.
         self._guardrail_status: dict[int, tuple[float, bool]] = {}
@@ -246,6 +276,16 @@ class DiscordBot(commands.Bot):
         # Discord retries the same blocked slash interaction for the same user.
         self._guardrail_log_dedup: dict[tuple[int, str, str], float] = {}
         self._guardrail_log_dedup_ttl = 5.0
+        # Command activity feed for the developer channel. Every invocation is
+        # buffered here and posted as a digest by :meth:`_command_log_worker`.
+        self._command_log_buffer: list[dict] = []
+        self._command_log_event = asyncio.Event()
+        self._command_log_task: asyncio.Task | None = None
+        self._command_log_dropped = 0
+        #: Guild ids kept out of that feed (empty means every server is logged),
+        #: persisted in ``bot_settings`` under :data:`COMMAND_LOG_EXCLUDED_KEY`
+        #: and managed with ``!admin logs exclude|include``.
+        self.command_log_excluded_guilds: set[int] = set()
         # Discord privileged intents we require and why:
         # - message_content: spam-channel enforcement, automated moderation
         #   (PII/card/token detection), message delete/edit logging, attachment
@@ -289,6 +329,272 @@ class DiscordBot(commands.Bot):
                 return await ctx.send(*args, **kwargs)
 
         ext_commands.Context.reply = safe_reply
+
+    async def is_owner(self, user: discord.abc.User) -> bool:  # type: ignore[override]
+        """Whether *user* may run owner/admin commands.
+
+        The application team members Discord reports are the baseline; any IDs
+        added to :attr:`bot_admin_ids` with ``!admin allow`` are treated the
+        same so they can use ``!admin``, ``!bank`` and the other owner tools.
+        """
+        if user.id in self.bot_admin_ids:
+            return True
+        return await super().is_owner(user)
+
+    async def _load_bot_admins(self) -> None:
+        """Read the persisted extra-admin list into memory at startup."""
+        settings = getattr(self, "dash_settings", None)
+        if settings is None:
+            return
+        stored = settings.stored(BOT_ADMINS_KEY)
+        ids: set[int] = set()
+        if isinstance(stored, (list, tuple, set)):
+            for value in stored:
+                try:
+                    ids.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        self.bot_admin_ids = ids
+
+    async def _persist_bot_admins(self) -> None:
+        """Write :attr:`bot_admin_ids` back to the settings store."""
+        settings = getattr(self, "dash_settings", None)
+        if settings is None:
+            raise RuntimeError("the settings store isn't ready yet")
+        await settings.set_value(BOT_ADMINS_KEY, sorted(self.bot_admin_ids))
+
+    async def add_bot_admin(self, user_id: int) -> bool:
+        """Grant *user_id* owner access. False if they already had it."""
+        user_id = int(user_id)
+        if user_id in self.bot_admin_ids:
+            return False
+        self.bot_admin_ids.add(user_id)
+        await self._persist_bot_admins()
+        return True
+
+    async def remove_bot_admin(self, user_id: int) -> bool:
+        """Revoke *user_id*'s added owner access. False if it wasn't set."""
+        user_id = int(user_id)
+        if user_id not in self.bot_admin_ids:
+            return False
+        self.bot_admin_ids.discard(user_id)
+        await self._persist_bot_admins()
+        return True
+
+    # -- developer-channel command log -------------------------------------
+    def dev_log_channel(self) -> discord.abc.Messageable | None:
+        """The developer channel, or None when it is unset or not reachable."""
+        raw = os.getenv("DEVELOPER_CHANNEL_ID")
+        if not raw:
+            return None
+        try:
+            channel_id = int(raw)
+        except (TypeError, ValueError):
+            self.logger.warning(f"DEVELOPER_CHANNEL_ID is not a channel ID: {raw!r}")
+            return None
+        return self.get_channel(channel_id)
+
+    def is_command_log_excluded(self, guild_id: int | None) -> bool:
+        """Whether *guild_id* opted out of the developer-channel command log."""
+        if guild_id is None:
+            # DMs belong to no server, so nothing can opt them out.
+            return False
+        return int(guild_id) in self.command_log_excluded_guilds
+
+    async def set_command_log_excluded(self, guild_id: int, excluded: bool) -> bool:
+        """Add or remove *guild_id* from the command-log exclusions.
+
+        Returns False when the server was already in the requested state, so a
+        caller can tell "changed" from "nothing to do". Every other server keeps
+        being logged, which is the default.
+        """
+        guild_id = int(guild_id)
+        if excluded:
+            if guild_id in self.command_log_excluded_guilds:
+                return False
+            self.command_log_excluded_guilds.add(guild_id)
+        else:
+            if guild_id not in self.command_log_excluded_guilds:
+                return False
+            self.command_log_excluded_guilds.discard(guild_id)
+        await self._persist_command_log_exclusions()
+        return True
+
+    async def _load_command_log_exclusions(self) -> None:
+        """Read the persisted excluded-server list into memory at startup."""
+        settings = getattr(self, "dash_settings", None)
+        if settings is None:
+            return
+        stored = settings.stored(COMMAND_LOG_EXCLUDED_KEY)
+        ids: set[int] = set()
+        if isinstance(stored, (list, tuple, set)):
+            for value in stored:
+                try:
+                    ids.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        self.command_log_excluded_guilds = ids
+
+    async def _persist_command_log_exclusions(self) -> None:
+        """Write the excluded-server list back to the settings store."""
+        settings = getattr(self, "dash_settings", None)
+        if settings is None:
+            raise RuntimeError("the settings store isn't ready yet")
+        await settings.set_value(
+            COMMAND_LOG_EXCLUDED_KEY, sorted(self.command_log_excluded_guilds)
+        )
+
+    def record_command_log(
+        self,
+        *,
+        command_name: str,
+        user: discord.abc.User,
+        guild: discord.Guild | None,
+        channel,
+        channel_id: int | None,
+        is_slash: bool,
+        outcome: str,
+    ) -> None:
+        """Buffer one command invocation for the developer-channel digest.
+
+        ``outcome`` is the short "what happened" label built by
+        :meth:`_command_log_outcome`. Logging is best-effort: it never raises,
+        so a bad entry can't take the command path down with it.
+        """
+        try:
+            guild_id = getattr(guild, "id", None)
+            if self.is_command_log_excluded(guild_id):
+                return
+            self._command_log_buffer.append(
+                {
+                    "command": command_name,
+                    "is_slash": is_slash,
+                    "outcome": outcome,
+                    "user": f"{user} (`{user.id}`)",
+                    "place": _command_log_place(channel, channel_id, guild, guild_id),
+                    "when": int(discord.utils.utcnow().timestamp()),
+                }
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            self.logger.warning(f"Command log buffering failed: {e}")
+            return
+
+        if len(self._command_log_buffer) > _COMMAND_LOG_BUFFER_LIMIT:
+            self._drop_oldest_command_log_entries()
+        if len(self._command_log_buffer) >= _COMMAND_LOG_BATCH_SIZE:
+            # Post the full batch now instead of waiting for the next tick.
+            self._command_log_event.set()
+
+    def _drop_oldest_command_log_entries(self) -> None:
+        """Keep the buffer bounded, counting what had to be discarded."""
+        overflow = len(self._command_log_buffer) - _COMMAND_LOG_BUFFER_LIMIT
+        if overflow <= 0:
+            return
+        del self._command_log_buffer[:overflow]
+        self._command_log_dropped += overflow
+
+    def _command_log_outcome(self, error) -> str:
+        """A short label for why an invocation failed, for the digest title."""
+        retry_after = self._get_cooldown_retry_after(error)
+        if retry_after is not None:
+            return f"⏳ on cooldown ({retry_after:.0f}s)"
+        root = error
+        while isinstance(
+            root,
+            (
+                app_commands.CommandInvokeError,
+                commands.HybridCommandError,
+                commands.CommandInvokeError,
+            ),
+        ):
+            root = root.original
+        if isinstance(root, commands.CommandNotFound):
+            return "❓ unknown command"
+        if isinstance(root, (app_commands.CheckFailure, commands.CheckFailure)):
+            return "🚫 blocked by a check"
+        if _root_cause_is_db_error(root):
+            return "⚠️ database error"
+        if self._is_transient_discord_api_error(root):
+            return "⚠️ Discord API error"
+        if self._is_missing_access_error(root):
+            return "⚠️ missing access"
+        return f"❌ {type(root).__name__}"
+
+    def _command_log_embed(
+        self, entries: list[dict], dropped: int = 0
+    ) -> discord.Embed:
+        """Build one digest: every buffered command, who ran it, when and where."""
+        count = len(entries)
+        embed = discord.Embed(
+            title=f"📋 Command log — {count} command{'s' if count != 1 else ''}",
+            color=discord.Color.from_rgb(88, 101, 242),
+            timestamp=discord.utils.utcnow(),
+        )
+        if dropped:
+            embed.description = (
+                f"-# {dropped} earlier entr{'y' if dropped == 1 else 'ies'} "
+                "dropped to keep up with the channel rate limit."
+            )
+        for entry in entries:
+            mark = "/" if entry["is_slash"] else ""
+            embed.add_field(
+                name=f"{entry['outcome']} {mark}{entry['command']}"[:256],
+                value=(
+                    f"👤 {entry['user']}\n"
+                    f"📍 {entry['place']}\n"
+                    f"🕒 <t:{entry['when']}:f> · <t:{entry['when']}:R>"
+                )[:1024],
+                inline=False,
+            )
+        embed.set_footer(text=f"v{self.version}")
+        return embed
+
+    async def _flush_command_log(self) -> None:
+        """Post the buffered invocations to the developer channel as digests."""
+        channel = self.dev_log_channel()
+        if channel is None:
+            if self._command_log_buffer:
+                self.logger.warning(
+                    f"No developer channel available; dropping "
+                    f"{len(self._command_log_buffer)} buffered command log "
+                    f"entr{'y' if len(self._command_log_buffer) == 1 else 'ies'}."
+                )
+                self._command_log_buffer.clear()
+                self._command_log_dropped = 0
+            return
+
+        while self._command_log_buffer:
+            entries = self._command_log_buffer[:_COMMAND_LOG_BATCH_SIZE]
+            del self._command_log_buffer[: len(entries)]
+            dropped, self._command_log_dropped = self._command_log_dropped, 0
+            try:
+                await channel.send(embed=self._command_log_embed(entries, dropped))
+            except Exception as e:
+                # Put the batch back and try again on the next tick rather than
+                # losing the entries: a transient 5xx shouldn't eat the log.
+                self._command_log_buffer[:0] = entries
+                self._command_log_dropped += dropped
+                self._drop_oldest_command_log_entries()
+                self.logger.warning(f"Command log digest failed to send: {e}")
+                return
+
+    async def _command_log_worker(self) -> None:
+        """Post buffered invocations every few seconds, or as soon as a batch fills."""
+        while True:
+            try:
+                await asyncio.wait_for(
+                    self._command_log_event.wait(),
+                    timeout=_COMMAND_LOG_FLUSH_INTERVAL,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._command_log_event.clear()
+            try:
+                await self._flush_command_log()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"Command log flush failed: {e}")
 
     async def get_prefix(self, message: discord.Message) -> str:
         if not message.guild:
@@ -339,11 +645,11 @@ class DiscordBot(commands.Bot):
     async def status_task(self) -> None:
         await self.wait_until_ready()
         statuses = [
-            f"{len(set(self.get_all_members())):,} members | .gg/TPNE",
-            f"{len(self.guilds):,} servers | .gg/TPNE",
-            f"{len(self.commands):,} commands | .gg/TPNE",
-            f"v{self.version} | .gg/TPNE",
-            f"for !help | .gg/TPNE",
+            f"{len(set(self.get_all_members())):,} members | .gg/slimeymusichubv2",
+            f"{len(self.guilds):,} servers | .gg/slimeymusichubv2",
+            f"{len(self.commands):,} commands | .gg/slimeymusichubv2",
+            f"v{self.version} | .gg/slimeymusichubv2",
+            f"for !help | .gg/slimeymusichubv2",
         ]
         await self.change_presence(
             activity=discord.Activity(
@@ -420,11 +726,6 @@ class DiscordBot(commands.Bot):
                 self.config = await self._config_task
         except Exception as e:
             self.logger.error(f"Failed to load bot config: {e}")
-            if isinstance(e, OSError) and e.errno == -2:
-                self.logger.error(
-                    f"Database host '{self.db_host}' could not be resolved. "
-                    "If running in Docker Compose, set DB_HOST=db (or remove DB_HOST from .env)."
-                )
             self.config = None
 
         try:
@@ -448,9 +749,32 @@ class DiscordBot(commands.Bot):
             await self.database.initialize()
             self.logger.info("Database Tables initialized successfully.")
             self.logger.info("-------------------")
+            self.logger.info("Setting up refbot compatibility layer...")
+            await refcompat.setup_refbot(self)
+            self.logger.info("Refbot compatibility layer ready.")
+            # Runs before every prefix command so it can pick the economy scope
+            # of the server the command came from. Slash commands and buttons
+            # never reach this hook, so install the hooks that cover them too.
+            self.before_invoke(self._apply_economy_scope)
+            install_interaction_scope(self)
+            await self._load_bot_admins()
+            if self.bot_admin_ids:
+                self.logger.info(
+                    f"Loaded {len(self.bot_admin_ids)} extra bot admin(s) from settings."
+                )
+            await self._load_command_log_exclusions()
+            if self.command_log_excluded_guilds:
+                self.logger.info(
+                    f"{len(self.command_log_excluded_guilds)} server(s) excluded "
+                    "from the developer-channel command log."
+                )
+            self.logger.info("-------------------")
             self.logger.info("Attempting to load cogs...")
             await self.load_cogs()
             self.logger.info("Cog loading stage completed successfully.")
+            self.logger.info("-------------------")
+            self.logger.info("Caching application emojis...")
+            await load_application_emojis(self)
             self.logger.info("-------------------")
             self.logger.info("Syncing application commands...")
             try:
@@ -481,6 +805,8 @@ class DiscordBot(commands.Bot):
             self.logger.info("Economic metrics collection task started successfully.")
             self.economic_rebalance_task.start()
             self.logger.info("Economic rebalance task started successfully.")
+            self._command_log_task = asyncio.create_task(self._command_log_worker())
+            self.logger.info("Command log worker started successfully.")
             self.logger.info("-------------------")
             self.logger.info(f"The bot is ready. Awaiting discord gateway connection...")
             if self.cool_guys is None:
@@ -495,11 +821,6 @@ class DiscordBot(commands.Bot):
 
         except Exception as e:
             self.logger.error(f"An error occurred during setup: {e}")
-            if isinstance(e, OSError) and e.errno == -2:
-                self.logger.error(
-                    f"Database host '{self.db_host}' could not be resolved. "
-                    "If running in Docker Compose, set DB_HOST=db (or remove DB_HOST from .env)."
-                )
             raise
 
     def _guardrail_status_done(self, interaction_id: int) -> bool | None:
@@ -634,43 +955,42 @@ class DiscordBot(commands.Bot):
                 )
                 return _block("DM")
 
-            account_age_threshold = timedelta(days=30)
-            account_age = discord.utils.utcnow() - user.created_at
-            if account_age < account_age_threshold:
-                days_remaining = 30 - account_age.days
-                await self._safe_guardrail_response(
-                    interaction,
-                    f"Your account must be at least 30 days old to use commands. "
-                    f"Please wait {days_remaining} more day{'s' if days_remaining != 1 else ''}.",
-                )
-                return _block("account age")
-
             try:
                 channel_id = interaction.channel_id
-                enabled = await self.database.get_command_status(command_name, channel_id)
-                if enabled is False:
-                    await self._safe_guardrail_response(
-                        interaction,
-                        f"The `/{command_name}` command is disabled in this channel by staff.",
+                guild_id = interaction.guild.id if interaction.guild else None
+                # A server-wide `admin enable` is authoritative: it overrides any
+                # per-channel or global disable so it works for everyone again.
+                force_enabled = False
+                if guild_id is not None:
+                    server_explicit = await self.database.get_command_status_explicit(
+                        command_name, channel_id=None, guild_id=guild_id
                     )
-                    return _block("channel disabled")
-                if interaction.guild:
-                    enabled_server = await self.database.get_command_status(
-                        command_name, channel_id=None, guild_id=interaction.guild.id
-                    )
-                    if enabled_server is False:
+                    force_enabled = server_explicit is True
+                if not force_enabled:
+                    enabled = await self.database.get_command_status(command_name, channel_id)
+                    if enabled is False:
                         await self._safe_guardrail_response(
                             interaction,
-                            f"The `/{command_name}` command is disabled in this server by staff.",
+                            f"The `/{command_name}` command is disabled in this channel by staff.",
                         )
-                        return _block("server disabled")
-                enabled_global = await self.database.get_command_status(command_name)
-                if enabled_global is False:
-                    await self._safe_guardrail_response(
-                        interaction,
-                        f"The `/{command_name}` command is currently disabled for maintenance.",
-                    )
-                    return _block("globally disabled")
+                        return _block("channel disabled")
+                    if guild_id is not None:
+                        enabled_server = await self.database.get_command_status(
+                            command_name, channel_id=None, guild_id=guild_id
+                        )
+                        if enabled_server is False:
+                            await self._safe_guardrail_response(
+                                interaction,
+                                f"The `/{command_name}` command is disabled in this server by staff.",
+                            )
+                            return _block("server disabled")
+                    enabled_global = await self.database.get_command_status(command_name)
+                    if enabled_global is False:
+                        await self._safe_guardrail_response(
+                            interaction,
+                            f"The `/{command_name}` command is currently disabled for maintenance.",
+                        )
+                        return _block("globally disabled")
             except Exception as e:
                 return _fail("command status lookup failed", e)
 
@@ -700,12 +1020,40 @@ class DiscordBot(commands.Bot):
         except Exception as e:
             return _fail("unexpected guardrail error", e)
 
+    async def _apply_economy_scope(self, ctx: Context) -> None:
+        """Run this command against the economy scope its server uses.
+
+        Servers on the shared economy (the default) stay on scope 0, so nothing
+        changes for them; a server that turned on `!guildeconomy` runs against
+        its own scope. Only prefix/slash command invocations are scoped —
+        background tasks keep using the bot-wide economy.
+        """
+        try:
+            from utils.core.economy_scope import scope_for_context, set_scope
+
+            set_scope(scope_for_context(ctx))
+        except Exception:
+            self.logger.exception("Could not resolve this command's economy scope")
+
+    def _log_prefix_block(self, ctx: Context, reason: str, *, emoji: str = "🚫") -> None:
+        """Log a prefix invocation that one of the pre-checks turned away."""
+        self.record_command_log(
+            command_name=ctx.command.qualified_name,
+            user=ctx.author,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            channel_id=getattr(ctx.channel, "id", None),
+            is_slash=False,
+            outcome=f"{emoji} {reason}",
+        )
+
     async def invoke(self, ctx: Context) -> None:
         try:
             if ctx.command is None:
                 return
 
             if self.debug_mode_active and ctx.author.id not in self.cool_guys:
+                self._log_prefix_block(ctx, "maintenance mode")
                 return await Embeds.error(
                     ctx,
                     "The bot is currently in maintenance mode. Please try again later.",
@@ -716,6 +1064,7 @@ class DiscordBot(commands.Bot):
             # Fast-fail during DB outages. Without this, every prefix command
             # hangs on DB pre-checks and can saturate the asyncio thread pool.
             if not await self.database.db_ready():
+                self._log_prefix_block(ctx, "database unavailable")
                 embed = discord.Embed(
                     title="⚠️ Database Temporarily Unavailable",
                     description="The database connection dropped. Your command was not processed. Please try again in a moment.",
@@ -725,36 +1074,39 @@ class DiscordBot(commands.Bot):
 
             is_blacklisted = await self.database.is_user_blacklisted(ctx.author.id)
             if is_blacklisted and ctx.author.id not in self.owner_ids:
+                self._log_prefix_block(ctx, "blacklisted user")
                 await Embeds.error(ctx, "You are blacklisted from using this bot.", delete_after=5, reply=True)
                 return
 
             # Block DM commands (owners exempt)
             if ctx.guild is None and ctx.author.id not in self.owner_ids:
+                self._log_prefix_block(ctx, "DMs not allowed")
                 await Embeds.error(ctx, "Commands can only be used in a server.", delete_after=5, reply=True)
-                return
-
-            # Block commands for accounts newer than 30 days
-            account_age_threshold = timedelta(days=30)
-            account_age = datetime.now(timezone.utc) - ctx.author.created_at
-            if account_age < account_age_threshold and ctx.author.id not in self.owner_ids:
-                days_remaining = 30 - account_age.days
-                await Embeds.error(
-                    ctx,
-                    f"Your account must be at least 30 days old to use commands. "
-                    f"Please wait {days_remaining} more day{'s' if days_remaining != 1 else ''}.",
-                    delete_after=10,
-                    reply=True,
-                )
                 return
 
             user_id = ctx.author.id
             command_name = ctx.command.qualified_name
             channel_id = ctx.channel.id
 
+            # A server-wide `admin enable` is authoritative: it overrides any
+            # per-channel or global disable so it works for everyone again.
+            guild_id = ctx.guild.id if ctx.guild else None
+            force_enabled = False
+            if guild_id is not None:
+                server_explicit = await self.database.get_command_status_explicit(
+                    command_name, channel_id=None, guild_id=guild_id
+                )
+                force_enabled = server_explicit is True
+
             command_enabled = await self.database.get_command_status(
                 command_name, channel_id
             )
-            if command_enabled is False and ctx.author.id not in self.owner_ids:
+            if (
+                not force_enabled
+                and command_enabled is False
+                and ctx.author.id not in self.owner_ids
+            ):
+                self._log_prefix_block(ctx, "disabled in this channel")
                 await Embeds.warning(
                     ctx,
                     f"The `{command_name}` command is disabled in this channel by staff.",
@@ -764,11 +1116,12 @@ class DiscordBot(commands.Bot):
                 )
                 return
 
-            if ctx.guild:
+            if guild_id is not None and not force_enabled:
                 command_enabled_server = await self.database.get_command_status(
-                    command_name, channel_id=None, guild_id=ctx.guild.id
+                    command_name, channel_id=None, guild_id=guild_id
                 )
                 if command_enabled_server is False and ctx.author.id not in self.owner_ids:
+                    self._log_prefix_block(ctx, "disabled in this server")
                     await Embeds.warning(
                         ctx,
                         f"The `{command_name}` command is disabled in this server by staff.",
@@ -781,7 +1134,12 @@ class DiscordBot(commands.Bot):
             command_enabled_global = await self.database.get_command_status(
                 command_name
             )
-            if command_enabled_global is False and ctx.author.id not in self.owner_ids:
+            if (
+                not force_enabled
+                and command_enabled_global is False
+                and ctx.author.id not in self.owner_ids
+            ):
+                self._log_prefix_block(ctx, "disabled for maintenance")
                 await Embeds.warning(
                     ctx,
                     f"The `{command_name}` command is currently disabled for maintenance.",
@@ -810,6 +1168,7 @@ class DiscordBot(commands.Bot):
                         break
 
                 if not has_permission:
+                    self._log_prefix_block(ctx, "missing role")
                     await Embeds.error(
                         ctx,
                         f"{ctx.author.mention}: You don't have the required role to use `{command_name}`",
@@ -834,6 +1193,11 @@ class DiscordBot(commands.Bot):
                     user_id, command_name
                 )
                 if remaining_cooldown > 0:
+                    self._log_prefix_block(
+                        ctx,
+                        f"on cooldown ({remaining_cooldown:.0f}s)",
+                        emoji="⏳",
+                    )
                     embed = await self.cooldowns.get_cooldown_embed(
                         remaining_cooldown
                     )
@@ -954,6 +1318,20 @@ class DiscordBot(commands.Bot):
         channel = ctx.channel
         guild = ctx.guild
 
+        # Hybrid commands invoked as slash commands also fire this event, and
+        # ``on_app_command_completion`` fires for the same invocation, so let the
+        # slash handler own the dev-channel entry to avoid logging it twice.
+        if ctx.interaction is None:
+            self.record_command_log(
+                command_name=command_name,
+                user=user,
+                guild=guild,
+                channel=channel,
+                channel_id=getattr(channel, "id", None),
+                is_slash=False,
+                outcome="✅ ran",
+            )
+
         try:
             used_at = discord.utils.utcnow()
             if used_at.tzinfo is None:
@@ -1006,6 +1384,15 @@ class DiscordBot(commands.Bot):
     async def on_app_command_completion(
         self, interaction: discord.Interaction, command: app_commands.Command
     ):
+        self.record_command_log(
+            command_name=getattr(command, "qualified_name", "unknown"),
+            user=interaction.user,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            channel_id=interaction.channel_id,
+            is_slash=True,
+            outcome="✅ ran",
+        )
         try:
             used_at = discord.utils.utcnow()
             if used_at.tzinfo is None:
@@ -1080,6 +1467,20 @@ class DiscordBot(commands.Bot):
         root_error = error
         if isinstance(error, (app_commands.CommandInvokeError, commands.HybridCommandError)):
             root_error = error.original
+
+        # Log the attempt before anything returns early: a blocked or failed
+        # invocation is exactly what the dev-channel feed is there to show.
+        command = getattr(interaction, "command", None)
+        if command is not None:
+            self.record_command_log(
+                command_name=getattr(command, "qualified_name", "unknown"),
+                user=interaction.user,
+                guild=interaction.guild,
+                channel=interaction.channel,
+                channel_id=interaction.channel_id,
+                is_slash=True,
+                outcome=self._command_log_outcome(root_error),
+            )
 
         # If our global guardrail check blocked this command we already sent an
         # ephemeral explanation. Don't record it as an error or show a generic one.
@@ -1193,6 +1594,24 @@ class DiscordBot(commands.Bot):
 
     async def on_command_error(self, ctx: Context, error) -> None:
         started_at = self._context_start_times.pop(id(ctx), None)
+
+        # Every invocation lands in the dev-channel feed, whether it worked or
+        # not. Unknown commands and quote-parsing failures have no command to
+        # name and are pure chatter, so they stay out.
+        if ctx.command is not None and not isinstance(
+            error, (commands.CommandNotFound, commands.UnexpectedQuoteError)
+        ):
+            self.record_command_log(
+                command_name=ctx.command.qualified_name,
+                user=ctx.author,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                channel_id=getattr(ctx.channel, "id", None),
+                # Hybrid commands invoked as slash commands land here too; they
+                # are slash invocations from the user's point of view.
+                is_slash=ctx.interaction is not None,
+                outcome=self._command_log_outcome(error),
+            )
         try:
             if ctx.command and not isinstance(
                 error, (commands.CommandNotFound, commands.CommandOnCooldown)
@@ -1341,8 +1760,7 @@ class DiscordBot(commands.Bot):
             except discord.Forbidden:
                 return
         elif isinstance(error, Exception):
-            dev_channel_id = int(os.getenv("DEVELOPER_CHANNEL_ID"))
-            dev_channel = self.get_channel(dev_channel_id)
+            dev_channel = self.dev_log_channel()
             detailed_error = "".join(
                 traceback.format_exception(type(error), error, error.__traceback__)
             )
@@ -1480,11 +1898,34 @@ class DiscordBot(commands.Bot):
                     delete_after=10,
                     reply=False,
                 )
-                raise error
+                # Deliberately not re-raised: it is already logged above, and
+                # raising out of an error handler only produces a second,
+                # unhandled copy of the same failure at the dispatch layer.
         else:
             return
 
     async def close(self) -> None:
+        if self._command_log_task is not None:
+            self._command_log_task.cancel()
+            try:
+                await self._command_log_task
+            except asyncio.CancelledError:
+                pass
+            self._command_log_task = None
+        # Best effort: a restart shouldn't swallow the batch that is still buffered.
+        try:
+            await self._flush_command_log()
+        except Exception as e:
+            self.logger.warning(f"Final command log flush failed: {e}")
+        # Let the SQLite worker threads finish before the event loop goes away.
+        # A statement still queued when the loop closes dies with "Event loop is
+        # closed", and one left waiting on a lock reports "database is locked"
+        # long after the bot has stopped - both of which read like a crash.
+        try:
+            await self.database.engine.dispose()
+        except Exception as e:
+            self.logger.warning(f"Closing the database failed: {e}")
+        await refcompat.teardown_refbot(self)
         await super().close()
 
 
@@ -1492,9 +1933,9 @@ async def main() -> None:
     """Load non-sensitive config from .env and all secrets from Infisical."""
     load_dotenv()
 
-    # Configure a larger default executor before the bot starts so asyncpg DNS
-    # resolution (which runs in asyncio's thread pool) can't saturate the small
-    # default pool during a Postgres outage and freeze the event loop.
+    # Configure a larger default executor before the bot starts so blocking
+    # work (image generation, file IO, SQLite driver calls) can't saturate the
+    # small default pool and freeze the event loop.
     loop = asyncio.get_running_loop()
     loop.set_default_executor(
         concurrent.futures.ThreadPoolExecutor(
@@ -1514,9 +1955,8 @@ async def main() -> None:
     await infisical.authenticate()
     await infisical.load_secrets_into_environ(
         {
-            # Core bot / database
+            # Core bot
             "TOKEN": "TOKEN",
-            "DB_PW": "DB_PW",
             # Security / hashing
             "USER_ID_HASH_KEY": "USER_ID_HASH_KEY",
             "STATS_SALT": "STATS_SALT",
@@ -1538,7 +1978,15 @@ async def main() -> None:
     asyncio.create_task(infisical.refresh_loop())
 
     bot = DiscordBot()
-    await bot.start(os.environ["TOKEN"])
+    try:
+        await bot.start(os.environ["TOKEN"])
+    except BaseException:
+        # Log why the connection ended before the process goes away. Without
+        # this the reason only ever reaches the console, while the log file
+        # keeps just the shutdown noise ("Event loop is closed" from the
+        # gateway/SQLite threads) that follows it.
+        logger.exception("Bot session ended; exiting")
+        raise
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import time
 import statistics
 import psutil
 from discord.ext import commands
+from utils.core.prefixes import render
 from discord import app_commands
 from discord.ext.commands import Context
 from utils.misc import MiscUtils
@@ -29,8 +30,11 @@ from database.models import (
     DailyUserExposure,
 )
 from database.manager import ItemType, ItemCategory, ItemRarity, EffectType
+from utils.core import userprefs
 import importlib.util
 from utils.embeds import Embeds
+from utils.amount import AmountUtils
+from utils.core.views import ResetConfirm
 
 logger = logging.getLogger("discord.client")
 
@@ -704,13 +708,14 @@ class Owner(commands.Cog, name="Owner"):
     @shopadmin.command(name="seed", hidden=True)
     @commands.is_owner()
     async def shopadmin_seed(self, ctx: Context):
-        """Create any missing default shop items."""
+        """Create any missing default shop items and restore catalogue prices."""
 
         result = await self.bot.database.seed_default_shop_items()
         embed = discord.Embed(
             title="Shop Catalog Seeded",
             description=(
                 f"Created **{result['created']}** new items, "
+                f"repriced **{result['repriced']}** onto the catalog figure, "
                 f"skipped **{result['skipped']}** existing items."
             ),
             color=discord.Color.green(),
@@ -901,7 +906,10 @@ class Owner(commands.Cog, name="Owner"):
             )
             return
 
-        lines = []
+        lines = [
+            "-# These are the fixed prices every member pays. `!shopadmin seed`",
+            "-# restores the catalog figures (millions, dearer for rarer items).",
+        ]
         for item in items:
             stock = "∞" if item.unlimited else str(item.quantity)
             limits = ""
@@ -2253,7 +2261,7 @@ class Owner(commands.Cog, name="Owner"):
         if max_frac < 0:
             max_frac = 0
         quant = Decimal(1).scaleb(-max_frac) if max_frac else Decimal(1)
-        xq = x.quantize(quant, rounding=rounding)
+        xq = AmountUtils.quantize(x, quant, rounding=rounding)
         s = f"{xq:,.{max_frac}f}"
         if "." in s:
             s = s.rstrip("0").rstrip(".")
@@ -2316,11 +2324,16 @@ class Owner(commands.Cog, name="Owner"):
         num = self._fmt_no_sci(value, max_frac=2)
         return f"-{num}" if negative else num
 
-    async def amount_handler(self, amount_input: str, user_balance: Decimal) -> Decimal:
+    async def amount_handler(
+        self, amount_input: str, user_balance: Decimal, *, clamp: bool = True
+    ) -> Decimal:
         """
         Process the bet input and return the corresponding bet amount.
         Supports keywords ('all', 'half', 'quarter'), percentages, and suffixed values.
         The returned amount is truncated (not rounded) to two decimal places.
+
+        Set ``clamp=False`` when the target is an absolute value that is not
+        tied to a spendable balance (e.g. ``bank treasuryset``).
         """
 
         if not isinstance(amount_input, str):
@@ -2381,11 +2394,11 @@ class Owner(commands.Cog, name="Owner"):
             raise ValueError("Invalid amount.")
 
         try:
-            amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            amount = AmountUtils.round_currency(amount)
         except InvalidOperation:
             raise ValueError("Invalid amount.")
 
-        if amount > user_balance:
+        if clamp and amount > user_balance:
             raise ValueError("Insufficient Funds.")
         if amount <= Decimal("0"):
             raise ValueError("Amount must be greater than 0.")
@@ -2414,7 +2427,7 @@ class Owner(commands.Cog, name="Owner"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}todo {name}`{aliases} — {desc}")
             else:
@@ -2749,7 +2762,7 @@ class Owner(commands.Cog, name="Owner"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}gamesession {name}`{aliases} — {desc}")
             else:
@@ -3454,6 +3467,60 @@ class Owner(commands.Cog, name="Owner"):
             await ctx.send(f"🚫 Failed to send DM: {e}")
 
     @commands.command(
+        name="sendtoserver",
+        aliases=["sts"],
+        help="Send a message to a channel in another server the bot is in.",
+        hidden=True,
+    )
+    @commands.is_owner()
+    async def send_to_server(
+        self, ctx: Context, server_id: int, channel_id: int, *, message: str
+    ):
+        """Send `message` to `channel_id` inside the server `server_id`."""
+        guild = self.bot.get_guild(server_id)
+        if guild is None:
+            try:
+                guild = await self.bot.fetch_guild(server_id)
+            except discord.HTTPException:
+                guild = None
+
+        if guild is None:
+            return await ctx.send(
+                f"🚫 The bot is not in a server with ID `{server_id}`."
+            )
+
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                channel = None
+
+        if (
+            channel is None
+            or getattr(channel, "guild", None) is None
+            or channel.guild.id != guild.id
+        ):
+            return await ctx.send(
+                f"🚫 Could not find a channel with ID `{channel_id}` in **{guild.name}**."
+            )
+
+        channel_name = f"#{getattr(channel, 'name', channel_id)}"
+        try:
+            sent = await channel.send(message)
+        except discord.Forbidden:
+            return await ctx.send(
+                f"🚫 I don't have permission to send messages in {channel_name} "
+                f"in **{guild.name}**."
+            )
+        except discord.HTTPException as e:
+            return await ctx.send(f"🚫 Failed to send the message: {e}")
+
+        await ctx.send(
+            f"✅ Message sent to {channel_name} in **{guild.name}**.\n{sent.jump_url}"
+        )
+
+    @commands.command(
         name="servers",
         aliases=["list_servers"],
         help="List all servers or show a specific server by ID.",
@@ -3764,7 +3831,7 @@ class Owner(commands.Cog, name="Owner"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}command {name}`{aliases} — {desc}")
             else:
@@ -3891,7 +3958,7 @@ class Owner(commands.Cog, name="Owner"):
                 if getattr(cmd, "aliases", None)
                 else ""
             )
-            desc = (cmd.help or cmd.description or "").strip()
+            desc = render((cmd.help or cmd.description or ""), prefix).strip()
             if desc:
                 lines.append(f"`{prefix}bank {name}`{aliases} — {desc}")
             else:
@@ -3910,6 +3977,38 @@ class Owner(commands.Cog, name="Owner"):
         embed.set_footer(text=f"Use {prefix}bank <subcommand> for details.")
 
         await ctx.reply(embed=embed, mention_author=False)
+
+    @adminbank.command(
+        name="transactions",
+        aliases=["history", "txs"],
+        help="View a user's complete transaction history, page by page.",
+    )
+    async def admin_bank_transactions(self, ctx: Context, user: discord.User = None):
+        """Show every transaction a user sent or received, newest first."""
+        # Imported lazily so the Owner cog doesn't pull in the economy cog at load time.
+        from cogs.economy import TransactionPaginator
+
+        user = user or ctx.author
+        transactions = await self.bot.database.get_transactions_by_user_id(
+            user.id, limit=None
+        )
+
+        if not transactions:
+            await Embeds.error(
+                ctx,
+                f"No transactions found for **{user.display_name}**.",
+                delete_after=None,
+                reply=True,
+                mention_author=True,
+            )
+            return
+
+        paginator = TransactionPaginator(
+            self, transactions, user, ctx.author, timeout=300
+        )
+        embed = await paginator.get_page_embed(0)
+        message = await ctx.reply(embed=embed, view=paginator)
+        paginator.message = message
 
     @adminbank.command(name="give", aliases=["award", "wire"], hidden=True)
     @commands.is_owner()
@@ -4020,6 +4119,225 @@ class Owner(commands.Cog, name="Owner"):
             await ctx.send(embed=embed)
         except ValueError as e:
             await Embeds.error(ctx, str(e), delete_after=None)
+
+    #: The suffix ladder every other amount parser in the bot uses, so a charity
+    #: rule can be written the same way as a bet: ``10k``, ``2s``, ``1d``.
+    _CHARITY_AMOUNT_SUFFIXES = {
+        "k": Decimal("1000"),
+        "m": Decimal("1000000"),
+        "b": Decimal("1000000000"),
+        "t": Decimal("1000000000000"),
+        "q": Decimal("1000000000000000"),
+        "qu": Decimal("1000000000000000000"),
+        "s": Decimal("1000000000000000000000"),
+        "se": Decimal("1000000000000000000000000"),
+        "o": Decimal("1000000000000000000000000000"),
+        "n": Decimal("1000000000000000000000000000000"),
+        "d": Decimal("1000000000000000000000000000000000"),
+    }
+
+    @classmethod
+    def _parse_charity_amount(cls, raw: str) -> Decimal:
+        """Parse a charity rule amount: ``off`` means zero, else a number.
+
+        Accepts the same k/m/b/t/q/qu/s/se/o/n/d suffixes as every other amount
+        in the bot, so staff can set a threshold like ``10k`` or ``5s`` without
+        typing the zeros out.
+        """
+        text = (raw or "").strip().lower().replace(",", "").replace("_", "")
+        if text in {"off", "none", "disable", "disabled", "no", "0"}:
+            return Decimal("0.00")
+        match = re.match(
+            r"^([0-9]+(?:\.[0-9]+)?)(k|m|b|t|q|qu|s|se|o|n|d)?$", text
+        )
+        if not match:
+            raise ValueError(
+                "Invalid amount. Try a number like `5000`, `10k` or `5s` "
+                "(sextillion), or `off`."
+            )
+        value = Decimal(match.group(1))
+        if match.group(2):
+            value *= cls._CHARITY_AMOUNT_SUFFIXES[match.group(2)]
+        return AmountUtils.round_currency(value)
+
+    async def _charity_config_embed(
+        self, fund: dict, note: Optional[str] = None
+    ) -> discord.Embed:
+        """The current charity rules, for the ``!bank charity`` commands."""
+        embed = discord.Embed(
+            title="🤝 Charity Fund Settings", color=discord.Color.blurple()
+        )
+        if note:
+            embed.description = note
+        embed.add_field(
+            name="Balance",
+            value=f"{self.currency_name} **{await self.formatter(fund['balance'])}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Claims",
+            value="Open" if fund["enabled"] else "Paused",
+            inline=True,
+        )
+        embed.add_field(
+            name="Cooldown",
+            value=f"{int(fund['cooldown_seconds'])}s",
+            inline=True,
+        )
+        embed.add_field(
+            name="Threshold",
+            value=(
+                f"No claims at a net worth of {self.currency_name} "
+                f"**{await self.formatter(fund['claim_threshold'])}** or more"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Claim range",
+            value=(
+                f"Poorest take up to {self.currency_name} "
+                f"**{await self.formatter(fund['max_claim'])}**; the richest "
+                f"eligible take {self.currency_name} "
+                f"**{await self.formatter(fund['min_claim'])}**."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Commands",
+            value=(
+                "`!bank charity enable|disable`\n"
+                "`!bank charity threshold <amount|off>`\n"
+                "`!bank charity min <amount>`\n"
+                "`!bank charity max <amount>`\n"
+                "`!bank charity cooldown <seconds>`\n"
+                "-# amounts take the usual suffixes: `10k`, `5m`, `2s` (sextillion), "
+                "`1d` (decillion)"
+            ),
+            inline=False,
+        )
+        return embed
+
+    @adminbank.group(name="charity", invoke_without_command=True)
+    @commands.is_owner()
+    async def admin_bank_charity(self, ctx: Context):
+        """View or tweak the community charity fund's rules."""
+        fund = await self.bot.database.get_charity_fund()
+        await ctx.reply(
+            embed=await self._charity_config_embed(fund), mention_author=False
+        )
+
+    @admin_bank_charity.command(name="enable", aliases=["on"])
+    @commands.is_owner()
+    async def charity_enable(self, ctx: Context):
+        """Allow members to claim from the charity fund."""
+        fund = await self.bot.database.set_charity_config(enabled=True)
+        await ctx.reply(
+            embed=await self._charity_config_embed(
+                fund, "✅ Charity claims are now **open**."
+            ),
+            mention_author=False,
+        )
+
+    @admin_bank_charity.command(name="disable", aliases=["off"])
+    @commands.is_owner()
+    async def charity_disable(self, ctx: Context):
+        """Stop members from claiming from the charity fund."""
+        fund = await self.bot.database.set_charity_config(enabled=False)
+        await ctx.reply(
+            embed=await self._charity_config_embed(
+                fund, "⛔ Charity claims are now **paused**."
+            ),
+            mention_author=False,
+        )
+
+    @admin_bank_charity.command(name="threshold")
+    @commands.is_owner()
+    async def charity_threshold(self, ctx: Context, amount: str):
+        """Set the net worth at which a member can no longer claim.
+
+        Use `off` to make the fund claimable by nobody.
+        """
+        try:
+            value = self._parse_charity_amount(amount)
+        except ValueError as e:
+            return await Embeds.error(ctx, str(e), delete_after=None, reply=True)
+        fund = await self.bot.database.set_charity_config(claim_threshold=value)
+        await ctx.reply(
+            embed=await self._charity_config_embed(
+                fund,
+                f"Threshold set to {self.currency_name} "
+                f"**{await self.formatter(value)}**.",
+            ),
+            mention_author=False,
+        )
+
+    @admin_bank_charity.command(name="min")
+    @commands.is_owner()
+    async def charity_min(self, ctx: Context, amount: str):
+        """Set the smallest claim, given to those nearest the threshold."""
+        try:
+            value = self._parse_charity_amount(amount)
+        except ValueError as e:
+            return await Embeds.error(ctx, str(e), delete_after=None, reply=True)
+        fund = await self.bot.database.get_charity_fund()
+        if value > Decimal(str(fund["max_claim"])):
+            return await Embeds.error(
+                ctx,
+                "The minimum claim can't be larger than the maximum claim.",
+                delete_after=None,
+                reply=True,
+            )
+        fund = await self.bot.database.set_charity_config(min_claim=value)
+        await ctx.reply(
+            embed=await self._charity_config_embed(
+                fund,
+                f"Minimum claim set to {self.currency_name} "
+                f"**{await self.formatter(value)}**.",
+            ),
+            mention_author=False,
+        )
+
+    @admin_bank_charity.command(name="max")
+    @commands.is_owner()
+    async def charity_max(self, ctx: Context, amount: str):
+        """Set the largest claim, given to the poorest members."""
+        try:
+            value = self._parse_charity_amount(amount)
+        except ValueError as e:
+            return await Embeds.error(ctx, str(e), delete_after=None, reply=True)
+        fund = await self.bot.database.get_charity_fund()
+        if value < Decimal(str(fund["min_claim"])):
+            return await Embeds.error(
+                ctx,
+                "The maximum claim can't be smaller than the minimum claim.",
+                delete_after=None,
+                reply=True,
+            )
+        fund = await self.bot.database.set_charity_config(max_claim=value)
+        await ctx.reply(
+            embed=await self._charity_config_embed(
+                fund,
+                f"Maximum claim set to {self.currency_name} "
+                f"**{await self.formatter(value)}**.",
+            ),
+            mention_author=False,
+        )
+
+    @admin_bank_charity.command(name="cooldown")
+    @commands.is_owner()
+    async def charity_cooldown(self, ctx: Context, seconds: int):
+        """Set how long members must wait between claims, in seconds."""
+        if seconds < 0:
+            return await Embeds.error(
+                ctx, "The cooldown can't be negative.", delete_after=None, reply=True
+            )
+        fund = await self.bot.database.set_charity_config(cooldown_seconds=seconds)
+        await ctx.reply(
+            embed=await self._charity_config_embed(
+                fund, f"Claim cooldown set to **{seconds}s**."
+            ),
+            mention_author=False,
+        )
 
     @adminbank.command(
         name="take", aliases=["steal", "seize", "confiscate"], hidden=True
@@ -4150,6 +4468,145 @@ class Owner(commands.Cog, name="Owner"):
         except Exception as e:
             await Embeds.error(ctx, f"❌ Error: {e}", delete_after=None)
 
+    @adminbank.command(name="resetall", aliases=["wipeall", "reseteconomy"], hidden=True)
+    @commands.is_owner()
+    async def admin_bank_resetall(self, ctx: Context):
+        """Wipe the entire economy for every user (asks for confirmation)."""
+        # ``dry_run`` reuses the database's own table catalogue so the prompt
+        # always lists exactly what is about to be destroyed.
+        try:
+            preview = await self.bot.database.wipe_economy(
+                ctx.author.id, confirm=True, dry_run=True
+            )
+        except Exception as e:
+            logger.exception("Economy resetall preview failed")
+            return await Embeds.error(ctx, f"❌ Error: {e}", delete_after=None)
+
+        tables = list(preview.get("wiped_tables", []))
+        listing = "\n".join(f"• `{name}`" for name in tables)
+
+        embed = discord.Embed(
+            title="⚠️ Reset the entire economy?",
+            description=(
+                "This **permanently wipes** every user's:\n"
+                "• wallet and bank balances\n"
+                "• crypto holdings\n"
+                "• items, inventory and active effects\n"
+                "• jobs, loans, bounties and trade logs\n"
+                "• game / gambling history and VIP / rakeback data\n"
+                "• reputation and social currencies\n\n"
+                f"The following **{len(tables)}** tables will be cleared:\n{listing}\n\n"
+                "**This cannot be undone.**\n\n"
+                "-# ✅ to reset · ✖️ to cancel · expires in 30 seconds."
+            ),
+            color=discord.Color.orange(),
+        )
+
+        view = ResetConfirm(ctx.author.id)
+        view.message = await ctx.send(embed=embed, view=view)
+        await view.wait()
+
+        if view.value is not True:
+            view.disable()
+            reason = "timed out" if view.value is None else "was cancelled"
+            try:
+                await view.message.edit(
+                    embed=discord.Embed(
+                        description=f"🚫 Economy reset {reason} — nothing was changed.",
+                        color=discord.Color.red(),
+                    ),
+                    view=view,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        view.disable()
+        try:
+            await view.message.edit(
+                embed=discord.Embed(
+                    description="🧨 Wiping the entire economy…",
+                    color=discord.Color.blurple(),
+                ),
+                view=view,
+            )
+        except discord.HTTPException:
+            pass
+
+        try:
+            result = await self.bot.database.wipe_economy(ctx.author.id, confirm=True)
+            await self.bot.database.validate_economy()
+        except Exception as e:
+            logger.exception("Economy resetall failed")
+            try:
+                await view.message.edit(
+                    embed=discord.Embed(
+                        description=f"❌ Reset failed: {e}",
+                        color=discord.Color.red(),
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        wiped = list(result.get("wiped_tables", tables))
+        logger.warning(
+            "Economy resetall by %s (%s): %s table(s) wiped",
+            ctx.author,
+            ctx.author.id,
+            len(wiped),
+        )
+        done = discord.Embed(
+            description=(
+                f"✅ Reset the entire economy — **{len(wiped)}** tables wiped.\n"
+                f"Every wallet, bank, crypto holding, item and record starts from zero."
+            ),
+            color=discord.Color.green(),
+        )
+        done.set_author(name="Admin Audit", icon_url=ctx.author.display_avatar.url)
+        try:
+            await view.message.edit(embed=done, view=None)
+        except discord.HTTPException:
+            pass
+
+    @adminbank.command(
+        name="resetcooldowns", aliases=["resetcd", "resetcds"], hidden=True
+    )
+    @commands.is_owner()
+    async def admin_bank_resetcooldowns(self, ctx: Context):
+        """Reset every user's economy cooldowns.
+
+        Clears daily / weekly / monthly claims, job work, item cooldowns and
+        every other economy command cooldown for all users at once.
+        """
+        try:
+            cleared = await self.bot.database.reset_all_economy_cooldowns()
+        except Exception as e:
+            logger.exception("Economy cooldown reset failed")
+            return await Embeds.error(ctx, f"❌ Error: {e}", delete_after=None)
+
+        lines = "\n".join(
+            f"> `{name}` — {count} row(s)" for name, count in cleared.items()
+        ) or "> Nothing was on cooldown."
+        logger.warning(
+            "Economy cooldowns reset by %s (%s): %s",
+            ctx.author,
+            ctx.author.id,
+            cleared,
+        )
+        embed = discord.Embed(
+            title="⏱️ Cooldowns reset",
+            description=(
+                f"Cleared every user's economy cooldowns:\n{lines}\n\n"
+                "-# Daily, weekly, monthly, job work and item cooldowns are "
+                "usable again."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_author(name="Admin Audit", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=embed)
+
     @adminbank.command(name="refund", aliases=["reimburse"], hidden=True)
     @commands.is_owner()
     async def admin_bank_refund(self, ctx: Context, member: discord.Member, txid: str):
@@ -4211,6 +4668,202 @@ class Owner(commands.Cog, name="Owner"):
             await ctx.send(embed=embed)
         except ValueError as e:
             await Embeds.error(ctx, str(e), delete_after=None)
+
+    @adminbank.command(name="treasuryset", aliases=["settreasury", "tset"], hidden=True)
+    @commands.is_owner()
+    async def treasury_set(self, ctx: Context, amount: str):
+        """Set the treasury to an exact amount (adjusts supply, does not mint)."""
+        try:
+            current = await self.bot.database.get_treasury_balance()
+            try:
+                # Deliberately not clamped to the current balance: the point is
+                # to move the treasury to any absolute figure, up or down.
+                target = await self.amount_handler(amount, current, clamp=False)
+            except ValueError as e:
+                await Embeds.error(ctx, str(e), delete_after=5, reply=True)
+                return
+
+            await self.bot.database.set_treasury_balance(
+                target, f"Admin Audit - Treasury set by {ctx.author.name}"
+            )
+            await self.bot.database.validate_economy()
+
+            embed = discord.Embed(
+                description=(
+                    f"Treasury set to {self.currency_name} "
+                    f"**{await self.formatter(target)}** "
+                    f"(was **{await self.formatter(current)}**)."
+                ),
+                color=discord.Color.green(),
+            )
+            embed.set_author(name="Admin Audit", icon_url=ctx.author.display_avatar.url)
+            await ctx.send(embed=embed)
+        except ValueError as e:
+            await Embeds.error(ctx, str(e), delete_after=None)
+
+    # ==================== Gambling Bet Cap ====================
+
+    #: Storage key for the "disable the dynamic bet cap" switch. Shared by the
+    #: bot-wide flag in ``bot_settings`` and each per-user override in
+    #: ``user_settings``; the economy manager reads it from
+    #: ``get_max_gamble_amount``.
+    BET_CAP_KEY = "bet_cap_disabled"
+
+    @commands.group(
+        name="betcap",
+        aliases=["betlimit", "gamblecap"],
+        invoke_without_command=True,
+    )
+    @commands.is_owner()
+    async def betcap(self, ctx: Context):
+        """View or change the dynamic gambling bet cap."""
+        await self._send_betcap_status(ctx)
+
+    async def _betcap_overrides(self) -> dict:
+        """Every per-user bet-cap override, as ``{user_id: cap_disabled}``."""
+        db = getattr(self.bot, "db", None)
+        if db is None:
+            return {}
+        try:
+            rows = await db.execute(
+                "SELECT user_id, value FROM user_settings WHERE key = %s",
+                self.BET_CAP_KEY,
+            )
+        except Exception:
+            logger.exception("Could not list bet cap overrides")
+            return {}
+        return {int(uid): userprefs.as_flag(value) for uid, value in rows}
+
+    async def _send_betcap_status(self, ctx: Context) -> None:
+        settings = getattr(self.bot, "dash_settings", None)
+        global_off = bool(settings and settings.flag(self.BET_CAP_KEY, False))
+        overrides = await self._betcap_overrides()
+
+        lines = [
+            "**Bot-wide cap:** "
+            + ("❌ OFF — bets are limited only by net worth" if global_off else "✅ ON"),
+            f"**Per-user overrides:** {len(overrides)}",
+        ]
+        if overrides:
+            preview = list(overrides.items())[:25]
+            lines.append("")
+            lines.extend(
+                f"• <@{uid}> — {'❌ cap OFF' if off else '✅ cap ON'}"
+                for uid, off in preview
+            )
+            if len(overrides) > len(preview):
+                lines.append(f"…and {len(overrides) - len(preview)} more.")
+
+        prefix = await self.bot.get_prefix(ctx.message)
+        if isinstance(prefix, list):
+            prefix = prefix[0]
+        lines.append("")
+        lines.append(
+            f"-# `{prefix}betcap global <on|off>` · "
+            f"`{prefix}betcap user <member> <on|off|clear>`"
+        )
+
+        await Embeds.info(
+            ctx, "\n".join(lines), title="🎲 Gambling Bet Cap", delete_after=None
+        )
+
+    @betcap.command(name="global", aliases=["all", "bot"])
+    @commands.is_owner()
+    async def betcap_global(self, ctx: Context, state: str):
+        """Turn the dynamic bet cap on/off for everyone (``off`` removes it)."""
+        settings = getattr(self.bot, "dash_settings", None)
+        if settings is None:
+            return await Embeds.error(
+                ctx, "Dashboard settings are not available.", delete_after=None
+            )
+        wanted = userprefs.parse_flag(state)
+        if wanted is None:
+            return await Embeds.error(
+                ctx, "State must be `on` or `off`.", delete_after=None
+            )
+
+        await settings.set_flag(self.BET_CAP_KEY, not wanted, guild_id=0)
+        await self.bot.database.record_owner_command(
+            user_id=ctx.author.id,
+            command_name="betcap global",
+            guild_id=ctx.guild.id if ctx.guild else None,
+            channel_id=ctx.channel.id,
+            args={"state": "on" if wanted else "off"},
+        )
+        await Embeds.success(
+            ctx,
+            f"The dynamic bet cap is now **{'ON' if wanted else 'OFF'}** for everyone."
+            + ("" if wanted else " Bets are limited only by net worth."),
+            title="🎲 Bet Cap Updated",
+            delete_after=None,
+        )
+
+    @betcap.command(name="user", aliases=["member", "for"])
+    @commands.is_owner()
+    async def betcap_user(self, ctx: Context, member: discord.User, state: str):
+        """Override the bet cap for one user (``clear`` restores the default)."""
+        db = getattr(self.bot, "db", None)
+        if db is None:
+            return await Embeds.error(
+                ctx, "The preference store is not available.", delete_after=None
+            )
+
+        wanted = userprefs.parse_flag(state)
+        if state.strip().lower() in {"clear", "reset", "default", "none"}:
+            await userprefs.clear(db, member.id, [self.BET_CAP_KEY])
+            await self.bot.database.record_owner_command(
+                user_id=ctx.author.id,
+                command_name="betcap user",
+                guild_id=ctx.guild.id if ctx.guild else None,
+                channel_id=ctx.channel.id,
+                args={"target": member.id, "state": "clear"},
+            )
+            return await Embeds.success(
+                ctx,
+                f"Cleared {member.mention}'s bet-cap override — they now follow the "
+                "bot-wide setting.",
+                title="🎲 Bet Cap Updated",
+                delete_after=None,
+            )
+        if wanted is None:
+            return await Embeds.error(
+                ctx, "State must be `on`, `off` or `clear`.", delete_after=None
+            )
+
+        await userprefs.set_flag(db, member.id, self.BET_CAP_KEY, not wanted)
+        await self.bot.database.record_owner_command(
+            user_id=ctx.author.id,
+            command_name="betcap user",
+            guild_id=ctx.guild.id if ctx.guild else None,
+            channel_id=ctx.channel.id,
+            args={"target": member.id, "state": "on" if wanted else "off"},
+        )
+        await Embeds.success(
+            ctx,
+            f"The bet cap is now **{'ON' if wanted else 'OFF'}** for {member.mention}."
+            + ("" if wanted else " Their bets are limited only by net worth."),
+            title="🎲 Bet Cap Updated",
+            delete_after=None,
+        )
+
+    @betcap.command(name="list", aliases=["overrides", "show"])
+    @commands.is_owner()
+    async def betcap_list(self, ctx: Context):
+        """List the per-user bet-cap overrides."""
+        overrides = await self._betcap_overrides()
+        if not overrides:
+            return await Embeds.info(
+                ctx, "No per-user bet-cap overrides are set.", delete_after=None
+            )
+        lines = [
+            f"• <@{uid}> — {'❌ cap OFF' if off else '✅ cap ON'}"
+            for uid, off in list(overrides.items())[:50]
+        ]
+        if len(overrides) > 50:
+            lines.append(f"…and {len(overrides) - 50} more.")
+        await Embeds.info(
+            ctx, "\n".join(lines), title="🎲 Bet Cap Overrides", delete_after=None
+        )
 
     # ==================== VIP Admin Commands ====================
 

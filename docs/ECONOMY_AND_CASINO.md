@@ -205,6 +205,10 @@ New or poor players get a small minimum floor so they can still participate even
 
 If you try to bet above the limit, the bot usually **auto-caps your bet** and tells you the new maximum. High-rollers see a warning that their bet was reduced.
 
+### Disabling The Cap (owners)
+
+The dynamic cap can be switched off bot-wide or for one user. Command: `!betcap global <on|off>` and `!betcap user <member> <on|off|clear>`. `off` removes the cap so the only remaining limit is what the player owns (wallet + bank + crypto); a per-user override wins over the bot-wide setting.
+
 ---
 
 ## 9. Earning Money Without Gambling
@@ -312,7 +316,11 @@ Some shop items can:
 - Multiply your winnings when you win.
 - Reduce your losses.
 
-These are applied after the core game outcome is determined.
+These are applied after the core game outcome is determined, and both of the
+casino aid items are capped by a small, absolute budget - a save returns part of
+your stake rather than the winnings, and the win multiplier only touches profit
+on the first 250,000 coins of a bet. See *Boost items are budgeted* in section
+13 for the exact rules and why they exist.
 
 ### What Happens If FairGate Is Down
 
@@ -328,7 +336,7 @@ VIP is based on **total amount wagered across all games**, not on balance or win
 
 | Tier | Required Wagered | Rakeback Rate | RTP Bonus |
 |------|------------------|---------------|-----------|
-| Unranked | 0 | 0% | 0% |
+| Unranked | 0 | 2% | 0% |
 | Bronze | 100 billion | 1% | 0% |
 | Silver | 100 trillion | 2% | 0.5% |
 | Gold | 100 quadrillion | 3% | 1.0% |
@@ -350,7 +358,7 @@ Rakeback is one of the only ways to reliably soften losses. A Diamond player get
 
 ### Claiming Rakeback
 
-- Use `!vip claim` (one-hour cooldown).
+- Use `!vip claim` (one-minute cooldown).
 - Rakeback claims are **fee-exempt**: you receive the full accumulated amount.
 - Unclaimed rakeback sits in reserve and can grow indefinitely.
 
@@ -417,6 +425,56 @@ Active effects can:
 - Multiply gambling winnings.
 - Reduce robbery damage.
 - Apply other buffs or debuffs.
+
+### Prices are fixed, and the rarer the item the dearer it is
+
+Every item has **one catalogue price**, and every member pays exactly that -
+the figure on the card is the figure everyone else sees. Prices are in the
+millions and follow how good the item is, so the shelf has a cheap end and a
+dear end rather than everything costing the same:
+
+| Item | Rarity | Price |
+| --- | --- | --- |
+| Instant Cash Crate | Common | 1,000,000 |
+| Padlock | Common | 1,500,000 |
+| Energy Drink | Common | 2,000,000 |
+| Lucky Clover | Common | 3,000,000 |
+| Money Multiplier | Common | 4,000,000 |
+| Handcuffs | Uncommon | 6,000,000 |
+| Anti-Rob Aura | Uncommon | 8,000,000 |
+| Cursed Coin | Rare | 12,000,000 |
+| Bank Insurance | Rare | 15,000,000 |
+| Golden Pepe | Legendary | 50,000,000 |
+
+Because the price does not chase the buyer, a purchase costs the same for a
+newcomer and for the richest player on the server.
+
+Paying works like an auction: the wallet is used first, and whatever it cannot
+cover is drawn from the **bank** (that move is internal and fee-free, like
+`!bank withdraw`). You only need enough in the two together; crypto does not
+count, because it cannot pay for an item.
+
+Staff change a price with `!shopadmin edit <id> price=<amount>`, and
+`!shopadmin seed` puts every default item back onto the catalogue price in
+`database/managers/inventory.py` (that list is the shop's pricing).
+
+### Boost items are budgeted
+
+The two casino aid items - **Money Multiplier** and **Lucky Clover** - cannot
+hand out unlimited money. Their bonus is deliberately small and absolute:
+
+- the win multiplier boosts **profit only**, never your stake, and only on the
+  first 250,000 coins of a bet;
+- a **luck save** refunds (part of) the stake rather than paying a win, and is
+  never multiplied by the gamble boost;
+- one activation can never add more than 250,000 coins in total.
+
+In practice the boosts are worth their full value at ordinary stakes and almost
+nothing on a balance-sized bet. Before this was in place a saved loss was paid
+as a win *and* multiplied, which gave a member holding both items roughly a
+300% return on every game - a coin faucet that fed straight back into the
+Treasury's minting. The limits live in `cogs/casino.py`
+(`ITEM_BOOST_STAKE_CAP`, `ITEM_BOOST_MAX_GAIN`, `LUCK_SAVE_REFUND_RATIO`).
 
 ### Cooldowns
 
@@ -558,6 +616,26 @@ Back to top
 | `!shop` | Browse shop items |
 | `!inventory` | View your items |
 | `!crypto` | Crypto trading commands |
+| `!charity` | The community charity fund, its rules and your eligibility |
+| `!charity donate <amount>` | Give from your wallet to the charity fund |
+| `!charity take` | Claim a small, balance-scaled slice of the fund |
+| `!charity stats` | Fund balance, lifetime totals and claim rules |
+
+### The Charity Fund
+
+The charity fund is a shared pot that wealthy players fill and the broke can draw
+from in small amounts. `!charity donate <amount>` moves currency from your
+wallet into the pot, fee-free; `!charity take` pulls a little back out. How much
+you may take scales with how poor you are: at zero net worth you can take the
+`max_claim`, tapering to `min_claim` as your net worth approaches the threshold,
+and **nobody at or above the threshold can take anything at all**. Claims are
+rate-limited by a cooldown.
+
+Staff configure it with the owner-only `!bank charity` command group
+(`threshold`, `min`, `max`, `cooldown`, `enable`/`disable`). The pot lives in the
+current economy scope, so a server on its own economy (`!guildeconomy on`) has a
+private charity fund. Money in the pot sits outside the Treasury until claimed,
+so a donation is a gentle sink and a claim is a small faucet.
 
 ---
 
@@ -587,6 +665,168 @@ Back to top
 
 ---
 
-## 19. Summary in One Paragraph
+## 19. Servers With Their Own Economy
+
+Everything above describes the **shared economy**: one wallet, one Treasury and
+one supply for the whole bot. A server can leave that behind and keep an economy
+of its own. A server manager switches with `!guildeconomy on` and back with
+`!guildeconomy off`; on its own, `!guildeconomy` shows which economy the server
+is on.
+
+- **Separate books.** Wallets, banks, crypto, inventory, shop cooldowns, VIP
+  progress, rakeback, loans, jobs, bounties and the transaction ledger are all
+  kept per server. Being rich in the shared economy means nothing in a server
+  that runs its own, and the same user can hold a different balance in each.
+- **Its own Treasury.** A server economy starts with empty player wallets but a
+  Treasury the same size as the shared one, so dailies, drops and payouts work
+  immediately. Health, fees, bet limits, minting and burning all use that
+  server's own supply, and a server's mint can never spend the shared economy's
+  daily mint budget or hold its rebalance cooldown.
+- **Honoured everywhere.** `!balance` in chat, `/balance`, casino buttons,
+  selects and modals all run against the right server's economy.
+- **Reversible.** Switching the mode off hides the server economy but keeps
+  every row, so switching it back on resumes exactly where it left off.
+- **Still shared.** The shop catalogue, VIP tier definitions, crypto price feed
+  and game rules are bot-wide.
+
+Switching is a server-manager action (`Manage Server`) and only ever affects
+that one server. The bot's own background maintenance (the ten-minute economic
+validation, the daily metrics snapshot, the auto-rebalancer and the inactivity
+sweeps) keeps tending the shared economy; a server's own economy is maintained
+by the activity happening in that server.
+
+---
+
+## 20. The Vault: Collecting Music With Your Coins
+
+The Vault (`!vault`) is a collecting game that runs on the **same coins as your
+`!balance`**. Nothing in it is a separate token, and nothing in it is free: every
+purchase leaves your wallet, every payout comes out of the Treasury, and every
+figure is subject to the same fees and market forces as the rest of the economy.
+
+### What you can own
+
+Three kinds of thing, all priced by how rare the recording is:
+
+- **Songs** — priced by recording year (newer costs more) and category.
+- **OG files** — a song's original file, worth about half the song and a fifth
+  more once that song has been leaked anywhere in the Vault.
+- **Recording sessions** — hand-made session files, worth 2.5× an unreleased song
+  from the same year.
+
+### Categories are the API's, not invented ones
+
+A song is graded into exactly one of the four categories the music API actually
+serves, and the multiplier that follows is public:
+
+| Category | Worth |
+| --- | --- |
+| `Unsurfaced` | **20×** unreleased — the holy grail of a vault |
+| `Unreleased` | the baseline |
+| `Recording Session` | **2.5×** |
+| `Released` | **0.5×** (the audio is already public) |
+
+### Prices are a share of the economy, not a fixed figure
+
+Each item's worth is frozen **once**, the first time it is looked up, as a
+**share of the money members are holding** — never as a coin amount. What you
+see and pay is that share applied to the server's live economy, so the market
+scales with the economy by itself, with nothing to recalibrate:
+
+- **Minting and payouts** put coins into members' hands, so the market grows and
+  every price rises with it — **inflation**.
+- **Fees, burns and casino losses** take coins back out, so the market shrinks and
+  every price falls — **deflation**.
+- A **Treasury burn on its own** does not move vault prices: it takes coins out of
+  the Treasury, not out of anyone's wallet, and what the vault is priced against
+  is the money players actually hold.
+
+This is what makes the vault work on any server. A hyperinflated economy gets
+hyperinflated prices and a quiet one gets cheap ones — no clamps, no stale table.
+On the shared economy here (roughly 8.1 × 10²³ coins circulating) the ladder,
+before the one-off 0.8×–1.5× roll that separates two items from the same year, is:
+
+| Item | Price |
+| --- | --- |
+| 2014 released | ~4 quadrillion |
+| 2019 released | ~22 quadrillion |
+| 2019 unreleased | ~44 quintillion |
+| 2019 recording session | ~109 quintillion |
+| 2019 unsurfaced grail | ~872 quintillion |
+
+`!vault market` shows that market size, the money supply behind it, and how far
+the economy has moved since the vault opened in that server. Cards show a `▲`/`▼`
+marker when the market has moved an item away from the price it was first listed
+at.
+
+What this means in practice: **your collection is an investment, not a receipt.**
+A song you bought during a quiet week is worth more after a busy weekend of
+gambling, and less after members lose a fortune in fees. Selling, groupbuys and
+portfolio values all read the live number.
+
+### Money in, money out
+
+- **Buying** spends from your **wallet** only, through the normal spending path,
+  so the economy's standard fee applies exactly as it does in the shop.
+- **Selling** returns **85%** of the live value and pays out of the Treasury as a
+  fee-free reward. Leaked items cannot be sold at all.
+- **Leaking** (`!vault gb`) resolves as a **groupbuy**: buyers pay between 75% and
+  250% of the item's value, you keep the pot, and the item's value drops 75% for
+good. Its song also becomes "leaked", which raises the value of that song's OG
+  files.
+- **Trading** (`!vault trade`) pays member-to-member through the economy's own
+  player-to-player path, so the transfer fee is taken out of the payment.
+- **Auctions** (`!vault auction`) escrow the item and take a bid from the
+  bidder's **wallet first, then bank**. An outbid member is refunded from the
+  Treasury; an auction nobody bids on returns the item to you after 30 minutes of
+  silence.
+- **Sharing** a file keeps your copy but shaves 5% off its value — more copies,
+  less scarcity.
+
+### Vault achievements
+
+`!vault achievements` lists nine badges — first item, first session, first
+unsurfaced grail, an OG file, ten items, twenty-five items, five sales, three
+leaks, and a collection worth **1% of the server's money supply** (the top badge
+is measured against the economy, not a coin figure, because one grail is already
+worth hundreds of quintillions here). Each one **pays coins from the server's
+Treasury** the moment it is earned, so collecting feeds back into the economy
+instead of being a closed side-game. Rewards are a share of the market like
+prices are — the lightest pays about half a 2014 released song and the top badge
+twenty times that — so a badge is worth real coins on any server and is never so
+small that a whale's balance swallows it. If the Treasury is protecting its
+floor a payout can be held back, and the command says so.
+
+### Per-server, like the rest of the economy
+
+A server running its own economy (`!guildeconomy on`) also gets its **own
+vault**: its own collection, its own frozen shares and its own market (the money
+that server's members hold), backed by its own Treasury. Coins earned in one
+server can never buy items in another, and the same song can be owned by one
+person per server. A server holding a few million therefore prices the very same
+grail in the thousands. See section 19.
+
+### Quick reference
+
+| Command | What it does |
+| --- | --- |
+| `!vault search <song>` | Price a song or session |
+| `!vault buy <song>` | Buy it with your wallet |
+| `!vault ogfile <song>` | Buy a song's OG file |
+| `!vault sell [song]` | Sell an item back |
+| `!vault list [@user]` | A collection and its live value |
+| `!vault gb [song]` | Leak an item as a groupbuy |
+| `!vault share <song> @user` | Send a file to a member |
+| `!vault trade @user <song> [price]` | Trade, swap or gift |
+| `!vault auction <song> <start price>` | Auction an item |
+| `!vault bid <amount>` | Bid on this channel's auction |
+| `!vault auctions` | Open auctions in this server |
+| `!vault market` | The economy the prices are measured against |
+| `!vault achievements` | Badges and their coin rewards |
+| `!vault leaderboard` | Top collections by value |
+
+---
+
+## 21. Summary in One Paragraph
 
 TPNEBOT's economy is a closed loop centered on the Treasury. Treasury Health controls fees, bet limits, payouts, and reward sizes. Players earn money through dailies, jobs, begging, drops, and gambling; they spend or lose it back through games, fees, transfers, robberies, loans, and the shop. The bot actively rebalances by minting when the Treasury is low and burning when it is high, with gambling volume accelerating refills. Wealthy players face whale taxes, VIP players earn rakeback and RTP bonuses, and every casino outcome is provably fair. Understanding these forces lets you decide when to bet big, when to bank, and when to let the economy catch its breath.
