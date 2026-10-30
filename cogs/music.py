@@ -13,6 +13,7 @@ from discord.ext import commands, tasks
 from discord.ext.commands import Context
 
 from utils.core.prefixes import render
+from utils.core.http_session import borrowed
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from urllib.parse import quote
@@ -34,6 +35,7 @@ from utils.core.groupbuys import (
 from utils.embeds import Embeds
 from utils.guardrails import check_slash_guardrails
 from cogs.songinfo import SongInfoAPI
+from cogs.covers import song_alt_names
 from itertools import product
 from difflib import SequenceMatcher
 from moviepy import *
@@ -57,6 +59,12 @@ def _fallback_file_api() -> SongInfoAPI:
         _FALLBACK_FILE_API = SongInfoAPI()
     return _FALLBACK_FILE_API
 
+def _write_bytes(path: str, data: bytes) -> None:
+    """Write *data* to *path*; run in a thread so the event loop keeps moving."""
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
 DOWNLOAD_CACHE_FOLDER_NAME = "__download_cache"
 HEARDLE_GAME_DURATION = 20
 HEARDLE_CLIP_DURATION = 10
@@ -68,6 +76,16 @@ HEARDLE_TOURNAMENT_JOIN_DURATION = 30
 HEARDLE_TOURNAMENT_MAX_ROUNDS = 20
 HEARDLE_TOURNAMENT_MIN_PLAYERS = 2
 DEFAULT_SNIPPET_DURATION = 15
+#: How many covers `!relapse` puts in its picker. Discord galleries hold ten.
+RELAPSE_MAX_COVERS = 10
+#: How long a member has to pick a song or reply with a cover number.
+RELAPSE_PICK_TIMEOUT = 180
+#: The square every `!relapse` video is rendered at. The cover fills it edge
+#: to edge, bright and unblurred.
+RELAPSE_VIDEO_SIZE = 720
+#: The frame rate of a `!relapse` video. The background never moves, so a low
+#: rate is visually identical and several times quicker to encode.
+RELAPSE_VIDEO_FPS = 10
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 MAX_NAME_TRANSFORMATIONS = 6
 GENIUS_API_TOKEN = os.getenv("GENIUS_API_KEY")
@@ -192,6 +210,166 @@ def build_lastfm_help_pages(
     return pages
 
 
+# ---------------------------------------------------------------------------
+# !relapse — the whole track over a cover the member picks
+# ---------------------------------------------------------------------------
+def relapse_cover_label(cover: dict) -> str:
+    """``Artist · file.png`` for one entry of the cover list."""
+    artist = str(cover.get("artist") or "Unknown Artist").strip()
+    name = str(cover.get("name") or "cover").strip()
+    return f"{artist} · {name}"
+
+
+def relapse_timestamp(seconds: float) -> str:
+    minutes, secs = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}:{secs:02d}"
+
+
+def relapse_cover_view(song_title: str, covers: list[dict]) -> discord.ui.LayoutView:
+    """The numbered cover picker.
+
+    Each cover is shown in a gallery in the same order as the numbered list
+    above it, so replying with a number is unambiguous.
+    """
+    view = discord.ui.LayoutView(timeout=RELAPSE_PICK_TIMEOUT)
+    box = discord.ui.Container(accent_color=0xFFFFFF)
+
+    listed = "\n".join(
+        f"**{index}.** {relapse_cover_label(cover)}"
+        for index, cover in enumerate(covers, start=1)
+    )
+    box.add_item(
+        discord.ui.TextDisplay(
+            f"# 🎨 Pick a cover\n"
+            f"**{song_title}**\n"
+            f"{listed}\n"
+            f"-# Reply to this message with the number of the cover to use."
+        )
+    )
+
+    gallery = [
+        discord.MediaGalleryItem(media=cover["media_url"], description=f"Cover {index}")
+        for index, cover in enumerate(covers, start=1)
+        if cover.get("media_url")
+    ]
+    if gallery:
+        box.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        box.add_item(discord.ui.MediaGallery(*gallery))
+
+    view.add_item(box)
+    return view
+
+
+class RelapseSongSelect(discord.ui.Select):
+    """The dropdown shown when a `!relapse` search matches several songs."""
+
+    def __init__(self, songs: dict[str, dict], author_id: int) -> None:
+        self.songs = list(songs.items())
+        self.author_id = author_id
+        self.chosen: Optional[dict] = None
+
+        super().__init__(
+            placeholder="Select the song to render...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=name[:100], value=str(index))
+                for index, (name, _song) in enumerate(self.songs[:25])
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the member who ran the command can pick.", ephemeral=True
+            )
+            return
+
+        self.chosen = self.songs[int(self.values[0])][1]
+        if self.view is not None:
+            self.view.stop()
+        await interaction.response.defer()
+
+
+class RelapseSongView(discord.ui.View):
+    """Holds the song dropdown so the command can wait on it."""
+
+    def __init__(self, songs: dict[str, dict], author_id: int) -> None:
+        super().__init__(timeout=RELAPSE_PICK_TIMEOUT)
+        self.select = RelapseSongSelect(songs, author_id)
+        self.add_item(self.select)
+
+
+async def _probe_audio_duration(audio_path: str) -> float:
+    """Length of an audio file in seconds, straight from ffprobe."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "ffprobe could not read the track: "
+            + stderr.decode(errors="replace")[:200]
+        )
+    return float(stdout.decode().strip() or 0)
+
+
+async def _render_relapse_video(
+    cover_path: str,
+    audio_path: str,
+    output_path: str,
+    duration: float,
+) -> None:
+    """Render the whole track over the cover, with no blur and no bars.
+
+    The prepared cover already fills the square, so it reads as a background
+    rather than a picture floating on black. Nothing is blurred — that is the
+    whole point of the command.
+    """
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    # Decode the cover once per second and stretch that to the output rate.
+    # Re-reading a large image 30 times a second was most of the render time.
+    cmd += ["-loop", "1", "-framerate", "1", "-i", cover_path]
+    cmd += ["-i", audio_path]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-tune", "stillimage",
+        "-preset", "ultrafast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-r", str(RELAPSE_VIDEO_FPS),
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", f"{max(duration, 1.0):.3f}",
+        "-shortest",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=900.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise TimeoutError("ffmpeg timed out while rendering the full track") from None
+
+    if proc.returncode != 0:
+        logger.error(
+            "ffmpeg exited with code %d: %s",
+            proc.returncode,
+            stderr.decode(errors="replace"),
+        )
+        raise RuntimeError("ffmpeg failed to render the full track")
+
+
 class Music(commands.Cog, name="Music"):
     async def cog_load(self) -> None:
         cache_registry.register(
@@ -237,6 +415,8 @@ class Music(commands.Cog, name="Music"):
         self.ongoing_heardle = []
         self.heardle_answers = {}
         self.snippet_debounce = {}
+        #: Members with a `!relapse` render in flight — one ffmpeg job each.
+        self.relapse_busy: set[int] = set()
         self._auto_cache_clean.start()
         self.standard_colors = {
             "black": "#000000",
@@ -505,52 +685,46 @@ class Music(commands.Cog, name="Music"):
             except Exception:
                 return None
 
-        async def fetch_decoded_image(url: str, params: dict | None = None) -> Image.Image | None:
-            data = await fetch_image_bytes(url, params)
-            if not data:
-                return None
+        # All three candidates are fetched at once, as before. Decoding and
+        # blurring, however, happen in a worker thread: a 4K cover takes tens of
+        # milliseconds of pure CPU, and doing that on the event loop stalls every
+        # other guild for the duration. Candidates are decoded in priority order
+        # and work stops at the first usable image, so nothing is decoded twice.
+        cover_bytes, album_bytes, avatar_bytes = await asyncio.gather(
+            fetch_image_bytes(cover_url),
+            fetch_image_bytes(album_art_url, album_art_params),
+            fetch_image_bytes(avatar_url),
+        )
+
+        def build_cover() -> bool:
+            for data, radius in (
+                (cover_bytes, 15),
+                (album_bytes, 5),
+                (avatar_bytes, None),
+            ):
+                if not data:
+                    continue
+                try:
+                    with Image.open(BytesIO(data)) as loaded:
+                        image = loaded.copy()
+                except Exception:
+                    continue
+                if radius is None:
+                    try:
+                        image.save(target_path)
+                        return True
+                    except Exception:
+                        continue
+                if self._blur_to_file(image, target_path, radius):
+                    return True
+
             try:
-                return Image.open(BytesIO(data)).copy()
-            except Exception:
-                return None
-
-        cover_task = asyncio.create_task(fetch_decoded_image(cover_url))
-        album_task = asyncio.create_task(fetch_decoded_image(album_art_url, album_art_params))
-        avatar_task = asyncio.create_task(fetch_decoded_image(avatar_url))
-
-        try:
-            cover_img = await cover_task
-        except Exception:
-            cover_img = None
-        if cover_img is not None and self._blur_to_file(cover_img, target_path, 15):
-            album_task.cancel()
-            avatar_task.cancel()
-            return True
-
-        try:
-            album_img = await album_task
-        except Exception:
-            album_img = None
-        if album_img is not None and self._blur_to_file(album_img, target_path, 5):
-            avatar_task.cancel()
-            return True
-
-        try:
-            avatar_img = await avatar_task
-        except Exception:
-            avatar_img = None
-        if avatar_img is not None:
-            try:
-                avatar_img.save(target_path)
+                Image.new("RGBA", (200, 200), (50, 50, 50)).save(target_path)
                 return True
             except Exception:
-                pass
+                return False
 
-        try:
-            Image.new("RGBA", (200, 200), (50, 50, 50)).save(target_path)
-            return True
-        except Exception:
-            return False
+        return await asyncio.to_thread(build_cover)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -1080,7 +1254,7 @@ class Music(commands.Cog, name="Music"):
             async def get_user_data(lastfm_username: str):
                 url = f"https://ws.audioscrobbler.com/2.0/?method=user.getinfo&user={lastfm_username}&api_key={LASTFM_API_KEY}&format=json"
 
-                async with aiohttp.ClientSession() as session:
+                async with borrowed() as session:
                     async with session.get(url) as response:
                         if response.status != 200 or "application/json" not in response.headers.get("Content-Type", ""):
                             logger.error(f"Last.fm user.getinfo returned {response.status} for {lastfm_username}")
@@ -1097,7 +1271,7 @@ class Music(commands.Cog, name="Music"):
 
             async def get_recent_tracks(lastfm_username: str):
                 url_recent = f"http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user={lastfm_username}&api_key={LASTFM_API_KEY}&format=json"
-                async with aiohttp.ClientSession() as session:
+                async with borrowed() as session:
                     async with session.get(url_recent) as response:
                         if response.status != 200 or "application/json" not in response.headers.get("Content-Type", ""):
                             logger.error(f"Last.fm user.getrecenttracks returned {response.status} for {lastfm_username}")
@@ -1109,7 +1283,7 @@ class Music(commands.Cog, name="Music"):
                 artist_name: str, track_name: str, lastfm_username: str
             ):
                 url_info = f"http://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={LASTFM_API_KEY}&artist={artist_name}&track={track_name}&username={lastfm_username}&format=json"
-                async with aiohttp.ClientSession() as session:
+                async with borrowed() as session:
                     async with session.get(url_info) as response:
                         if response.status != 200 or "application/json" not in response.headers.get("Content-Type", ""):
                             logger.error(f"Last.fm track.getInfo returned {response.status} for {artist_name} - {track_name}")
@@ -1358,7 +1532,7 @@ class Music(commands.Cog, name="Music"):
             await asyncio.sleep(delay)
         return None
 
-    @commands.hybrid_command(name="snp", description="View what you are currently playing on Spotify.")
+    @commands.hybrid_command(name="spotify", description="View what you are currently playing on Spotify.")
     @unified_cooldown(30)
     async def spotify_now_playing(
         self, ctx: commands.Context, member: Optional[discord.Member] = None
@@ -1381,7 +1555,7 @@ class Music(commands.Cog, name="Music"):
 
                 cover_url = activity.album_cover_url
                 if cover_url:
-                    async with aiohttp.ClientSession() as session:
+                    async with borrowed() as session:
                         async with session.get(cover_url) as response:
                             cover_data = await response.read()
 
@@ -1531,7 +1705,7 @@ class Music(commands.Cog, name="Music"):
 
                 async def get_track_playcount(lastfm_username, artist_name, track_name):
                     url = f"http://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={LASTFM_API_KEY}&artist={artist_name}&track={track_name}&username={lastfm_username}&format=json"
-                    async with aiohttp.ClientSession() as session:
+                    async with borrowed() as session:
                         async with session.get(url) as response:
                             track_info = await response.json()
                             return track_info.get("track", {}).get(
@@ -1653,7 +1827,7 @@ class Music(commands.Cog, name="Music"):
 
         try:
             async with ctx.typing():
-                async with aiohttp.ClientSession() as session:
+                async with borrowed() as session:
                     async with session.get(
                         f"{JUICEWRLD_API}/analytics/now-playing/discord",
                         params={"discord_user_id": member.id},
@@ -1731,7 +1905,7 @@ class Music(commands.Cog, name="Music"):
                         position = now_playing.get("position", 0)
 
                         if cover_url:
-                            async with aiohttp.ClientSession() as cover_session:
+                            async with borrowed() as cover_session:
                                 async with cover_session.get(
                                     cover_url
                                 ) as cover_response:
@@ -2015,7 +2189,7 @@ class Music(commands.Cog, name="Music"):
         pairing_code = code.upper()
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with borrowed() as session:
                 async with session.post(
                     f"{JUICEWRLD_API}/auth/discord/bot-link",
                     json={"code": pairing_code, "discord_user_id": ctx.author.id},
@@ -2185,17 +2359,31 @@ class Music(commands.Cog, name="Music"):
         if no_parens and no_parens != query:
             queries.append(no_parens)
 
+        async def fetch_variant(candidate: str) -> dict | None:
+            try:
+                async with self.session.get(
+                    JUICEWRLD_API + "/juicewrld/songs/",
+                    params={"search": candidate, "page_size": SEARCH_PAGE_SIZE},
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    return await response.json()
+            except Exception:
+                return None
+
+        # The extra variants only widen the search, so they run together instead
+        # of costing a round trip each. Merging in query order keeps the ranking
+        # and the de-duplication identical to the sequential version. A variant
+        # that fails is simply skipped; only a failed primary search is an error.
+        payloads = await asyncio.gather(*(fetch_variant(q) for q in queries))
+        if payloads[0] is None:
+            return None
+
         seen_ids = set()
         all_results: list[dict] = []
-        for q in queries:
-            async with self.session.get(
-                JUICEWRLD_API + "/juicewrld/songs/",
-                params={"search": q, "page_size": SEARCH_PAGE_SIZE},
-            ) as response:
-                if response.status != 200:
-                    return None
-                data = await response.json()
-
+        for data in payloads:
+            if data is None:
+                continue
             for song in data.get("results", []):
                 if keep(song):
                     if song.get("id") not in seen_ids:
@@ -2227,21 +2415,43 @@ class Music(commands.Cog, name="Music"):
         The radio endpoint occasionally returns `unsurfaced` tracks that have
         metadata only — those 404 on the download endpoint. Retry a few times
         before giving up.
-        """
-        for _ in range(max_retries):
-            async with self.session.get(
-                f"{JUICEWRLD_API}/juicewrld/radio/random/"
-            ) as response:
-                if response.status != 200:
-                    return None
-                data = await response.json()
 
-            song_data = data.get("song")
-            if not song_data:
-                continue
-            if self._is_unsurfaced(song_data):
-                continue
-            return data
+        The first try is a single request, because it usually succeeds. Only the
+        retries are fetched in small parallel batches, so an unlucky streak of
+        unplayable tracks costs one round trip instead of several.
+        """
+
+        async def fetch_one() -> tuple[bool, dict | None]:
+            """Return ``(request_succeeded, payload)``."""
+            try:
+                async with self.session.get(
+                    f"{JUICEWRLD_API}/juicewrld/radio/random/"
+                ) as response:
+                    if response.status != 200:
+                        return False, None
+                    return True, await response.json()
+            except Exception:
+                return False, None
+
+        attempts = 0
+        while attempts < max_retries:
+            batch_size = 1 if attempts == 0 else min(3, max_retries - attempts)
+            batch = await asyncio.gather(*(fetch_one() for _ in range(batch_size)))
+            attempts += batch_size
+
+            for ok, data in batch:
+                if not ok or not data:
+                    continue
+                song_data = data.get("song")
+                if not song_data or self._is_unsurfaced(song_data):
+                    continue
+                return data
+
+            # Every request in the batch failed outright: the endpoint is down,
+            # so retrying would only add latency. This matches the old behaviour
+            # of giving up as soon as a request is refused.
+            if not any(ok for ok, _ in batch):
+                return None
         return None
 
     async def fetch_session(self, ctx: commands.Context, query: str, allow_unsurfaced: bool = True):
@@ -3806,16 +4016,18 @@ class Music(commands.Cog, name="Music"):
         output_path = None
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(download_url, params={"path": path} if path else None) as download_response:
-                    if download_response.status != 200:
-                        return False, download_response.status
+            # Reuse the cog's connection pool. Opening a fresh ClientSession here
+            # meant a new TCP + TLS handshake to the API on every snippet.
+            async with self.session.get(download_url, params={"path": path} if path else None) as download_response:
+                if download_response.status != 200:
+                    return False, download_response.status
 
-                    self.assert_download_cache()
-                    song_bytes = await download_response.read()
-                    temp_file_path = DOWNLOAD_CACHE_FOLDER_NAME + f"/{file_name}.mp3"
-                    with open(temp_file_path, "wb") as f:
-                        f.write(song_bytes)
+                self.assert_download_cache()
+                song_bytes = await download_response.read()
+                temp_file_path = DOWNLOAD_CACHE_FOLDER_NAME + f"/{file_name}.mp3"
+                # Writing a whole track to disk blocks the event loop; hand it to
+                # the default executor.
+                await asyncio.to_thread(_write_bytes, temp_file_path, song_bytes)
 
             def _build():
                 orig_clip = AudioFileClip(temp_file_path)
@@ -4927,6 +5139,389 @@ class Music(commands.Cog, name="Music"):
             )
         finally:
             self.handle_user_done_snippet(ctx.author.id)
+
+    # -- !relapse ---------------------------------------------------------
+    @staticmethod
+    async def _relapse_paint(message: discord.Message, content: str) -> None:
+        """Repaint the status card, ignoring a message that is already gone."""
+        try:
+            await message.edit(embed=discord.Embed(description=content, color=None))
+        except discord.HTTPException:
+            pass
+
+    async def _relapse_covers(self, title: str, song: dict) -> list[dict]:
+        """Every cover the picker can offer for ``song``.
+
+        The cover index lives in ``cogs.covers``; the artwork the API embeds in
+        the file is the fallback when the index has nothing for the title.
+        """
+        covers_cog = self.bot.get_cog("Covers")
+        covers: list[dict] = []
+        if covers_cog is not None:
+            try:
+                covers = await covers_cog.fetch_song_covers(
+                    title,
+                    song.get("path") or "",
+                    alt_names=song_alt_names(song),
+                )
+            except Exception:
+                logger.exception("Could not resolve covers for '%s'", title)
+
+        usable = [cover for cover in covers if cover.get("media_url")]
+        if usable:
+            return usable[:RELAPSE_MAX_COVERS]
+
+        path = song.get("path") or ""
+        if path:
+            return [
+                {
+                    "media_url": (
+                        f"{JUICEWRLD_API}/juicewrld/files/cover-art/"
+                        f"?path={quote(path)}"
+                    ),
+                    "artist": "Juice WRLD",
+                    "name": f"{title}.png",
+                }
+            ]
+        return []
+
+    async def _relapse_wait_for_number(
+        self, ctx: commands.Context, prompt: discord.Message, count: int
+    ) -> Optional[int]:
+        """Wait for the member to reply to the picker with a cover number."""
+
+        def check(message: discord.Message) -> bool:
+            if message.author.id != ctx.author.id:
+                return False
+            if message.channel.id != ctx.channel.id:
+                return False
+            reference = message.reference
+            # A reply to some other message belongs to another conversation.
+            return reference is None or reference.message_id == prompt.id
+
+        deadline = time.monotonic() + RELAPSE_PICK_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                reply = await self.bot.wait_for(
+                    "message", check=check, timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                return None
+
+            text = (reply.content or "").strip()
+            if not text.isdigit():
+                continue
+            number = int(text)
+            if 1 <= number <= count:
+                return number
+            await ctx.send(
+                embed=discord.Embed(
+                    description=f"❌ Pick a number between **1** and **{count}**.",
+                    color=discord.Color.red(),
+                ),
+                delete_after=7,
+            )
+
+    async def _relapse_download_audio(self, path: str, target_path: str) -> bool:
+        """Download the playable audio for a library ``path``."""
+        try:
+            async with self.session.get(
+                f"{JUICEWRLD_API}/juicewrld/files/download-compressed/",
+                params={"path": path} if path else None,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as response:
+                if response.status != 200:
+                    logger.warning(
+                        "Relapse audio download for '%s' returned HTTP %s",
+                        path,
+                        response.status,
+                    )
+                    return False
+                data = await response.read()
+        except Exception:
+            logger.exception("Relapse audio download for '%s' failed", path)
+            return False
+
+        if len(data) < 1024:
+            return False
+        await asyncio.to_thread(_write_bytes, target_path, data)
+        return True
+
+    async def _relapse_download_cover(self, url: str, target_path: str) -> bool:
+        """Download a cover and prepare the exact square ffmpeg loops.
+
+        The frame is centre-cropped to fill the square and scaled once here,
+        so the encoder has nothing to do per frame. It stays sharp: no blur,
+        and the crop only trims the overflow.
+        """
+        try:
+            async with self.session.get(
+                url, timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                if response.status != 200:
+                    logger.warning(
+                        "Relapse cover download returned HTTP %s", response.status
+                    )
+                    return False
+                data = await response.read()
+        except Exception:
+            logger.exception("Relapse cover download failed")
+            return False
+
+        def _save() -> bool:
+            try:
+                with Image.open(BytesIO(data)) as loaded:
+                    image = loaded.convert("RGB")
+                    width, height = image.size
+                    side = min(width, height)
+                    image = image.crop(
+                        (
+                            (width - side) // 2,
+                            (height - side) // 2,
+                            (width + side) // 2,
+                            (height + side) // 2,
+                        )
+                    )
+                    if side != RELAPSE_VIDEO_SIZE:
+                        image = image.resize(
+                            (RELAPSE_VIDEO_SIZE, RELAPSE_VIDEO_SIZE), Image.LANCZOS
+                        )
+                    image.save(target_path)
+                return True
+            except Exception:
+                logger.exception("Relapse cover could not be decoded")
+                return False
+
+        return await asyncio.to_thread(_save)
+
+    @commands.command(
+        name="relapse",
+        description="Render a whole song as a video over a cover you pick.",
+    )
+    async def relapse(self, ctx: commands.Context, *, query: Optional[str] = None):
+        """Render an entire track playing over the cover you choose.
+
+        Usage: `{prefix}relapse Emotional Overdose` — a search with several
+        hits first asks which song, then lists every cover found for it with a
+        number. Reply with the number and the whole track comes back as an mp4
+        with that cover as the unblurred background.
+        """
+        if not query or not query.strip():
+            await Embeds.custom(
+                ctx,
+                f"Please provide a song name — usage: `{ctx.prefix}relapse <song>`.",
+                title="Error",
+                color=0x36393E,
+                reply=True,
+            )
+            return
+
+        if ctx.author.id in self.relapse_busy:
+            await Embeds.send_warning_embed(
+                ctx.channel,
+                ctx.author,
+                "Your previous full track is still rendering — hang on.",
+            )
+            return
+
+        self.relapse_busy.add(ctx.author.id)
+        try:
+            await self._build_relapse(ctx, query.strip())
+        except Exception:
+            logger.exception("relapse failed for %s", ctx.author.id)
+            await Embeds.send_error_embed(
+                ctx.channel,
+                ctx.author,
+                "Something went wrong while rendering the track. Please try again.",
+            )
+        finally:
+            self.relapse_busy.discard(ctx.author.id)
+
+    async def _build_relapse(self, ctx: commands.Context, query: str) -> None:
+        """Search, choose the song and cover, then render the whole track."""
+        status = await ctx.reply(
+            embed=discord.Embed(description=f"🔍 Searching for **{query}**...")
+        )
+
+        matches = await self._search_songs(query, allow_unsurfaced=False)
+        if matches is None:
+            await self._relapse_paint(
+                status, "❌ Request failed. Please try again later."
+            )
+            return
+
+        songs: dict[str, dict] = {}
+        for song in matches:
+            name = self.get_most_acceptable_track_name(
+                song.get("name") or "Unknown Title"
+            )
+            if name and name not in songs:
+                songs[name] = song
+
+        if not songs:
+            await self._relapse_paint(
+                status, f"❌ I couldn't find a song called **{query}**."
+            )
+            return
+
+        if len(songs) > 1:
+            await self._relapse_paint(
+                status,
+                f"🎵 **{len(songs)}** songs match **{query}** — pick one below.",
+            )
+            view = RelapseSongView(songs, ctx.author.id)
+            chooser = await ctx.reply(
+                embed=discord.Embed(
+                    description=(
+                        f"Multiple **songs** found for **{query}**. Pick one to "
+                        "choose a cover for."
+                    )
+                ),
+                view=view,
+            )
+            await view.wait()
+            view.stop()
+            song = view.select.chosen
+            await self._safe_delete(chooser)
+            if song is None:
+                await self._relapse_paint(
+                    status, "⏱️ Nobody picked a song, so nothing was rendered."
+                )
+                return
+        else:
+            song = next(iter(songs.values()))
+
+        title = self.get_most_acceptable_track_name(
+            song.get("name") or "Unknown Title"
+        )
+        await self._relapse_paint(
+            status, f"🎨 Looking for covers for **{title}**..."
+        )
+        covers = await self._relapse_covers(title, song)
+        if not covers:
+            await self._relapse_paint(
+                status, f"❌ I couldn't find any cover art for **{title}**."
+            )
+            return
+
+        chosen_cover: dict = covers[0]
+        if len(covers) > 1:
+            picker = await ctx.reply(view=relapse_cover_view(title, covers))
+            number = await self._relapse_wait_for_number(ctx, picker, len(covers))
+            if number is None:
+                await self._relapse_paint(
+                    status, "⏱️ No cover was picked, so nothing was rendered."
+                )
+                return
+            chosen_cover = covers[number - 1]
+            await self._safe_delete(picker)
+
+        self.assert_download_cache()
+        base = f"{DOWNLOAD_CACHE_FOLDER_NAME}/{ctx.author.id}_relapse"
+        cover_path = f"{base}_cover.png"
+        audio_path = f"{base}.mp3"
+        output_path = f"{base}.mp4"
+
+        try:
+            await self._relapse_paint(
+                status,
+                f"⬇️ Downloading the **{relapse_cover_label(chosen_cover)}** cover...",
+            )
+            if not await self._relapse_download_cover(
+                chosen_cover["media_url"], cover_path
+            ):
+                await self._relapse_paint(
+                    status, "❌ Couldn't download that cover — run it again."
+                )
+                return
+
+            await self._relapse_paint(status, f"⬇️ Downloading **{title}**...")
+            if not await self._relapse_download_audio(
+                song.get("path") or "", audio_path
+            ):
+                await self._relapse_paint(
+                    status, "❌ Couldn't download the audio for that track."
+                )
+                return
+
+            try:
+                duration = await _probe_audio_duration(audio_path)
+            except Exception:
+                logger.exception("Could not probe the length of '%s'", title)
+                await self._relapse_paint(
+                    status, "❌ Couldn't read the length of that track."
+                )
+                return
+            if duration <= 0:
+                await self._relapse_paint(status, "❌ That track came back empty.")
+                return
+
+            await self._relapse_paint(
+                status,
+                f"🎬 Rendering **{title}** ({relapse_timestamp(duration)}) over "
+                "the cover — I'll ping you when it's done.",
+            )
+            try:
+                await _render_relapse_video(
+                    cover_path,
+                    audio_path,
+                    output_path,
+                    duration,
+                )
+            except Exception:
+                logger.exception("Rendering the full track for '%s' failed", title)
+                await self._relapse_paint(
+                    status, "❌ ffmpeg couldn't render the video."
+                )
+                return
+
+            if not os.path.exists(output_path) or not os.path.getsize(output_path):
+                await self._relapse_paint(
+                    status, "❌ The rendered video came out empty."
+                )
+                return
+
+            limit = getattr(ctx.guild, "filesize_limit", None) or 25 * 1024 * 1024
+            size = os.path.getsize(output_path)
+            if size > limit:
+                await self._relapse_paint(
+                    status,
+                    f"❌ The video is {size / (1024 * 1024):.1f} MB, over this "
+                    f"server's {limit / (1024 * 1024):.0f} MB upload limit.",
+                )
+                return
+
+            clean_name = re.sub(r"[^\w\s-]", "", title).strip()
+            clean_name = re.sub(r"\s+", "_", clean_name) or "relapse"
+            embed = discord.Embed(
+                title=f"🎬 {title}",
+                description=(
+                    f"**Cover**\n{relapse_cover_label(chosen_cover)}\n"
+                    f"**Length**\n`{relapse_timestamp(duration)}` of the full track"
+                ),
+                color=getattr(ctx.author, "color", discord.Color.default()),
+            )
+            embed.set_footer(text="Full track · cover background, no blur")
+
+            await ctx.channel.send(
+                embed=embed,
+                file=discord.File(
+                    output_path, filename=f"{clean_name}_relapse.mp4"
+                ),
+            )
+            await ctx.channel.send(
+                f"{ctx.author.mention} ✅ **{title}** is done — the full track "
+                "is above."
+            )
+            await self._relapse_paint(
+                status, f"✅ Rendered **{title}** ({relapse_timestamp(duration)})."
+            )
+        finally:
+            for path in (cover_path, audio_path, output_path):
+                self.remove_file(path)
 
     def find_pledges_channel(self, guild: discord.Guild):
         channels = []

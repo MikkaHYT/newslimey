@@ -19,6 +19,8 @@ from collections import OrderedDict
 
 import aiohttp
 
+from utils.core.http_session import borrowed
+
 logger = logging.getLogger("slimey.shorten")
 
 #: is.gd without an API key. ``format=simple`` returns the bare short link as
@@ -57,9 +59,11 @@ async def shorten(url: str) -> str:
 async def _request(url: str) -> str | None:
     """Ask is.gd for a short link. ``None`` on any failure."""
     try:
-        async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+        async with borrowed() as session:
             async with session.get(
-                IS_GD_ENDPOINT, params={"format": "simple", "url": url}
+                IS_GD_ENDPOINT,
+                params={"format": "simple", "url": url},
+                timeout=TIMEOUT,
             ) as response:
                 if response.status != 200:
                     logger.warning("is.gd answered HTTP %s", response.status)

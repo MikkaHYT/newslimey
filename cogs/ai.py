@@ -49,7 +49,7 @@ from utils.core.settings import (
 
 logger = logging.getLogger("slimey.ai")
 
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6LnunfgSIcIZjT_P0yCyh4n_SUyFt0aKRhxxvMbTOnAYg")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyA0hmdcmgLpErD0kAaHMJbsni7HYX2ngdE")
 client = genai.Client(api_key=GEMINI_KEY)
 MODEL_ID = "gemini-3.5-flash-lite"
 

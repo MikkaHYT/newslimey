@@ -76,6 +76,10 @@ async def setup_refbot(bot: commands.Bot) -> None:
     except Exception as e:
         logger.warning(f"Failed to preload refbot settings: {e}")
 
+    #: Per-guild command disables, shared by reference so the dashboard can edit
+    #: them live. The slash bridge already reads this mapping.
+    bot.dash_disabled = bot.dash_settings.disabled
+
     try:
         await bot.cache.initialize_settings_cache()
     except Exception as e:

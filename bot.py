@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from utils.cache import Cache
 from utils import refcompat
 from utils.core.economy_scope import install_interaction_scope
+from utils.core.http_session import close_shared_session
 from utils.core.settings import BOT_ADMINS_KEY, COMMAND_LOG_EXCLUDED_KEY
 from utils.core.eras import load_application_emojis
 from utils.security import hash_user_id_analytics as hash_user_id
@@ -756,6 +757,7 @@ class DiscordBot(commands.Bot):
             # of the server the command came from. Slash commands and buttons
             # never reach this hook, so install the hooks that cover them too.
             self.before_invoke(self._apply_economy_scope)
+            self.before_invoke(self._enforce_dashboard_disables)
             install_interaction_scope(self)
             await self._load_bot_admins()
             if self.bot_admin_ids:
@@ -773,6 +775,17 @@ class DiscordBot(commands.Bot):
             await self.load_cogs()
             self.logger.info("Cog loading stage completed successfully.")
             self.logger.info("-------------------")
+            self.logger.info("Starting the web dashboard...")
+            try:
+                from web.server import start_dashboard
+
+                await start_dashboard(self)
+                self.logger.info(
+                    f"Dashboard ready on port {getattr(self, 'dashboard_port', 25565)}"
+                )
+            except Exception as e:
+                # A dashboard failure must never stop the bot from running.
+                self.logger.error(f"Failed to start the web dashboard: {e}")
             self.logger.info("Caching application emojis...")
             await load_application_emojis(self)
             self.logger.info("-------------------")
@@ -1019,6 +1032,25 @@ class DiscordBot(commands.Bot):
             return True
         except Exception as e:
             return _fail("unexpected guardrail error", e)
+
+    async def _enforce_dashboard_disables(self, ctx: Context) -> None:
+        """Refuse commands a server's dashboard turned off.
+
+        The list lives in ``bot_settings`` under ``disabled_commands`` and is
+        mirrored onto ``bot.dash_disabled`` by the refbot compatibility layer,
+        so a dashboard write takes effect on the next invocation.
+        """
+        if ctx.guild is None or ctx.command is None:
+            return
+        disabled = getattr(self, "dash_disabled", {}).get(ctx.guild.id, ())
+        if ctx.command.qualified_name in disabled:
+            await Embeds.error(
+                ctx,
+                f"`{ctx.command.qualified_name}` is disabled on this server.",
+                delete_after=6,
+                reply=True,
+            )
+            raise commands.CheckFailure("disabled on this server from the dashboard")
 
     async def _apply_economy_scope(self, ctx: Context) -> None:
         """Run this command against the economy scope its server uses.
@@ -1905,6 +1937,12 @@ class DiscordBot(commands.Bot):
             return
 
     async def close(self) -> None:
+        try:
+            from web.server import stop_dashboard
+
+            await stop_dashboard(self)
+        except Exception as e:
+            self.logger.warning(f"Stopping the web dashboard failed: {e}")
         if self._command_log_task is not None:
             self._command_log_task.cancel()
             try:
@@ -1926,6 +1964,12 @@ class DiscordBot(commands.Bot):
         except Exception as e:
             self.logger.warning(f"Closing the database failed: {e}")
         await refcompat.teardown_refbot(self)
+        # The shared HTTP pool outlives every command, so it has to be closed
+        # here or a reloaded bot leaves its sockets behind.
+        try:
+            await close_shared_session()
+        except Exception as e:
+            self.logger.warning(f"Closing the shared HTTP session failed: {e}")
         await super().close()
 
 

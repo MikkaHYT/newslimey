@@ -1,4 +1,4 @@
-from .base import BaseManager
+from .base import BaseManager, _CACHE_MISS
 
 from sqlalchemy.future import select
 from sqlalchemy import update, delete
@@ -763,9 +763,19 @@ class CoreMixin(BaseManager):
                     settings = ServerSettings(guild_id=guild_id, prefix=prefix)
                     session.add(settings)
                 await session.commit()
+        self._cache_set(("prefix", guild_id), prefix or "!")
 
     async def get_prefix(self, guild_id: int) -> str:
-        """Retrieve the prefix for a specific guild from the database."""
+        """Retrieve the prefix for a specific guild.
+
+        discord.py resolves the prefix for every message in every guild, so the
+        answer is memoised; :meth:`set_prefix` refreshes it.
+        """
+        cache_key = ("prefix", guild_id)
+        cached = self._cache_get(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
         # Fast-fail during known outages; discord.py calls this for every message,
         # so a hanging lookup can saturate the asyncio thread pool and freeze the bot.
         if not await self.db_ready():
@@ -776,7 +786,9 @@ class CoreMixin(BaseManager):
                     select(ServerSettings.prefix).where(ServerSettings.guild_id == guild_id)
                 )
                 prefix = result.scalar_one_or_none()
-            return prefix if prefix else "!"
+            prefix = prefix if prefix else "!"
+            self._cache_set(cache_key, prefix)
+            return prefix
         except Exception as exc:
             if self._is_retryable_db_error(exc):
                 await self._mark_db_unhealthy()

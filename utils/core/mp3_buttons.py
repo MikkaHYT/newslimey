@@ -23,6 +23,8 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 import discord
 
+from utils.core.http_session import borrowed
+
 logger = logging.getLogger("slimey.mp3buttons")
 
 #: Per-server: pressing an mp3 download button attaches the file instead of
@@ -128,8 +130,8 @@ async def _download(url: str) -> bytes:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(url) as response:
+    async with borrowed() as session:
+        async with session.get(url, timeout=timeout, headers=headers) as response:
             response.raise_for_status()
             if response.content_length and response.content_length > MAX_DOWNLOAD_BYTES:
                 raise _TooLarge

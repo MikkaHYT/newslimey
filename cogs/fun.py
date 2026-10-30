@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands import Context
 from utils.misc import MiscUtils
+from utils.core.http_session import borrowed
 from utils.cooldown import unified_cooldown
 from utils.embeds import Embeds
 from utils.guardrails import check_slash_guardrails
@@ -118,7 +119,7 @@ class Fun(commands.Cog, name="Fun"):
         url = "https://api.api-ninjas.com/v1/facts"
         headers = {"X-Api-Key": self.api_key}
 
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url, headers=headers) as request:
                 if request.status == 200:
                     data = await request.json()
@@ -158,7 +159,7 @@ class Fun(commands.Cog, name="Fun"):
         """Get a random fact of the day."""
         url = "https://uselessfacts.jsph.pl/api/v2/facts/today?language=en"
 
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as response:
                 if response.status != 200:
                     await Embeds.error(ctx, "There was a problem contacting the Useless Facts API. Please try again later.", title="Error!", reply=True)
@@ -198,7 +199,7 @@ class Fun(commands.Cog, name="Fun"):
     async def dog(self, ctx: commands.Context):
         """Get a random dog photo."""
         url = "https://random.dog/woof.json"
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -211,7 +212,7 @@ class Fun(commands.Cog, name="Fun"):
     async def cat(self, ctx: commands.Context):
         """Get a random cat photo."""
         url = "https://api.thecatapi.com/v1/images/search"
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -224,7 +225,7 @@ class Fun(commands.Cog, name="Fun"):
     async def fox(self, ctx: commands.Context):
         """Get a random fox photo."""
         url = "https://randomfox.ca/floof/"
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -236,7 +237,7 @@ class Fun(commands.Cog, name="Fun"):
     async def penguin(self, ctx: commands.Context):
         """Get a random penguin photo."""
         url = "https://penguin.sjsharivker.workers.dev/api"
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -253,7 +254,7 @@ class Fun(commands.Cog, name="Fun"):
     async def duck(self, ctx: commands.Context):
         """Get a random duck photo."""
         url = "https://random-d.uk/api/v2/random"
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()

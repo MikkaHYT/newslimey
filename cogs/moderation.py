@@ -1,5 +1,7 @@
 import re
 import io
+import json
+import time
 import discord
 import logging
 import asyncio
@@ -41,6 +43,39 @@ INVITE_LINK_PATTERN = re.compile(
 #: Reason recorded on invite-link jails.
 INVITE_JAIL_REASON = "Posted a Discord invite link"
 
+#: ``bot_settings`` key holding, per guild, the ``view_channel`` values that
+#: ``hide`` replaced. ``unhide`` reads it back so a channel is restored exactly
+#: as it was rather than guessed at.
+HIDDEN_CHANNELS_KEY = "hidden_channels"
+
+
+async def _load_hidden_channels(bot, guild_id: int) -> dict[str, dict[str, Any]]:
+    """Read the per-guild hide snapshots (``{channel_id: {target_id: value}}``)."""
+    raw = await bot.db.fetchval(
+        "SELECT value FROM bot_settings WHERE guild_id = ? AND key = ?;",
+        guild_id,
+        HIDDEN_CHANNELS_KEY,
+    )
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _save_hidden_channels(
+    bot, guild_id: int, snapshots: dict[str, dict[str, Any]]
+) -> None:
+    await bot.db.execute(
+        "INSERT INTO bot_settings (guild_id, key, value) VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id, key) DO UPDATE SET value = excluded.value;",
+        guild_id,
+        HIDDEN_CHANNELS_KEY,
+        json.dumps(snapshots),
+    )
+
 
 def _bot_admin_or_manage_messages() -> Any:
     """Allow bot admins anywhere, or anyone with Manage Messages.
@@ -70,6 +105,11 @@ class Moderation(commands.Cog, name="Moderation"):
         self.bot = bot
         if not hasattr(self.bot, "forced_nicks"):
             self.bot.forced_nicks = {}  # (guild_id, user_id) -> forced nickname
+        #: (guild_id, target_id) -> (moderator_id, name, monotonic time). The
+        #: server-log cog reads this because the audit log can only attribute
+        #: an action to the bot, and can lag behind the gateway event.
+        if not hasattr(self.bot, "mod_action_hints"):
+            self.bot.mod_action_hints = {}
         self.utils = MiscUtils(self)
         self.lockdown_channels = []
         self.new_members = []
@@ -87,12 +127,49 @@ class Moderation(commands.Cog, name="Moderation"):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await check_slash_guardrails(self, interaction)
 
+    def _remember_moderator(self, guild, target, moderator) -> None:
+        """Record who ran a moderation command, for the server-log's `By` line."""
+        target_id = getattr(target, "id", None)
+        if guild is None or target_id is None or moderator is None:
+            return
+        hints = getattr(self.bot, "mod_action_hints", None)
+        if hints is None:
+            hints = self.bot.mod_action_hints = {}
+        now = time.monotonic()
+        for key, value in list(hints.items()):
+            if now - value[2] > 300:
+                hints.pop(key, None)
+        hints[(guild.id, int(target_id))] = (
+            getattr(moderator, "id", 0),
+            getattr(moderator, "display_name", str(moderator)),
+            now,
+        )
+
+    async def _log_jail(self, guild, member, **kwargs) -> None:
+        """Send a jail/release card to the logs cog's `jails` channel."""
+        serverlogs = self.bot.get_cog("ServerLogs")
+        if serverlogs is None:
+            return
+        try:
+            await serverlogs.log_jail(guild, member, **kwargs)
+        except Exception:
+            logger.exception("Could not post a jail log in guild %s", getattr(guild, "id", None))
+
     async def _get_settings(self, guild: discord.Guild):
         """Fetch channel_id and name template from DB (fallbacks included)."""
         channel_id = await self.bot.database.get_member_count_channel(guild.id)
 
         template = "Members: {count:,}"
         return channel_id, template
+
+    @staticmethod
+    def _human_count(guild: discord.Guild) -> int:
+        """Members who are not bots -- what the count channel reports.
+
+        ``guild.member_count`` includes bots, so it is not usable here; the
+        member cache is complete because the bot runs with the members intent.
+        """
+        return sum(1 for member in guild.members if not member.bot)
 
     async def _ensure_channel(self, guild: discord.Guild, template: str):
         """If channel missing, recreate it and save to DB."""
@@ -101,9 +178,11 @@ class Moderation(commands.Cog, name="Moderation"):
             ch = guild.get_channel(channel_id)
             if ch:
                 return ch
-        name = template.format(count=guild.member_count)
+        name = template.format(count=self._human_count(guild))
         overwrites = {guild.default_role: discord.PermissionOverwrite(connect=False)}
-        vc = await guild.create_voice_channel(name=name, overwrites=overwrites)
+        vc = await guild.create_voice_channel(
+            name=name, overwrites=overwrites, position=0
+        )
         await self.bot.database.set_member_count_channel(guild.id, vc.id)
         return vc
 
@@ -114,9 +193,14 @@ class Moderation(commands.Cog, name="Moderation"):
         vc = guild.get_channel(channel_id)
         if not isinstance(vc, discord.VoiceChannel):
             vc = await self._ensure_channel(guild, template)
-        new_name = template.format(count=guild.member_count)
+        new_name = template.format(count=self._human_count(guild))
         if vc.name != new_name:
-            await vc.edit(name=new_name, reason="Member count auto-sync")
+            # Renames are rate limited to a couple per ten minutes; a busy join
+            # wave can trip that, and the next member/periodic sync catches up.
+            try:
+                await vc.edit(name=new_name, reason="Member count auto-sync")
+            except discord.HTTPException:
+                pass
 
     def _get_mcc_embed(
         self,
@@ -162,6 +246,16 @@ class Moderation(commands.Cog, name="Moderation"):
                 await member.edit(nick=forced_nick, reason="Re-applying forced nickname after rejoin")
             except (discord.Forbidden, discord.HTTPException):
                 pass
+
+        # Keep the live count channel current instead of waiting for the
+        # ten-minute sweep. Bots don't change the human count.
+        if not member.bot:
+            await self._update_channel(member.guild)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member):
+        if not member.bot:
+            await self._update_channel(member.guild)
 
     async def _check_command_exists(self, command_name: str):
         """
@@ -253,8 +347,9 @@ class Moderation(commands.Cog, name="Moderation"):
             embed=self._get_mcc_embed(
                 title="✅ Member Count Channel Created",
                 description=(
-                    f"Created {vc.mention}. It will automatically update as members join and leave.\n\n"
-                    f"Current count: **{ctx.guild.member_count:,}**"
+                    f"Created {vc.mention} at the top of the channel list. It shows how many "
+                    f"humans (bots excluded) are in the server and updates as they join and leave.\n\n"
+                    f"Current count: **{self._human_count(ctx.guild):,}**"
                 ),
                 color=discord.Color.green(),
             ),
@@ -293,7 +388,7 @@ class Moderation(commands.Cog, name="Moderation"):
         await self.bot.database.set_member_count_channel(ctx.guild.id, channel.id)
         try:
             await channel.edit(
-                name=f"Members: {ctx.guild.member_count:,}",
+                name=f"Members: {self._human_count(ctx.guild):,}",
                 reason=f"Set as member count channel by {ctx.author}",
             )
         except discord.Forbidden:
@@ -311,7 +406,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 title="✅ Member Count Channel Set",
                 description=(
                     f"Now using {channel.mention} as the member count channel.\n\n"
-                    f"Current count: **{ctx.guild.member_count:,}**"
+                    f"Current count: **{self._human_count(ctx.guild):,}**"
                 ),
                 color=discord.Color.green(),
             ),
@@ -448,7 +543,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 f"**Channel:** {vc.mention}\n"
                 f"**Name:** `{vc.name}`\n"
                 f"**ID:** `{vc.id}`\n"
-                f"**Current member count:** {ctx.guild.member_count:,}"
+                f"**Current human count:** {self._human_count(ctx.guild):,}"
             )
             color = discord.Color.green()
         else:
@@ -1100,6 +1195,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 except:
                     await Embeds.error(ctx, f"Could not send user a DM message!")
 
+                self._remember_moderator(ctx.guild, member, ctx.author)
                 await member.kick(reason=reason)
             except Exception as e:
                 embed = discord.Embed(
@@ -1234,6 +1330,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 )
                 await ctx.reply(embed=embed)
 
+            self._remember_moderator(ctx.guild, member, ctx.author)
             await ctx.guild.ban(member, reason=reason, delete_message_seconds=0)
             return case_id
 
@@ -1380,6 +1477,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 "Invalid duration format. Use like `15m`, `2h`, `1d`, etc."
             )
 
+        self._remember_moderator(ctx.guild, member, ctx.author)
         await member.ban(reason=reason)
 
         await self.bot.database.log_punishment_command(
@@ -1739,6 +1837,7 @@ class Moderation(commands.Cog, name="Moderation"):
                 duration=int(seconds),
             )
 
+            self._remember_moderator(ctx.guild, member, ctx.author)
             await member.edit(timed_out_until=timeout_until)
 
             embed = discord.Embed(
@@ -1802,6 +1901,7 @@ class Moderation(commands.Cog, name="Moderation"):
             return await Embeds.error(ctx, f"{ctx.author.mention}: {member.name} is not timed out.", reply=False)
 
         try:
+            self._remember_moderator(ctx.guild, member, ctx.author)
             await member.edit(timed_out_until=None)
             await Embeds.info(ctx, f"{ctx.author.mention}: {member.name} is no longer timed out.", reply=False)
 
@@ -2346,6 +2446,14 @@ class Moderation(commands.Cog, name="Moderation"):
         except (discord.Forbidden, discord.HTTPException):
             logger.debug("Could not announce a jail in %s", guild.id)
 
+        await self._log_jail(
+            guild,
+            member,
+            moderator=actor,
+            reason=reason,
+            duration_seconds=duration_seconds,
+        )
+
         if duration_seconds:
             asyncio.create_task(self._auto_unjail(guild.id, member.id, duration_seconds))
 
@@ -2392,6 +2500,15 @@ class Moderation(commands.Cog, name="Moderation"):
                 punishment_type=PunishmentType.UNJAIL,
                 reason="Jail expired",
                 duration=None,
+            )
+
+            await self._log_jail(
+                guild,
+                member,
+                moderator=self.bot.user,
+                reason="Jail expired",
+                released=True,
+                automatic=True,
             )
 
             channel = guild.get_channel(jail_settings.jail_channel_id)
@@ -2499,6 +2616,14 @@ class Moderation(commands.Cog, name="Moderation"):
             description=description, color=discord.Color.blurple()
         )
         await ctx.reply(embed=confirm_embed)
+
+        await self._log_jail(
+            ctx.guild,
+            member,
+            moderator=ctx.author,
+            reason="Released from jail",
+            released=True,
+        )
 
         try:
             announce_embed = discord.Embed(
@@ -3977,6 +4102,194 @@ class Moderation(commands.Cog, name="Moderation"):
         overwrite.create_private_threads = None
         await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
         await ctx.send(f"🔓 Unlocked {channel.mention}.")
+
+    @staticmethod
+    def _view_allow_targets(
+        channel: discord.abc.GuildChannel,
+    ) -> list[tuple[discord.Role | discord.Member, discord.PermissionOverwrite]]:
+        """Overwrites that explicitly allow View Channel, minus the bot's own.
+
+        A role or member allow outranks the ``@everyone`` deny, so each of these
+        has to be denied too or the channel stays visible to whoever holds it.
+        The bot's own roles and member overwrite are left alone: it has to keep
+        seeing the channel to be able to undo this afterwards.
+        """
+        me = channel.guild.me
+        own_roles = {role.id for role in me.roles} if me is not None else set()
+
+        targets = []
+        for target, overwrite in channel.overwrites.items():
+            if overwrite.view_channel is not True:
+                continue
+            if isinstance(target, discord.Member):
+                if me is not None and target.id == me.id:
+                    continue
+            elif isinstance(target, discord.Role):
+                if target.id in own_roles:
+                    continue
+            else:
+                # Cache miss: the role or member no longer resolves, so it
+                # cannot be edited through the API.
+                continue
+            targets.append((target, channel.overwrites_for(target)))
+        return targets
+
+    @staticmethod
+    def _overwrite_target(
+        guild: discord.Guild, target_id: int
+    ) -> discord.Role | discord.Member | None:
+        if target_id == guild.default_role.id:
+            return guild.default_role
+        return guild.get_role(target_id) or guild.get_member(target_id)
+
+    @commands.command(name="hide", description="Hides a channel from every member.")
+    @commands.guild_only()
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_channels=True))
+    @commands.bot_has_permissions(manage_channels=True, manage_roles=True)
+    async def hide_channel(
+        self,
+        ctx: Context,
+        channel: discord.abc.GuildChannel = None,
+        *,
+        reason: str = "No reason provided",
+    ):
+        """Hide a channel from every member.
+
+        Denying ``@everyone`` is not enough on its own: a role or member
+        overwrite that allows View Channel beats that deny, so those are denied
+        as well. Whatever each overwrite held is recorded first, so ``unhide``
+        can put it back exactly.
+
+        Only the bot keeps access, through an explicit member allow: the deny
+        applies to bots too, and losing sight of the channel would stop it
+        answering here or restoring anything later. Administrators also keep
+        access, because Administrator bypasses channel overwrites entirely.
+        """
+        channel = channel or ctx.channel
+        guild = ctx.guild
+        everyone = channel.overwrites_for(guild.default_role)
+
+        allowed = self._view_allow_targets(channel)
+        if everyone.view_channel is False and not allowed:
+            await ctx.send(f"🙈 {channel.mention} is already hidden.")
+            return
+
+        # (target, overwrite, value to set). The bot's allow goes first so it
+        # never loses the channel, not even between two API calls.
+        targets: list[tuple[Any, discord.PermissionOverwrite, bool | None]] = []
+        me = guild.me
+        if me is not None:
+            bot_overwrite = channel.overwrites_for(me)
+            if bot_overwrite.view_channel is not True:
+                targets.append((me, bot_overwrite, True))
+        targets.append((guild.default_role, everyone, False))
+        targets.extend((target, overwrite, False) for target, overwrite in allowed)
+
+        snapshots = await _load_hidden_channels(self.bot, guild.id)
+        entry = snapshots.setdefault(str(channel.id), {})
+
+        changed = 0
+        for target, overwrite, value in targets:
+            entry.setdefault(str(target.id), overwrite.view_channel)
+            overwrite.view_channel = value
+            try:
+                await channel.set_permissions(
+                    target, overwrite=overwrite, reason=reason
+                )
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not hide %s from %s in %s",
+                    channel,
+                    target,
+                    guild,
+                    exc_info=True,
+                )
+                continue
+            changed += 1
+
+        await _save_hidden_channels(self.bot, guild.id, snapshots)
+
+        if not changed:
+            await ctx.send(
+                f"🚫 I could not hide {channel.mention} — check my permissions."
+            )
+            return
+        await ctx.send(
+            f"🙈 Hid {channel.mention} from every member. "
+            "Administrators can still see it."
+        )
+
+    @commands.command(
+        name="unhide", description="Makes a hidden channel visible again."
+    )
+    @commands.guild_only()
+    @commands.check_any(commands.is_owner(), commands.has_permissions(manage_channels=True))
+    @commands.bot_has_permissions(manage_channels=True, manage_roles=True)
+    async def unhide_channel(
+        self, ctx: Context, channel: discord.abc.GuildChannel = None
+    ):
+        """Undo ``hide`` by restoring the overwrites it replaced."""
+        channel = channel or ctx.channel
+        guild = ctx.guild
+
+        snapshots = await _load_hidden_channels(self.bot, guild.id)
+        entry = snapshots.pop(str(channel.id), None)
+
+        if not entry:
+            # No snapshot: either the channel was hidden by hand or the record
+            # is gone. The ``@everyone`` deny is what closes it, so clear that
+            # and leave every other overwrite untouched.
+            overwrite = channel.overwrites_for(guild.default_role)
+            if overwrite.view_channel is not False:
+                await ctx.send(f"👀 {channel.mention} is not hidden.")
+                return
+            overwrite.view_channel = None
+            await channel.set_permissions(
+                guild.default_role, overwrite=overwrite, reason="Channel unhidden"
+            )
+            await ctx.send(f"👀 Made {channel.mention} visible again.")
+            return
+
+        failed: dict[str, Any] = {}
+        restored = 0
+        for target_id, value in entry.items():
+            target = self._overwrite_target(guild, int(target_id))
+            if target is None:
+                failed[target_id] = value
+                continue
+
+            overwrite = channel.overwrites_for(target)
+            overwrite.view_channel = value
+            allow, deny = overwrite.pair()
+            try:
+                if allow.value == 0 and deny.value == 0:
+                    # Nothing left in the overwrite: drop it instead of leaving
+                    # an empty one behind.
+                    await channel.set_permissions(target, overwrite=None)
+                else:
+                    await channel.set_permissions(target, overwrite=overwrite)
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not restore %s on %s in %s",
+                    target,
+                    channel,
+                    guild,
+                    exc_info=True,
+                )
+                failed[target_id] = value
+                continue
+            restored += 1
+
+        if failed:
+            snapshots[str(channel.id)] = failed
+        await _save_hidden_channels(self.bot, guild.id, snapshots)
+
+        if not restored:
+            await ctx.send(
+                f"🚫 I could not make {channel.mention} visible — check my permissions."
+            )
+            return
+        await ctx.send(f"👀 Made {channel.mention} visible again.")
 
     @commands.group(
         name="lockdownset",

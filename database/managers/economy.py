@@ -465,6 +465,7 @@ class EconomyMixin(BaseManager):
                     .where(Job.last_worked.is_not(None))
                     .values(last_worked=None)
                 )
+        self._cache_invalidate("cooldown")
         return {
             "command_cooldowns": commands.rowcount or 0,
             "item_cooldowns": items.rowcount or 0,

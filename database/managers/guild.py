@@ -1,4 +1,4 @@
-from .base import BaseManager, db_safe
+from .base import BaseManager, db_safe, _CACHE_MISS
 
 from sqlalchemy.future import select
 from sqlalchemy import update, delete
@@ -17,6 +17,7 @@ from ..models import (
     StickyMessage,
 )
 from datetime import timedelta
+import time
 import discord
 import logging
 
@@ -257,26 +258,43 @@ class GuildMixin(BaseManager):
     async def set_command_status(
         self, command_name: str, enabled: bool, channel_id: int = None, guild_id: int = None
     ) -> None:
+        """Create or update the override for one command scope.
+
+        ``channel_id``/``guild_id`` are NULL for the bot-wide and channel-scoped
+        rows, and SQL's ``= NULL`` never matches, so the old lookup could only
+        ever insert: toggling a global command twice left two rows behind. The
+        update below uses ``IS NULL`` and rewrites every row for the scope, so
+        such duplicates collapse back to one answer.
+        """
+        conditions = [CommandStatus.command_name == command_name]
+        conditions.append(
+            CommandStatus.channel_id == channel_id
+            if channel_id
+            else CommandStatus.channel_id.is_(None)
+        )
+        conditions.append(
+            CommandStatus.guild_id.is_(None)
+            if guild_id is None
+            else CommandStatus.guild_id == guild_id
+        )
+
         async with self.get_session() as session:
             async with session.begin():
                 result = await session.execute(
-                    select(CommandStatus).where(
-                        CommandStatus.command_name == command_name,
-                        CommandStatus.channel_id == channel_id,
-                        CommandStatus.guild_id == guild_id,
-                    )
+                    update(CommandStatus)
+                    .where(*conditions)
+                    .values(enabled=enabled)
                 )
-                command_status = result.scalar_one_or_none()
-                if command_status:
-                    command_status.enabled = enabled
-                else:
-                    new_status = CommandStatus(
-                        command_name=command_name,
-                        enabled=enabled,
-                        channel_id=channel_id,
-                        guild_id=guild_id,
+                if not result.rowcount:
+                    session.add(
+                        CommandStatus(
+                            command_name=command_name,
+                            enabled=enabled,
+                            channel_id=channel_id,
+                            guild_id=guild_id,
+                        )
                     )
-                    session.add(new_status)
+        self._invalidate_command_status(command_name)
 
     @db_safe(default=True)
     async def get_command_status(
@@ -288,26 +306,14 @@ class GuildMixin(BaseManager):
         - channel_id set, guild_id None  -> channel-scoped row
         - channel_id None, guild_id None -> bot-wide row
         - channel_id None, guild_id set  -> per-guild serverwide row
+
+        Answered from the in-memory snapshot of overrides, so the hot path is a
+        dict lookup rather than a query per scope per command.
         """
-        async with self.async_sessionmaker() as session:
-            query = select(CommandStatus).filter_by(
-                command_name=command_name,
-            )
-
-            if channel_id:
-                query = query.filter_by(channel_id=channel_id)
-            else:
-                query = query.filter(CommandStatus.channel_id.is_(None))
-
-            if guild_id is None:
-                query = query.filter(CommandStatus.guild_id.is_(None))
-            else:
-                query = query.filter(CommandStatus.guild_id == guild_id)
-
-            result = await session.execute(query)
-            status = result.scalars().first()
-
-            return status.enabled if status else True
+        snapshot = await self._command_status_snapshot()
+        key = (command_name, channel_id if channel_id else None, guild_id)
+        value = snapshot.get(key)
+        return True if value is None else value
 
     @db_safe(default=None)
     async def get_command_status_explicit(
@@ -319,22 +325,9 @@ class GuildMixin(BaseManager):
         which a forced server-wide enable needs in order to take precedence over
         per-channel disables.
         """
-        async with self.async_sessionmaker() as session:
-            query = select(CommandStatus.enabled).filter_by(
-                command_name=command_name,
-            )
-            if channel_id:
-                query = query.filter(CommandStatus.channel_id == channel_id)
-            else:
-                query = query.filter(CommandStatus.channel_id.is_(None))
-            if guild_id is None:
-                query = query.filter(CommandStatus.guild_id.is_(None))
-            else:
-                query = query.filter(CommandStatus.guild_id == guild_id)
-
-            result = await session.execute(query)
-            value = result.scalars().first()
-            return None if value is None else bool(value)
+        snapshot = await self._command_status_snapshot()
+        key = (command_name, channel_id if channel_id else None, guild_id)
+        return snapshot.get(key)
 
     async def clear_channel_command_statuses(
         self, command_name: str, channel_ids: list[int]
@@ -355,6 +348,7 @@ class GuildMixin(BaseManager):
                         CommandStatus.channel_id.in_(channel_ids),
                     )
                 )
+                self._invalidate_command_status(command_name)
                 return result.rowcount or 0
 
     @db_safe(default=[])
@@ -395,12 +389,14 @@ class GuildMixin(BaseManager):
                 )
             )
             await session.commit()
+        self._cache_invalidate("cooldown")
 
     async def clear_all_cooldowns(self):
         """Wipes all cooldowns from the database."""
         async with self.async_sessionmaker() as session:
             await session.execute(delete(CommandCooldown))
             await session.commit()
+        self._cache_invalidate("cooldown")
 
     async def set_cooldown(
         self, user_id: int, command_name: str, cooldown_seconds: int
@@ -446,10 +442,24 @@ class GuildMixin(BaseManager):
                                 cooldown_expiry=expiry_time,
                             )
                         )
+        self._cache_set(
+            ("cooldown", user_hash, command_name),
+            time.monotonic() + float(cooldown_seconds),
+        )
 
     async def get_cooldown(self, user_id: int, command_name: str) -> float:
-        """Returns the remaining cooldown time in seconds. Returns 0 if expired or not found."""
+        """Returns the remaining cooldown time in seconds. Returns 0 if expired or not found.
+
+        Cooldowns are only ever written by :meth:`set_cooldown` in this process,
+        so an expiry memo answers the check without a read. It is seeded from the
+        database on the first check after a restart and refreshed by every write.
+        """
         user_id = self.hash_user_id(user_id)
+        cache_key = ("cooldown", user_id, command_name)
+        deadline = self._cache_get(cache_key)
+        if deadline is not _CACHE_MISS:
+            return max(0.0, deadline - time.monotonic())
+
         async with self.async_sessionmaker() as session:
             result = await session.execute(
                 select(CommandCooldown).filter_by(
@@ -460,6 +470,7 @@ class GuildMixin(BaseManager):
             cooldown = result.scalar_one_or_none()
 
             if not cooldown:
+                self._cache_set(cache_key, time.monotonic())
                 return 0
 
             now = discord.utils.utcnow()
@@ -467,10 +478,12 @@ class GuildMixin(BaseManager):
                 # Cooldown expired, clean it up
                 await session.delete(cooldown)
                 await session.commit()
+                self._cache_set(cache_key, time.monotonic())
                 return 0
 
-            remaining_time = (cooldown.cooldown_expiry - now).total_seconds()
-            return max(0, remaining_time)
+            remaining_time = max(0.0, (cooldown.cooldown_expiry - now).total_seconds())
+            self._cache_set(cache_key, time.monotonic() + remaining_time)
+            return remaining_time
 
     async def add_command_role_restriction(
         self, guild_id: int, command_name: str, role_id: int
@@ -494,6 +507,7 @@ class GuildMixin(BaseManager):
                         guild_id=guild_id, command_name=command_name, role_id=role_id
                     )
                     session.add(restriction)
+        self._invalidate_role_restrictions()
 
     async def remove_command_role_restriction(
         self, guild_id: int, command_name: str, role_id: int
@@ -510,7 +524,8 @@ class GuildMixin(BaseManager):
                         CommandRoleRestriction.role_id == role_id,
                     )
                 )
-                return result.rowcount > 0
+        self._invalidate_role_restrictions()
+        return result.rowcount > 0
 
     async def get_command_restrictions(self, guild_id: int):
         """Get all command restrictions for a guild."""
@@ -535,41 +550,29 @@ class GuildMixin(BaseManager):
                         CommandRoleRestriction.guild_id == guild_id
                     )
                 )
-                return result.rowcount
+        self._invalidate_role_restrictions()
+        return result.rowcount
 
     @db_safe(default=False)
     async def check_command_role_restriction(
         self, guild_id: int, command_name: str, user_roles: list
     ) -> bool:
         """Check if a user has permission to use a restricted command."""
-        from ..models import CommandRoleRestriction
+        # A command with no restrictions is open to everyone; that is the
+        # common case and needs no per-user work at all.
+        restrictions = await self._role_restriction_snapshot()
+        required_role_ids = restrictions.get((guild_id, command_name))
+        if not required_role_ids:
+            return True
 
-        async with self.async_sessionmaker() as session:
-            result = await session.execute(
-                select(CommandRoleRestriction).where(
-                    CommandRoleRestriction.guild_id == guild_id,
-                    CommandRoleRestriction.command_name == command_name,
-                )
-            )
-            restrictions = result.scalars().all()
+        user_role_ids = set()
+        for role in user_roles:
+            if hasattr(role, "id"):
+                user_role_ids.add(role.id)
+            elif isinstance(role, int):
+                user_role_ids.add(role)
 
-            if not restrictions:
-                return True
-
-            user_role_ids = []
-            for role in user_roles:
-                if hasattr(role, "id"):
-                    user_role_ids.append(role.id)
-                elif isinstance(role, int):
-                    user_role_ids.append(role)
-
-            required_role_ids = [restriction.role_id for restriction in restrictions]
-
-            has_permission = any(
-                role_id in user_role_ids for role_id in required_role_ids
-            )
-
-            return has_permission
+        return not user_role_ids.isdisjoint(required_role_ids)
 
     async def add_jtc_setup(self, guild_id: int, jtc_channel_id: int):
         """Save JTC setup for a server. Prevent duplicate setups."""
@@ -584,6 +587,28 @@ class GuildMixin(BaseManager):
             session.add(setting)
             await session.commit()
             return True
+
+    async def set_jtc_channel(self, guild_id: int, jtc_channel_id: int):
+        """Point ``guild_id``'s Join To Create system at ``jtc_channel_id``.
+
+        Creates the row when there is none, and replaces the hub of an existing
+        setup. Returns ``True`` when a new setup was created.
+        """
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                select(JTCSettings).where(JTCSettings.guild_id == guild_id)
+            )
+            setting = result.scalar_one_or_none()
+            if setting is None:
+                session.add(
+                    JTCSettings(guild_id=guild_id, jtc_channel_id=jtc_channel_id)
+                )
+                await session.commit()
+                return True
+
+            setting.jtc_channel_id = jtc_channel_id
+            await session.commit()
+            return False
 
     async def get_jtc_channels(self, guild_id: int):
         """Retrieve the JTC channel IDs for a guild."""

@@ -60,6 +60,21 @@ Docker run --env-file .env --name tpnebot --restart unless-stopped tpnebot:lates
 ```
 Note: Ensure Postgres hostname inside URL references service name or external host.
 
+## Optional: Live VC AI (`cogs/vcai.py`)
+- `,vcai join` puts the AI in a voice channel: it transcribes every speaker on their own Deepgram stream, answers out loud through Fish Audio, and follows the same `aiprompt` rules as the text AI.
+- It needs `DEEPGRAM_API_KEY` in the environment (same place the other secrets live). Without it `,vcai join` refuses to start and says so; the text AI is unaffected.
+- Receiving audio is done in-process (RTP decrypt in `utils/core/voice_receive.py`), so the host needs `libopus` and `ffmpeg` — the same pair voice playback already requires. E2EE voice channels only work when `dave_session` can decrypt the frame, and are skipped otherwise.
+- Every finished sentence is its own Fish Audio request and every speaker keeps one Deepgram websocket open, so both are billed per minute (or per request) for as long as the AI stays in the call. `,vcai leave` ends it.
+
+## Web dashboard (`web/`)
+- The bot serves its own dashboard on port **25565** from inside the bot process, so it always shows live Discord state and actions go through the bot's own client. Nothing extra to start: `python bot.py` brings it up, and a failure to bind the port is logged without stopping the bot.
+- Set `DASHBOARD_PASSWORD` next to `TOKEN` in the environment. That one password unlocks every server's panel. If it is missing, the dashboard generates a random password for that run and prints it in the log — set the variable to keep a password of your own.
+- Optional knobs: `DASHBOARD_HOST` (default `0.0.0.0`) and `DASHBOARD_PORT` (default `25565`).
+- The session is a signed, HttpOnly cookie valid for seven days; five wrong passwords from one address lock that address out for a minute. Nobody can reach any `/api/*` route without it.
+- Panels: overview, live chat (send messages, upload up to ten files per message, inline images/gifs/video/audio), members (nicknames, roles, timeout/kick/ban), moderation cases and bans, per-server command toggles and maintenance, and server settings (AI prompt and limits, welcome card, logging channels, radio, song of the day, anti-nuke, honeypot, plus a raw JSON editor for anything else). Bot-wide switches live behind the gear in the sidebar.
+- The chat is a Discord-like front end, not a bridge: messages sent from it post as the bot. It updates live over a websocket (`/ws`) fed by the bot's gateway events.
+- In Docker, publish the port (`-p 25565:25565`). Do not expose it to the internet without TLS in front of it — the password crosses the wire in plain HTTP otherwise.
+
 ## Optional: Local Vocal Separation (Karaoke)
 - Karaoke plays a real instrumental when one can be made. `utils/core/separate.py` runs Demucs in a background subprocess and caches the result beside the song as `<name>.karaoke.ai.m4a`; with no separator installed, karaoke uses the DSP chain in `utils/core/radio.py` exactly as before.
 - Install it with the project's own interpreter: `venv/bin/python scripts/install_local_separator.py` (`--check` only reports). The script refuses any other interpreter, because a venv copied from another project can carry a `pip` that installs into *that* project.

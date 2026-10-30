@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import aiohttp
 
+from utils.core.http_session import borrowed
+
 
 class HTTP:
     def __init__(self) -> None:
@@ -13,7 +15,7 @@ class HTTP:
         }
 
     async def read(self, url: str) -> bytes:
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            async with session.get(url) as response:
+        async with borrowed() as session:
+            async with session.get(url, headers=self.headers) as response:
                 response.raise_for_status()
                 return await response.read()

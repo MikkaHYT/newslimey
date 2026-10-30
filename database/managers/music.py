@@ -51,8 +51,13 @@ class MusicMixin(BaseManager):
                 )
                 username = result.scalar_one_or_none()
                 if username is None:
-                    logging.info(
-                        f"User {discord_id} has no last.fm account and will not be indexed."
+                    # A missing link is the normal case, not an event: server-wide
+                    # sweeps ask about every member, so logging this at INFO put
+                    # hundreds of lines in the log per command. Callers already
+                    # handle the ValueError; the trace is here for debugging.
+                    logger.debug(
+                        "User %s has no last.fm account and will not be indexed.",
+                        discord_id,
                     )
                     raise ValueError(f"User {discord_id} has no last.fm account.")
                 return username
@@ -87,12 +92,13 @@ class MusicMixin(BaseManager):
                     select(LastFMusers.embed_color).filter_by(discord_id=discord_id)
                 )
                 color = result.scalar_one_or_none()
+                # Read on every Last.fm command, so both branches are DEBUG:
+                # at INFO this alone was one line per invocation.
                 if color:
-                    logging.info(f"Retrieved color for {discord_id}: {color}")
+                    logger.debug("Retrieved color for %s: %s", discord_id, color)
                     return discord.Color(int(color.replace("#", "0x"), 16))
-                else:
-                    logging.info(f"No color set for {discord_id}, using default green.")
-                    return discord.Color.green()
+                logger.debug("No color set for %s, using default green.", discord_id)
+                return discord.Color.green()
         except SQLAlchemyError as e:
             logging.error(f"Error retrieving color: {str(e)}")
             return discord.Color.green()

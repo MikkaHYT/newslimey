@@ -5,6 +5,8 @@ import logging
 import os
 import random
 import re
+import subprocess
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -13,6 +15,8 @@ from urllib.parse import quote, urlparse
 import aiohttp
 import discord
 from discord.ext import commands
+
+from utils.core.prefixes import prefix_for
 
 
 logger = logging.getLogger("slimey.jwradio")
@@ -33,8 +37,56 @@ EMBED_COLOR = discord.Color.from_str("#2b2d31")
 RADIO_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "jwradio_settings.json"
 UPLOADS_DIR = Path(__file__).resolve().parent.parent / "jwradio_uploads"
 UPLOADS_META_PATH = Path(__file__).resolve().parent.parent / "jwradio_uploads.json"
+#: The host answers a bot-looking User-Agent with a gzip'd error page that
+#: refuses byte ranges, so streaming uses a normal browser agent.
+AUDIO_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+#: Byte ranges pulled at once while a track streams. The host throttles each
+#: connection below the bitrate of the MP3s it serves, so one plain read starves
+#: ffmpeg and the audio stutters; several ranges run well above realtime.
+STREAM_CONNECTIONS = 4
+STREAM_WINDOW = 256 * 1024
+#: ffmpeg's stdin buffer, raised so a short network hiccup doesn't starve it.
+STREAM_PIPE_BYTES = 1024 * 1024
+
+FFMPEG = "ffmpeg"
 
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac")
+
+#: The radio's filters, as ffmpeg ``-af`` chains: name -> (label, what it does,
+#: chain). Chains are comma-separated with no spaces anywhere, because
+#: discord.py splits the player's option string on whitespace. ``None`` means
+#: the track plays exactly as it was uploaded.
+FILTERS: dict[str, tuple[str, str, Optional[str]]] = {
+    "off": ("Off", "the track exactly as it was uploaded", None),
+    "bass": ("Bass boost", "the low end pushed up about 12 dB", "bass=g=12"),
+    "nightcore": (
+        "Nightcore",
+        "sped up 25%, with the pitch dragged up to match",
+        "asetrate=48000*1.25,aresample=48000,atempo=1.25",
+    ),
+    "slowed": (
+        "Slowed",
+        "dragged down to 85% speed, pitch dropping with it",
+        "asetrate=48000*0.85,aresample=48000,atempo=0.85",
+    ),
+    "vaporwave": (
+        "Vaporwave",
+        "slowed, bass-heavy and echoing",
+        "asetrate=48000*0.8,aresample=48000,atempo=0.8,bass=g=6,"
+        "aecho=0.8:0.9:50:0.3",
+    ),
+    "8d": ("8D", "the track circling around your head", "apulsator=hz=0.08"),
+    "lofi": ("Lo-fi", "muffled like a tape copy", "lowpass=f=3200"),
+    "reverb": (
+        "Reverb",
+        "a room-sized tail on every hit",
+        "aecho=0.8:0.88:60:0.4",
+    ),
+}
+
 
 QUEUE_HINT = (
     "-# **Queue a song:** just type the song name in this channel -- "
@@ -523,6 +575,208 @@ def direct_file_url(item):
     )
 
 
+class RangeStreamSource(discord.AudioSource):
+    """Streams a remote track into ffmpeg over parallel byte-range requests.
+
+    Reading the URL directly gives ffmpeg one throttled connection -- a few
+    KB/s, less than the bitrate of the file -- so it starves between frames and
+    the audio stutters. Ranges over several connections run far above
+    realtime; they are fetched in order and piped into ffmpeg, which lets
+    playback start almost immediately while the rest of the track is still on
+    its way.
+    """
+
+    FRAME = 3840  # 20ms of 48kHz stereo s16le
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        loop,
+        url: str,
+        filter_chain: Optional[str] = None,
+    ):
+        self.session = session
+        self.loop = loop
+        self.url = url
+        #: The server's ffmpeg ``-af`` chain, or ``None`` for an untouched track.
+        self.filter_chain = filter_chain
+        self.total: int | None = None
+        self._proc: subprocess.Popen | None = None
+        self._task: asyncio.Task | None = None
+        self._running = True
+
+    def start(self) -> "RangeStreamSource":
+        """Spawn ffmpeg and begin pulling ranges. Call from the event loop."""
+        args = [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel", "error",
+            # ffmpeg must not wait for megabytes before emitting audio.
+            "-probesize", "131072",
+            "-analyzeduration", "1000000",
+            "-i", "pipe:0",
+            "-vn",
+        ]
+        if self.filter_chain:
+            args.extend(["-af", self.filter_chain])
+        args.extend(["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
+        self._proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        widen_pipe(self._proc.stdin)
+        self._task = asyncio.create_task(self._feed())
+        return self
+
+    # -- AudioSource -----------------------------------------------------
+
+    def read(self) -> bytes:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return b""
+        try:
+            return proc.stdout.read(self.FRAME) or b""
+        except (OSError, ValueError):
+            return b""
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        self._running = False
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            try:
+                self.loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            # Kill first: closing stdin flushes into a full pipe and would
+            # otherwise wait for ffmpeg to drain minutes of audio.
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    # -- pulling ---------------------------------------------------------
+
+    async def _feed(self) -> None:
+        offset = 0
+        pending: deque = deque()
+        try:
+            while self._running:
+                # Keep a few ranges in flight, always in file order.
+                while len(pending) < STREAM_CONNECTIONS and (
+                    self.total is None or offset < self.total
+                ):
+                    end = offset + STREAM_WINDOW - 1
+                    if self.total is not None:
+                        end = min(end, self.total - 1)
+                    queue: asyncio.Queue = asyncio.Queue()
+                    task = asyncio.create_task(
+                        self._fetch(offset, end, queue)
+                    )
+                    pending.append((queue, task))
+                    offset = end + 1
+                if not pending:
+                    break
+
+                queue, task = pending.popleft()
+                received = 0
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    if not self._running:
+                        for _, other in pending:
+                            other.cancel()
+                        task.cancel()
+                        return
+                    # Blocking write, off the loop: it paces itself against
+                    # ffmpeg's consumption and keeps a full pipe buffered.
+                    await asyncio.to_thread(self._write, chunk)
+                    received += len(chunk)
+                await task
+                if not received and offset > STREAM_WINDOW:
+                    # Past the end of a file whose size was never reported.
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[Radio] Streaming %s stopped", self.url)
+        finally:
+            for _, other in pending:
+                other.cancel()
+            proc = self._proc
+            if proc is not None and proc.stdin is not None and proc.poll() is None:
+                try:
+                    await asyncio.to_thread(proc.stdin.close)
+                except (OSError, ValueError, asyncio.CancelledError):
+                    pass
+
+    async def _fetch(self, start: int, end: int, queue: asyncio.Queue) -> None:
+        """Stream one byte range into ``queue``, a chunk at a time."""
+        headers = {"Range": f"bytes={start}-{end}", "User-Agent": AUDIO_UA}
+        # No overall deadline: a slow-but-moving range must not be cut off.
+        # ``sock_read`` still catches a connection that stops delivering.
+        timeout = aiohttp.ClientTimeout(
+            total=None, sock_connect=20, sock_read=60
+        )
+        try:
+            async with self.session.get(
+                self.url, headers=headers, timeout=timeout
+            ) as response:
+                if response.status != 206:
+                    raise RuntimeError(
+                        f"range request refused ({response.status})"
+                    )
+                if self.total is None:
+                    match = re.search(
+                        r"/\s*(\d+)\s*$",
+                        response.headers.get("Content-Range", ""),
+                    )
+                    if match:
+                        self.total = int(match.group(1))
+                # Small chunks so the first of them reaches ffmpeg quickly.
+                async for chunk in response.content.iter_chunked(16384):
+                    if chunk:
+                        await queue.put(chunk)
+        finally:
+            await queue.put(None)
+
+    def _write(self, data: bytes) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None or not data:
+            return
+        try:
+            proc.stdin.write(data)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            self._running = False
+
+
+def widen_pipe(handle, size: int = STREAM_PIPE_BYTES) -> None:
+    """Give ffmpeg's stdin a bigger kernel buffer, best effort."""
+    try:
+        import fcntl
+
+        fcntl.fcntl(handle.fileno(), fcntl.F_SETPIPE_SZ, size)
+    except Exception:
+        pass
+
+
 def build_radio_header(song: Any) -> str:
     title = song_title(song)
     lines = [f"### **{title}**"]
@@ -711,15 +965,74 @@ class JWRadioPlayer:
         self._advance_lock = asyncio.Lock()
         self._skip_requested = False
         self.history = []
+        self._next_song = None
+        self._prefetched_song = None
+        self._prefetched_playable = None
+        self._prefetch_task: asyncio.Task | None = None
 
     def add_to_queue(self, song):
         self.queue.append(song)
 
     async def get_next_song(self):
-        """Pop the next track: queued requests first, then a random song."""
+        """Pop the next track: queued requests first, then a prefetched one."""
         if self.queue:
             return self.queue.pop(0)
+        if self._next_song is not None:
+            song, self._next_song = self._next_song, None
+            return song
         return await self.cog.api.get_random_song()
+
+    def _schedule_prefetch(self):
+        """Resolve the next track while this one plays, so the handover is quick."""
+        if self.queue or self.loop:
+            # An explicit request always wins; a loop replay is the same song.
+            return
+        if self._prefetch_task is not None and not self._prefetch_task.done():
+            return
+        self._prefetch_task = asyncio.create_task(self._prefetch_next())
+
+    async def _prefetch_next(self):
+        try:
+            song = self._next_song or await self.cog.api.get_random_song()
+            if not song:
+                return
+            song = await self.enrich_song(song)
+            self._next_song = song
+            self._prefetched_song = song
+            playable = await self.cog.resolve_playable_file(song)
+            if not playable:
+                return
+            self._prefetched_playable = playable
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[Radio] Could not prefetch the next track")
+
+    async def enrich_song(self, song):
+        """Replace a search result with the full song record from the API.
+
+        That round trip is slow, so prefetching does it ahead of time and
+        ``play_song`` reuses the finished result instead of paying for it in
+        the silence between tracks.
+        """
+        if song.get("is_custom"):
+            return song
+        song_id = first_value(
+            song,
+            "id", "song_id", "songId", "public_id", "publicId",
+            default=None,
+        )
+        if song_id is None:
+            return song
+        full_song = await self.cog.api.get_song(song_id)
+        if not isinstance(full_song, dict):
+            return song
+        wrapped = full_song.get("song") or full_song.get("data")
+        if isinstance(wrapped, dict):
+            if song.get("path") and not wrapped.get("path"):
+                wrapped["path"] = song["path"]
+            return wrapped
+        return full_song
 
     async def _advance(self):
         """Pick and play the next track. Serialized so two triggers can never
@@ -750,25 +1063,17 @@ class JWRadioPlayer:
     async def play_song(self, song, push_history=True):
         if not self.voice or not self.voice.is_connected():
             return False
+        source = None
+        started = False
         try:
-            if not song.get("is_custom"):
-                song_id = first_value(
-                    song,
-                    "id", "song_id", "songId", "public_id", "publicId",
-                    default=None,
-                )
-                if song_id is not None:
-                    full_song = await self.cog.api.get_song(song_id)
-                    if isinstance(full_song, dict):
-                        wrapped = full_song.get("song") or full_song.get("data")
-                        if isinstance(wrapped, dict):
-                            if song.get("path") and not wrapped.get("path"):
-                                wrapped["path"] = song["path"]
-                            song = wrapped
-                        else:
-                            song = full_song
+            prefetched = song is self._prefetched_song
+            if not prefetched:
+                song = await self.enrich_song(song)
 
-            playable = await self.cog.resolve_playable_file(song)
+            if prefetched and self._prefetched_playable is not None:
+                playable = self._prefetched_playable
+            else:
+                playable = await self.cog.resolve_playable_file(song)
             if not playable:
                 logger.warning("[Radio] No playable file found for: %s", song_title(song))
                 return False
@@ -776,29 +1081,46 @@ class JWRadioPlayer:
             play_url = playable.get("url")
             if not play_url:
                 return False
-            if not (valid_http_url(play_url) or Path(play_url).is_file()):
+            is_remote = bool(valid_http_url(play_url))
+            if not (is_remote or Path(play_url).is_file()):
                 return False
+            filter_chain = self.cog.filter_chain(self.guild_id)
 
             previous_song = self.current_song
             self.current_song = song
             self.current_url = play_url
             self.paused = False
-            # The -reconnect options are HTTP(S) protocol options; ffmpeg
-            # fails with "Option not found" when they're applied to a local
-            # file, so only add them for streamed URLs.
-            before_options = (
-                "-reconnect 1 "
-                "-reconnect_streamed 1 "
-                "-reconnect_delay_max 5 "
-                "-reconnect_on_network_error 1"
-                if valid_http_url(play_url)
-                else ""
-            )
-            source = discord.FFmpegPCMAudio(
-                play_url,
-                before_options=before_options,
-                options="-vn",
-            )
+            source = None
+            if is_remote:
+                # Feed ffmpeg from parallel byte ranges instead of letting it
+                # open one slow connection to the host.
+                try:
+                    await self.cog.api.start()
+                    source = RangeStreamSource(
+                        self.cog.api.session,
+                        self.cog.bot.loop,
+                        play_url,
+                        filter_chain,
+                    ).start()
+                except Exception:
+                    logger.exception("[Radio] Could not range-stream %s", play_url)
+                    source = None
+            if source is None:
+                # Local upload, or the range stream could not start: hand
+                # ffmpeg the path/URL directly.
+                before_options = (
+                    "-reconnect 1 "
+                    "-reconnect_streamed 1 "
+                    "-reconnect_delay_max 5 "
+                    "-reconnect_on_network_error 1"
+                    if is_remote
+                    else ""
+                )
+                source = discord.FFmpegPCMAudio(
+                    play_url,
+                    before_options=before_options,
+                    options=f"-vn -af {filter_chain}" if filter_chain else "-vn",
+                )
 
             def after_play(error):
                 asyncio.run_coroutine_threadsafe(
@@ -807,14 +1129,19 @@ class JWRadioPlayer:
                 )
 
             self.voice.play(source, after=after_play)
+            started = True
             if push_history and previous_song is not None and previous_song is not song:
                 self.history.append(previous_song)
                 if len(self.history) > 50:
                     self.history.pop(0)
             await self.update_message()
+            self._schedule_prefetch()
             return True
         except Exception as exc:
             logger.exception("[Radio Play Error] %s", exc)
+            if not started and source is not None:
+                # Don't leave a half-opened stream behind.
+                source.cleanup()
             return False
 
     async def song_finished(self, error=None):
@@ -1308,6 +1635,21 @@ class JWRadio(commands.Cog):
             return channel
         return None
 
+    def get_filter(self, guild_id) -> str:
+        """The filter this server is on; ``"off"`` when unset or unrecognised."""
+        entry = self._settings.get(str(guild_id)) or {}
+        name = str(entry.get("filter") or "off").casefold()
+        return name if name in FILTERS else "off"
+
+    def filter_chain(self, guild_id) -> Optional[str]:
+        """The ffmpeg ``-af`` chain for this server, or ``None`` for untouched."""
+        return FILTERS[self.get_filter(guild_id)][2]
+
+    def set_filter(self, guild_id, name: str):
+        entry = self._settings.setdefault(str(guild_id), {})
+        entry["filter"] = name
+        self._save_settings()
+
     # ------------------------------------------------------------------
     # Player helpers
     # ------------------------------------------------------------------
@@ -1436,7 +1778,9 @@ class JWRadio(commands.Cog):
     # Commands
     # ------------------------------------------------------------------
 
-    @commands.command(name="jwradio", aliases=["jwrd", "wrldradio"])
+    @commands.group(
+        name="jwradio", aliases=["jwrd", "wrldradio"], invoke_without_command=True
+    )
     async def radio(self, ctx):
         if not ctx.author.voice:
             return await ctx.send(view=simple_view("❌ You need to be in a voice channel first."))
@@ -1470,6 +1814,68 @@ class JWRadio(commands.Cog):
         await player._advance()
         confirmation = await ctx.send(
             view=simple_view(f"✅ Radio connected to **{channel.name}** -- it'll keep playing 24/7.")
+        )
+        asyncio.create_task(self._auto_delete(confirmation))
+
+    @radio.command(name="filter", aliases=["filters", "fx"])
+    async def radio_filter(self, ctx, name: Optional[str] = None):
+        """List the radio's filters, or switch the radio to one.
+
+        With no name every filter is listed, with the one in use marked. With a
+        name the server switches to it; the chain is read when the next track
+        starts, so the song that is playing is never interrupted. `off` plays
+        tracks untouched.
+        """
+        if ctx.guild is None:
+            return
+        prefix = await prefix_for(ctx)
+        active = self.get_filter(ctx.guild.id)
+
+        if name is None:
+            lines = [
+                "# 🎛️ Radio filters",
+                f"-# In use: **{FILTERS[active][0]}**"
+                + ("" if active == "off" else f" (`{active}`)"),
+                "",
+            ]
+            for key, (label, description, _chain) in FILTERS.items():
+                mark = "✅" if key == active else "•"
+                lines.append(f"{mark} `{key}` — **{label}** — {description}")
+            lines.append("")
+            lines.append(
+                f"-# Switch with `{prefix}jwradio filter <name>`; "
+                f"`{prefix}jwradio filter off` plays tracks untouched."
+            )
+            return await ctx.send(view=simple_view("\n".join(lines)))
+
+        wanted = name.strip().casefold().lstrip("!.,")
+        if wanted not in FILTERS:
+            listed = ", ".join(f"`{key}`" for key in FILTERS)
+            return await ctx.send(
+                view=simple_view(
+                    f"❌ There's no **{name}** filter. Pick one of: {listed}."
+                )
+            )
+
+        if wanted != active:
+            allowed = ctx.author.guild_permissions.manage_guild
+            if not allowed and not await self.bot.is_owner(ctx.author):
+                return await ctx.send(
+                    view=simple_view(
+                        "❌ Only server managers can change the radio's filter."
+                    )
+                )
+            # Changing a filter never interrupts what is playing: the chain is
+            # read when the next track starts, so the change is simply heard then.
+            self.set_filter(ctx.guild.id, wanted)
+
+        label, description, _chain = FILTERS[wanted]
+        if wanted == active:
+            note = " (already on)"
+        else:
+            note = " — applies from the next track, so nothing gets cut off."
+        confirmation = await ctx.send(
+            view=simple_view(f"🎛️ Radio filter: **{label}** — {description}.{note}")
         )
         asyncio.create_task(self._auto_delete(confirmation))
 

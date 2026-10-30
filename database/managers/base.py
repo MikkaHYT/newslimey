@@ -13,12 +13,22 @@ from sqlalchemy.exc import (
 from sqlalchemy.future import select
 from sqlalchemy.orm import sessionmaker
 import asyncio
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 import time
 import functools
 from typing import Optional
-from ..models import Base, EconomyIdentity, UserIdentity
+from ..models import (
+    Base,
+    CommandRoleRestriction,
+    CommandStatus,
+    EconomyIdentity,
+    UserIdentity,
+)
 import logging
+
+#: Returned by the hot-path cache when a key is missing or expired.
+_CACHE_MISS = object()
 
 
 def _hash_user_id(user_id) -> str:
@@ -182,7 +192,22 @@ class BaseManager:
 
         Call this whenever the bot sees a Discord user for the first time in a
         session, so later resolve_user_hash() calls can recover the raw ID.
+
+        This runs for every message the bot receives, but the insert is
+        idempotent, so the IDs already known to this process are remembered and
+        skipped. The memo is bounded; an evicted user simply writes the row
+        again on their next message, which is harmless.
         """
+        try:
+            cache_key = int(user_id)
+        except (TypeError, ValueError):
+            cache_key = user_id
+
+        cached = self._known_identities.get(cache_key)
+        if cached is not None:
+            self._known_identities.move_to_end(cache_key)
+            return cached
+
         user_hash = _hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             async with session.begin():
@@ -191,7 +216,125 @@ class BaseManager:
                     .values(user_hash=user_hash, user_id=user_id)
                     .on_conflict_do_nothing(index_elements=["user_hash"])
                 )
+        self._remember_identity(cache_key, user_hash)
         return user_hash
+
+    def _remember_identity(self, cache_key, user_hash: str) -> None:
+        """Memoise a known ``user_id -> user_hash`` pair, keeping the memo bounded."""
+        self._known_identities[cache_key] = user_hash
+        self._known_identities.move_to_end(cache_key)
+        while len(self._known_identities) > self._known_identities_limit:
+            self._known_identities.popitem(last=False)
+
+    # -- hot-path cache primitives -----------------------------------------
+    def _cache_get(self, key):
+        """Return a cached value, or :data:`_CACHE_MISS` when absent/expired."""
+        entry = self._hot_cache.get(key)
+        if entry is None:
+            return _CACHE_MISS
+        expires, value = entry
+        if expires <= time.monotonic():
+            self._hot_cache.pop(key, None)
+            return _CACHE_MISS
+        return value
+
+    def _cache_set(self, key, value) -> None:
+        if len(self._hot_cache) >= self._hot_cache_max_entries:
+            # Coarse but cheap: every entry is rebuildable from one query.
+            self._hot_cache.clear()
+        self._hot_cache[key] = (time.monotonic() + self._hot_cache_ttl, value)
+
+    def _cache_invalidate(self, prefix: str) -> None:
+        """Drop every cached value stored under *prefix* (the key's first item)."""
+        for key in [k for k in self._hot_cache if k[0] == prefix]:
+            self._hot_cache.pop(key, None)
+
+    async def _command_status_snapshot(self) -> dict[tuple, bool]:
+        """All explicit command-status overrides, indexed by scope.
+
+        Only admins create these rows, so the table is small and a single read
+        can answer every per-channel/per-guild/global lookup.
+        """
+        now = time.monotonic()
+        if self._command_status_rows is not None and now < self._command_status_expires:
+            return self._command_status_rows
+        async with self._snapshot_lock:
+            now = time.monotonic()
+            if (
+                self._command_status_rows is not None
+                and now < self._command_status_expires
+            ):
+                return self._command_status_rows
+            generation = self._command_status_generation
+            async with self.async_sessionmaker() as session:
+                rows = await session.execute(
+                    select(
+                        CommandStatus.command_name,
+                        CommandStatus.channel_id,
+                        CommandStatus.guild_id,
+                        CommandStatus.enabled,
+                    ).order_by(CommandStatus.id)
+                )
+                # Old databases can hold more than one row for a scope (the
+                # write used to compare NULL with ``=`` and always insert).
+                # The newest row is the admin's latest intent, so it wins.
+                snapshot: dict[tuple, bool] = {}
+                for command_name, channel_id, guild_id, enabled in rows.all():
+                    snapshot[(command_name, channel_id, guild_id)] = bool(enabled)
+            if generation == self._command_status_generation:
+                self._command_status_rows = snapshot
+                self._command_status_expires = time.monotonic() + self._hot_cache_ttl
+            return snapshot
+
+    def _invalidate_command_status(self, command_name: str | None = None) -> None:
+        """Drop cached command statuses, for one command or all of them."""
+        self._command_status_generation += 1
+        self._command_status_expires = 0.0
+        if command_name is None or self._command_status_rows is None:
+            self._command_status_rows = None
+            return
+        for key in [k for k in self._command_status_rows if k[0] == command_name]:
+            self._command_status_rows.pop(key, None)
+
+    async def _role_restriction_snapshot(self) -> dict[tuple, frozenset[int]]:
+        """All command role restrictions, indexed by ``(guild_id, command)``."""
+        now = time.monotonic()
+        if (
+            self._role_restriction_rows is not None
+            and now < self._role_restriction_expires
+        ):
+            return self._role_restriction_rows
+        async with self._snapshot_lock:
+            now = time.monotonic()
+            if (
+                self._role_restriction_rows is not None
+                and now < self._role_restriction_expires
+            ):
+                return self._role_restriction_rows
+            generation = self._role_restriction_generation
+            async with self.async_sessionmaker() as session:
+                rows = await session.execute(
+                    select(
+                        CommandRoleRestriction.guild_id,
+                        CommandRoleRestriction.command_name,
+                        CommandRoleRestriction.role_id,
+                    )
+                )
+                grouped: dict[tuple, set[int]] = {}
+                for guild_id, command_name, role_id in rows.all():
+                    grouped.setdefault((guild_id, command_name), set()).add(role_id)
+                snapshot = {key: frozenset(value) for key, value in grouped.items()}
+            if generation == self._role_restriction_generation:
+                self._role_restriction_rows = snapshot
+                self._role_restriction_expires = (
+                    time.monotonic() + self._hot_cache_ttl
+                )
+            return snapshot
+
+    def _invalidate_role_restrictions(self) -> None:
+        self._role_restriction_generation += 1
+        self._role_restriction_expires = 0.0
+        self._role_restriction_rows = None
 
     def __init__(self, database_url: str):
         # pool_pre_ping validates connections before checkout, which eliminates
@@ -230,6 +373,37 @@ class BaseManager:
         self._db_healthy = True
         self._db_last_failure = 0.0
         self._db_failure_cooldown = 30.0
+
+        # ------------------------------------------------------------------
+        # Hot-path caches.
+        #
+        # Every prefix command used to make eight sequential reads before its
+        # callback ran (blacklist, three command-status scopes, one restriction
+        # query per alias), and discord.py resolved the guild prefix with
+        # another read on *every* message in every guild. These values are
+        # admin settings that change rarely, so they are mirrored in memory and
+        # invalidated by the writes that change them. A 5 minute TTL is only a
+        # safety net for a write path that might be missed; the caches are
+        # otherwise refreshed the moment an admin toggles them.
+        # ------------------------------------------------------------------
+        self._hot_cache: dict[tuple, tuple[float, object]] = {}
+        self._hot_cache_ttl = 300.0
+        self._hot_cache_max_entries = 20_000
+
+        #: Whole-table snapshots: only rows that were explicitly overridden are
+        #: stored, so these stay small, and one query answers every lookup.
+        self._command_status_rows: dict[tuple, bool] | None = None
+        self._command_status_expires = 0.0
+        self._command_status_generation = 0
+        self._role_restriction_rows: dict[tuple, frozenset[int]] | None = None
+        self._role_restriction_expires = 0.0
+        self._role_restriction_generation = 0
+        self._snapshot_lock = asyncio.Lock()
+
+        #: User IDs whose identity row is known to exist, so the idempotent
+        #: upsert that ran for every message becomes a one-off per user.
+        self._known_identities: OrderedDict[int, str] = OrderedDict()
+        self._known_identities_limit = 50_000
 
     @staticmethod
     def _is_retryable_db_error(exc: Exception) -> bool:

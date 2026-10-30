@@ -12,6 +12,7 @@ deliberately. One channel per topic keeps each feed readable and easy to mute:
     deletions    bulk purges
     roles        role creations, edits and deletions
     moderation   timeouts, kicks, bans and unbans
+    jails        jails, releases and expired jail time
     anti-mp3     messages Discord removed because they carried an audio file
 
 Every card is kept deliberately small — a title, a line of description and at
@@ -21,7 +22,9 @@ Channel ids live in the dashboard settings store, so a restart never loses them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +47,7 @@ TOPICS: dict[str, tuple[str, str]] = {
     "deletions": ("deletions", "Bulk message purges"),
     "roles": ("roles", "Role creations, edits and deletions"),
     "moderation": ("moderation", "Timeouts, kicks, bans and unbans"),
+    "jails": ("jails", "Jails, releases and expired jail time"),
     "antimp3": ("anti-mp3", "Audio files deleted by the filter"),
 }
 
@@ -191,24 +195,112 @@ class ServerLogs(commands.Cog):
         me = guild.me if guild is not None else None
         if me is None or not me.guild_permissions.view_audit_log:
             return None
-        try:
-            async for entry in guild.audit_logs(limit=6, action=action):
-                age = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
-                if age > AUDIT_WINDOW:
-                    break
-                if target_id is not None and getattr(entry.target, "id", None) != target_id:
-                    continue
-                return entry
-        except (discord.Forbidden, discord.HTTPException):
-            return None
+        # Discord can write the audit-log entry a moment after the gateway
+        # event that announced it, so one immediate lookup often comes back
+        # empty (and every card then said "Unknown"). Look, wait, look again.
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.6)
+            try:
+                async for entry in guild.audit_logs(limit=8, action=action):
+                    age = (
+                        datetime.now(timezone.utc) - entry.created_at
+                    ).total_seconds()
+                    if age > AUDIT_WINDOW:
+                        break
+                    if (
+                        target_id is not None
+                        and getattr(entry.target, "id", None) != target_id
+                    ):
+                        continue
+                    return entry
+            except (discord.Forbidden, discord.HTTPException):
+                return None
         return None
 
-    @staticmethod
-    def _actor(entry: Any) -> str:
+    #: How long an in-memory "who ran this command" hint stays usable.
+    HINT_TTL = 120.0
+
+    def _mod_hint(
+        self, guild: discord.Guild | None, target_id: int | None
+    ) -> tuple[int, str, float] | None:
+        """The moderator recorded by our own commands, if there is a fresh one."""
+        if guild is None or target_id is None:
+            return None
+        hints = getattr(self.bot, "mod_action_hints", None)
+        if not hints:
+            return None
+        key = (guild.id, int(target_id))
+        hint = hints.get(key)
+        if hint is None:
+            return None
+        if time.monotonic() - hint[2] > self.HINT_TTL:
+            hints.pop(key, None)
+            return None
+        return hint
+
+    def _actor(
+        self,
+        entry: Any,
+        guild: discord.Guild | None = None,
+        target_id: int | None = None,
+    ) -> str:
+        """Who did it: our command's invoker, or the audit-log actor."""
         user = getattr(entry, "user", None) if entry is not None else None
+        hint = self._mod_hint(guild, target_id)
+        me = getattr(self.bot, "user", None)
+        # When our own command bans/kicks/timeouts someone the audit log can
+        # only name the bot. The moderation cog records the invoker, and that
+        # is the answer people want.
+        if hint is not None and (
+            user is None or getattr(user, "id", None) == getattr(me, "id", None)
+        ):
+            return f"{hint[1]} (`{hint[0]}`)"
         if user is None:
             return "Unknown"
         return f"{getattr(user, 'display_name', user)} (`{user.id}`)"
+
+    async def log_jail(
+        self,
+        guild: discord.Guild,
+        member: Any,
+        *,
+        moderator: Any,
+        reason: str = "No reason provided",
+        duration_seconds: int | None = None,
+        released: bool = False,
+        automatic: bool = False,
+    ) -> None:
+        """Post a jail or release card to the dedicated ``jails`` channel."""
+        if guild is None:
+            return
+        avatar = getattr(getattr(member, "display_avatar", None), "url", None)
+        description = f"{getattr(member, 'mention', member)} (`{getattr(member, 'id', 0)}`)"
+        by = (
+            f"{getattr(moderator, 'display_name', moderator)} "
+            f"(`{getattr(moderator, 'id', 0)}`)"
+        )
+        fields: list[tuple[str, Any, bool]] = [("By", by, True)]
+        if released:
+            title, color = ("🔓 Jail Expired" if automatic else "🔓 Member Released"), GREEN
+        else:
+            title, color = "⛓️ Member Jailed", RED
+            if duration_seconds:
+                fields.append(("Duration", _duration(duration_seconds), True))
+        fields.append(("Reason", reason or "*no reason given*", False))
+        if released and automatic:
+            fields[0] = ("By", "*jail time expired*", True)
+        await self._log(
+            guild,
+            "jails",
+            embed(
+                title,
+                color,
+                description=description,
+                avatar=avatar,
+                fields=fields,
+            ),
+        )
 
     @staticmethod
     def _reason(entry: Any) -> str:
@@ -342,7 +434,7 @@ class ServerLogs(commands.Cog):
                 "🆕 Role Created",
                 GREEN,
                 description=f"{role.mention} (`{role.id}`)",
-                fields=[("By", self._actor(entry), True)],
+                fields=[("By", self._actor(entry, role.guild, role.id), True)],
             ),
         )
 
@@ -372,7 +464,7 @@ class ServerLogs(commands.Cog):
                 description=f"{after.mention} (`{after.id}`)",
                 fields=[
                     ("Changes", "\n".join(changes), False),
-                    ("By", self._actor(entry), True),
+                    ("By", self._actor(entry, after.guild, after.id), True),
                 ],
             ),
         )
@@ -387,7 +479,7 @@ class ServerLogs(commands.Cog):
                 "🗑️ Role Deleted",
                 RED,
                 description=f"**{role.name}** (`{role.id}`)",
-                fields=[("By", self._actor(entry), True)],
+                fields=[("By", self._actor(entry, role.guild, role.id), True)],
             ),
         )
 
@@ -411,13 +503,13 @@ class ServerLogs(commands.Cog):
             fields = [
                 ("Duration", _duration(seconds), True),
                 ("Expires", f"<t:{int(after_timeout.timestamp())}:R>", True),
-                ("By", self._actor(entry), True),
+                ("By", self._actor(entry, after.guild, after.id), True),
                 ("Reason", self._reason(entry), False),
             ]
             title, color = "⏳ Member Timed Out", RED
         else:
             fields = [
-                ("By", self._actor(entry), True),
+                ("By", self._actor(entry, after.guild, after.id), True),
             ]
             title, color = "✅ Timeout Removed", GREEN
 
@@ -448,7 +540,7 @@ class ServerLogs(commands.Cog):
                 description=f"{member.mention} (`{member.id}`)",
                 avatar=avatar,
                 fields=[
-                    ("By", self._actor(entry), True),
+                    ("By", self._actor(entry, member.guild, member.id), True),
                     ("Reason", self._reason(entry), False),
                 ],
             ),
@@ -467,7 +559,7 @@ class ServerLogs(commands.Cog):
                 description=f"{user.mention} (`{user.id}`)",
                 avatar=avatar,
                 fields=[
-                    ("By", self._actor(entry), True),
+                    ("By", self._actor(entry, guild, getattr(user, "id", None)), True),
                     ("Reason", self._reason(entry), False),
                 ],
             ),
@@ -485,7 +577,7 @@ class ServerLogs(commands.Cog):
                 GREEN,
                 description=f"{user.mention} (`{user.id}`)",
                 avatar=avatar,
-                fields=[("By", self._actor(entry), True)],
+                fields=[("By", self._actor(entry, guild, user.id), True)],
             ),
         )
 
@@ -501,8 +593,8 @@ class ServerLogs(commands.Cog):
 
         Usage: `{PREFIX}logsetup` — builds (or reuses) a `logs` category with
         one hidden channel per topic: messages, edits, deletions, roles,
-        moderation and anti-mp3. Nobody but me and you can see them, so grant
-        any staff roles access afterwards.
+        moderation, jails and anti-mp3. Nobody but me and you can see them, so
+        grant any staff roles access afterwards.
         """
         guild = ctx.guild
         if guild is None:
@@ -585,6 +677,10 @@ class ServerLogs(commands.Cog):
         lines.append(
             "-# Hidden from @everyone — grant access to any staff roles that "
             "should read the logs."
+        )
+        lines.append(
+            "-# Give me **View Audit Log** if the `By` lines on moderation and "
+            "role cards should name people."
         )
         await ctx.send(view=self._card("\n".join(lines), ok=True))
 

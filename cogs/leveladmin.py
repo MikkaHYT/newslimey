@@ -59,6 +59,7 @@ from discord.ext import commands
 
 from config import EMBED_COLOR, EMBED_COLORS, PREFIX, leveling
 from utils.core import levelroles, preferences, userprefs
+from utils.core.http_session import borrowed
 from utils.core.converters import find_member
 from utils.core.economy import format_cash, parse_amount
 from utils.core.leveling import xp_for_level
@@ -1169,8 +1170,8 @@ class Admin(commands.Cog):
         if url.startswith(("http://", "https://")):
             try:
                 timeout = aiohttp.ClientTimeout(total=15)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as response:
+                async with borrowed() as session:
+                    async with session.get(url, timeout=timeout) as response:
                         if response.status != 200:
                             return None
                         return await response.read()

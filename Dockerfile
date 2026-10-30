@@ -57,12 +57,12 @@ RUN mkdir -p /app/data \
 
 USER tpnebot
 
-# AdminAPIServer (aiohttp) listens here by default; expose when running compose
-EXPOSE 8080
+# The dashboard (aiohttp) listens here by default; expose when running compose
+EXPOSE 25565
 
-# Liveness: admin API exposes /status on the same port
+# Liveness: the dashboard exposes /status on the same port
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${ADMIN_API_PORT:-8080}/status" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${ADMIN_API_PORT:-25565}/status" || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "bot.py"]

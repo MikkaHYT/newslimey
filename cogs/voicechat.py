@@ -459,6 +459,85 @@ class Voicechat(commands.Cog):
         )
         await ctx.reply(embed=embed)
 
+    async def _prefix_for(self, ctx: Context) -> str:
+        prefix = await self.bot.get_prefix(ctx.message)
+        if isinstance(prefix, list):
+            return prefix[0] if prefix else "!"
+        return prefix or "!"
+
+    @commands.hybrid_command(
+        name="jtcset",
+        aliases=["setjtc"],
+        description="Use an existing voice channel as the Join To Create hub.",
+    )
+    @commands.has_permissions(administrator=True)
+    @commands.bot_has_permissions(manage_channels=True)
+    @discord.app_commands.default_permissions(administrator=True)
+    @unified_cooldown(5)
+    async def jtc_set(
+        self, ctx: Context, channel: Optional[discord.VoiceChannel] = None
+    ):
+        """Set (or show) the voice channel that spawns temporary channels.
+
+        With no argument this reports the current hub, so an admin can check the
+        setup without changing it. Any channel can be the hub -- it does not have
+        to be named "Join To Create" and it does not have to be created by the
+        bot; the channel is left exactly as it is.
+        """
+        guild = ctx.guild
+        prefix = await self._prefix_for(ctx)
+
+        if channel is None:
+            existing = await self.bot.database.get_jtc_channels(guild.id)
+            hub = guild.get_channel(existing.jtc_channel_id) if existing else None
+            if hub is None:
+                description = (
+                    "No Join To Create hub is set for this server.\n\n"
+                    f"Use `{prefix}jtcset #channel` to pick one."
+                )
+                color = discord.Color.orange()
+            else:
+                description = (
+                    f"**Hub:** {hub.mention}\n"
+                    f"**ID:** `{hub.id}`\n\n"
+                    "Anyone who joins it gets their own ``name's Channel`` and is "
+                    "moved into it.\n"
+                    f"Use `{prefix}jtcset #channel` to change the hub."
+                )
+                color = discord.Color.blurple()
+            await ctx.reply(
+                embed=discord.Embed(
+                    title="Join To Create", description=description, color=color
+                )
+            )
+            return
+
+        if channel.guild.id != guild.id:
+            await Embeds.error(
+                ctx,
+                "The channel must be in this server.",
+                title="Join To Create",
+                delete_after=10,
+                reply=True,
+            )
+            return
+
+        created = await self.bot.database.set_jtc_channel(guild.id, channel.id)
+        await ctx.reply(
+            embed=discord.Embed(
+                title="Join To Create",
+                description=(
+                    f"{'Created' if created else 'Updated'} the Join To Create hub: "
+                    f"{channel.mention}\n\n"
+                    "When someone joins it I'll create a channel named "
+                    "``<their name>'s Channel`` and move them in. The channel is "
+                    "deleted again once the last person leaves.\n\n"
+                    f"Change it later with `{prefix}jtcset #channel`."
+                ),
+                color=discord.Color.blurple(),
+            )
+        )
+
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         """Handles user joining 'Join To Create' and creating private VCs."""

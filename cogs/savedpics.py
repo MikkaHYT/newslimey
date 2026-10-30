@@ -13,8 +13,17 @@ the channel stays clean, and ``,sendpic`` / ``,sendvid`` / ``,sendfile`` posts
 the raw file(s) again later with no embed around them.
 
 Saving under a name that is already taken stacks the new file(s) on top of the
-ones saved before instead of replacing them, up to the per-kind limit: once the
-stack is full the oldest file(s) drop off so the name always holds the newest.
+ones saved before instead of replacing them, up to the per-kind limit. A full
+name is never trimmed behind the user's back: the save is refused and they are
+told to use a different name, so nothing already saved is ever deleted.
+
+A stack can hold more files than one message can carry, so sending it back is
+split over several messages that each stay inside Discord's attachment count
+and payload limits.
+
+``,linkpics <server id>`` links this server with another one, and from then on
+pictures saved with ``,ss`` in either server can be sent from both with
+``,sendpic``. ``,unlinkpics <server id>`` undoes it.
 """
 
 from __future__ import annotations
@@ -46,6 +55,9 @@ SAVED_VIDEOS_DIR = ROOT / "saved_videos"
 SAVED_VIDEOS_META_PATH = ROOT / "saved_videos.json"
 SAVED_FILES_DIR = ROOT / "saved_files"
 SAVED_FILES_META_PATH = ROOT / "saved_files.json"
+# Servers that send each other's saved pictures. Kept beside the indexes, and
+# read the same way, so a link survives a restart.
+LINKED_PICS_META_PATH = ROOT / "linked_pics.json"
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv", ".m4v")
@@ -81,14 +93,21 @@ AUDIO_CONTENT_TYPES = {
 }
 
 MAX_NAME_LENGTH = 48
-# A discord MediaGallery can only render ten items.
-MAX_IMAGES = 10
+# How many files one name can hold.
+MAX_IMAGES = 50
 MAX_VIDEOS = 5
 MAX_AUDIO = 5
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_BYTES = 25 * 1024 * 1024
 MAX_AUDIO_BYTES = 16 * 1024 * 1024
 MAX_LISTED_NAMES = 30
+# A discord MediaGallery renders at most ten items, and a message accepts at
+# most ten attachments.
+MAX_GALLERY_ITEMS = 10
+# Sending a stack back is batched so no single message trips the payload limit:
+# at most eight files, and at most 8 MiB of attachments, per message.
+SEND_BATCH_FILES = 8
+SEND_BATCH_BYTES = 8 * 1024 * 1024
 
 
 # ============================================================
@@ -260,12 +279,67 @@ def upload_name(original: Any, fallback: str) -> str:
     return f"{stem[: 100 - len(suffix)]}{suffix}"
 
 
+def parse_guild_id(raw: Any) -> Optional[int]:
+    """A server id out of what a user typed: digits only, or anything wrapping them."""
+    digits = re.sub(r"[^0-9]", "", str(raw or ""))
+    return int(digits) if digits else None
+
+
 def format_size(num_bytes: int) -> str:
     if num_bytes >= 1024 ** 2:
         return f"{num_bytes / (1024 ** 2):.1f} MiB"
     if num_bytes >= 1024:
         return f"{num_bytes / 1024:.1f} KiB"
     return f"{num_bytes} B"
+
+
+def plan_batches(
+    entries: Sequence[tuple[Path, str]],
+    *,
+    max_files: int = SEND_BATCH_FILES,
+    max_bytes: int = SEND_BATCH_BYTES,
+) -> list[list[tuple[Path, str]]]:
+    """Split saved files into the groups that are sent as separate messages.
+
+    A single message can only carry so many attachments before Discord answers
+    with ``413 Request entity too large``, so files are grouped by count and by
+    total size. A file larger than the whole byte budget still gets a message of
+    its own instead of being dropped.
+    """
+    batches: list[list[tuple[Path, str]]] = []
+    current: list[tuple[Path, str]] = []
+    budget = max_bytes
+
+    for path, original in entries:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if current and (len(current) >= max_files or size > budget):
+            batches.append(current)
+            current, budget = [], max_bytes
+        current.append((path, original))
+        budget -= size
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def build_upload_files(
+    entries: Sequence[tuple[Path, str]],
+) -> list[discord.File]:
+    """Upload-ready files for one message, named after the saved attachments."""
+    files: list[discord.File] = []
+    used: set[str] = set()
+    for index, (path, original) in enumerate(entries, start=1):
+        name = upload_name(original, path.name)
+        if name in used:
+            stem, suffix = Path(name).stem, Path(name).suffix
+            name = f"{stem}-{index}{suffix}"
+        used.add(name)
+        files.append(discord.File(str(path), filename=name))
+    return files
 
 
 def format_saved_at(value: Any) -> str:
@@ -282,6 +356,17 @@ def format_saved_at(value: Any) -> str:
 # ============================================================
 # LOCAL STORAGE
 # ============================================================
+
+class NameFull(Exception):
+    """Raised when a name cannot take every file the user is trying to add."""
+
+    def __init__(self, *, name: str, count: int, incoming: int, max_files: int) -> None:
+        super().__init__(f"{name} already holds {count} of {max_files} files")
+        self.name = name
+        self.count = count
+        self.incoming = incoming
+        self.max_files = max_files
+
 
 class SavedMediaStore:
     """JSON-backed registry of saved files, keyed by guild and name.
@@ -426,10 +511,10 @@ class SavedMediaStore:
         """Store ``files`` under ``name``, stacked on top of anything saved before.
 
         ``files`` is a sequence of ``(original filename, extension, bytes)``.
-        New files go to the end of the stack; when ``max_files`` is reached the
-        oldest entries drop off (and are deleted from disk), so a name always
-        holds the most recently saved files. The returned record carries the
-        ``added`` and ``dropped`` entries for the caller's reply.
+        New files go to the end of the stack. Nothing is ever evicted to make
+        room: when the stack cannot take every new file, ``NameFull`` is raised
+        and the user is asked to save under another name. The returned record
+        carries the ``added`` entries for the caller's reply.
         """
         key = slugify_name(name)
         if not key:
@@ -438,8 +523,7 @@ class SavedMediaStore:
             raise ValueError("A saved file needs at least one attachment")
 
         guild_key = str(guild_id)
-        entries = self._records.setdefault(guild_key, {})
-        previous = entries.get(key) or {}
+        previous = (self._records.get(guild_key) or {}).get(key) or {}
 
         # Anything saved before stays in the stack, oldest first, but entries
         # whose files vanished from disk are pruned so the index self-heals.
@@ -463,6 +547,15 @@ class SavedMediaStore:
             if tail.isdigit():
                 next_index = max(next_index, int(tail) + 1)
 
+        if max_files and len(kept) + len(files) > max_files:
+            raise NameFull(
+                name=clean_display_name(name),
+                count=len(kept),
+                incoming=len(files),
+                max_files=max_files,
+            )
+
+        entries = self._records.setdefault(guild_key, {})
         self.directory.mkdir(parents=True, exist_ok=True)
 
         stored: list[dict[str, Any]] = []
@@ -476,13 +569,6 @@ class SavedMediaStore:
             })
 
         merged = kept + stored
-        dropped: list[dict[str, Any]] = []
-        if max_files and len(merged) > max_files:
-            dropped = merged[: len(merged) - max_files]
-            merged = merged[len(merged) - max_files :]
-            for entry in dropped:
-                self._remove(self.directory / Path(str(entry.get("filename"))).name)
-
         now = datetime.now(timezone.utc).isoformat()
         record = {
             "name": clean_display_name(name),
@@ -496,7 +582,7 @@ class SavedMediaStore:
         }
         entries[key] = record
         self._save()
-        return {"key": key, "added": stored, "dropped": dropped, **record}
+        return {"key": key, "added": stored, **record}
 
     def delete(self, guild_id: Any, name: str) -> Optional[dict[str, Any]]:
         """Remove a record and its files, returning what was removed."""
@@ -512,6 +598,94 @@ class SavedMediaStore:
         entries.pop(key, None)
         self._save()
         return {"key": key, **record}
+
+class LinkedGuilds:
+    """JSON-backed list of servers that send each other's saved pictures.
+
+    Links are symmetric: linking A with B lets either server send pictures
+    saved in the other, and unlinking from one side removes both.
+    """
+
+    def __init__(self, meta_path: Path) -> None:
+        self.meta_path = Path(meta_path)
+        self._links: dict[str, list[str]] = {}
+        self._load()
+
+    # --------------------------------------------------------
+    # Persistence
+    # --------------------------------------------------------
+
+    def _load(self) -> None:
+        try:
+            if not self.meta_path.is_file():
+                return
+            data = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            # A damaged link file only costs links, so start clean rather than crash.
+            logger.warning("[SavedMedia] Ignoring unreadable link file %s: %s", self.meta_path.name, exc)
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        for guild_key, linked in data.items():
+            if not isinstance(linked, list):
+                continue
+            for entry in linked:
+                other = str(entry)
+                if other.isdigit() and other != str(guild_key):
+                    # Adding both directions repairs a hand-edited, one-sided file.
+                    self._add(str(guild_key), other)
+
+    def _save(self) -> None:
+        temporary = self.meta_path.with_suffix(self.meta_path.suffix + ".tmp")
+        try:
+            self.meta_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(self._links, indent=2), encoding="utf-8")
+            os.replace(temporary, self.meta_path)
+        except Exception:
+            logger.exception("[SavedMedia] Could not write the link file at %s", self.meta_path)
+
+    def _add(self, guild_key: str, other_key: str) -> None:
+        for guild, other in ((guild_key, other_key), (other_key, guild_key)):
+            entries = self._links.setdefault(guild, [])
+            if other not in entries:
+                entries.append(other)
+
+    # --------------------------------------------------------
+    # Lookups & mutation
+    # --------------------------------------------------------
+
+    def linked(self, guild_id: Any) -> list[int]:
+        """Every server whose saved pictures this one can send."""
+        return [int(entry) for entry in self._links.get(str(guild_id), [])]
+
+    def is_linked(self, guild_id: Any, other_id: Any) -> bool:
+        return str(other_id) in self._links.get(str(guild_id), [])
+
+    def link(self, guild_id: Any, other_id: Any) -> bool:
+        """Link two servers, returning False when they were already linked."""
+        if str(guild_id) == str(other_id):
+            raise ValueError("A server cannot be linked with itself")
+        if self.is_linked(guild_id, other_id):
+            return False
+        self._add(str(guild_id), str(other_id))
+        self._save()
+        return True
+
+    def unlink(self, guild_id: Any, other_id: Any) -> bool:
+        """Remove a link on both sides, returning False when there was none."""
+        removed = False
+        for guild, other in ((str(guild_id), str(other_id)), (str(other_id), str(guild_id))):
+            entries = self._links.get(guild) or []
+            if other in entries:
+                entries.remove(other)
+                removed = True
+            if not entries:
+                self._links.pop(guild, None)
+        if removed:
+            self._save()
+        return removed
 
 
 # ============================================================
@@ -546,7 +720,8 @@ def build_media_view(
             discord.ui.MediaGallery(
                 *(
                     discord.MediaGalleryItem(media=f"attachment://{file.filename}")
-                    for file in files
+                    # A gallery only shows the first ten, so stay inside its cap.
+                    for file in list(files)[:MAX_GALLERY_ITEMS]
                 )
             )
         )
@@ -607,6 +782,7 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
             kind.key: SavedMediaStore(kind.directory, kind.meta_path)
             for kind in KINDS
         }
+        self.links = LinkedGuilds(LINKED_PICS_META_PATH)
 
     # --------------------------------------------------------
     # Shared helpers
@@ -619,30 +795,40 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
     def store(self, kind: MediaKind) -> SavedMediaStore:
         return self.stores[kind.key]
 
+    def guild_label(self, guild_id: int) -> str:
+        """How a server is named in replies: its name, or its id if it is gone."""
+        guild = self.bot.get_guild(guild_id) if guild_id else None
+        name = getattr(guild, "name", None)
+        return f"**{name}**" if name else f"server `{guild_id}`"
+
+    def picture_links(
+        self, kind: MediaKind, guild_id: int
+    ) -> list[tuple[int, list[dict[str, Any]]]]:
+        """The saved pictures of every server linked with this one.
+
+        Only pictures are shared; videos and audio stay with the server they
+        were saved in.
+        """
+        if kind is not PICTURES:
+            return []
+        store = self.store(PICTURES)
+        found: list[tuple[int, list[dict[str, Any]]]] = []
+        for other in self.links.linked(guild_id):
+            records = store.stored_records(other)
+            if records:
+                found.append((other, records))
+        return found
+
     @staticmethod
     def byte_limit(ctx: commands.Context, kind: MediaKind) -> int:
-        """The largest file that can still be re-uploaded in this guild.
+        """The largest file this kind accepts when saving.
 
-        Discords's per-guild upload limit decides whether a saved file could ever
-        be sent back, so a file over it is refused up front rather than stored.
+        This is the kind's own limit rather than the server's current upload
+        cap: a boosted server can carry bigger files than an unboosted one, so
+        clamping to today's cap made a 25 MB picture impossible to save simply
+        because the server was not boosted yet.
         """
-        limit = getattr(ctx.guild, "filesize_limit", None) if ctx.guild else None
-        if isinstance(limit, int) and limit > 0:
-            return min(kind.max_bytes, limit)
         return kind.max_bytes
-
-    def upload_files(self, kind: MediaKind, record: dict[str, Any]) -> list[discord.File]:
-        """Upload-ready files, named after the attachments they were saved as."""
-        files: list[discord.File] = []
-        used: set[str] = set()
-        for index, (path, original) in enumerate(self.store(kind).files_for(record), start=1):
-            name = upload_name(original, path.name)
-            if name in used:
-                stem, suffix = Path(name).stem, Path(name).suffix
-                name = f"{stem}-{index}{suffix}"
-            used.add(name)
-            files.append(discord.File(str(path), filename=name))
-        return files
 
     @staticmethod
     async def delete_trigger(ctx: commands.Context) -> None:
@@ -665,10 +851,14 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
         *,
         prefix: str,
         heading: Optional[str] = None,
+        linked: Sequence[tuple[int, list[dict[str, Any]]]] = (),
     ) -> discord.ui.LayoutView:
         heading = heading or f"# Saved {kind.plural.title()}"
-        records = self.store(kind).stored_records(guild_id)
-        if not records:
+        store = self.store(kind)
+        records = store.stored_records(guild_id)
+        linked = [(source, found) for source, found in linked if found]
+
+        if not records and not linked:
             return simple_view(
                 f"{heading}\n"
                 f"No {kind.plural} have been saved in this server yet.\n"
@@ -676,18 +866,34 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
                 f"{article(kind.noun)} {kind.noun} attached."
             )
 
-        lines = [heading, f"**{len(records)}** {kind.singular}(s) saved here.", ""]
-        for record in records[:MAX_LISTED_NAMES]:
-            file_count = len(self.store(kind).paths(record))
+        def entry_line(record: dict[str, Any]) -> str:
+            file_count = len(store.paths(record))
             # ``updated_at`` moves whenever something is stacked on the name, so
             # the list reflects the newest save rather than the first one.
             saved = format_saved_at(record.get("updated_at") or record.get("saved_at"))
             author = record.get("author_name") or "unknown"
-            lines.append(
+            return (
                 f"> **{record['name']}** — `{file_count}` file(s) · saved {saved} by {author}"
             )
-        if len(records) > MAX_LISTED_NAMES:
-            lines.append(f"> _...and {len(records) - MAX_LISTED_NAMES} more._")
+
+        lines = [heading]
+        if records:
+            lines.append(f"**{len(records)}** {kind.singular}(s) saved here.")
+            lines.append("")
+            lines.extend(entry_line(record) for record in records[:MAX_LISTED_NAMES])
+            if len(records) > MAX_LISTED_NAMES:
+                lines.append(f"> _...and {len(records) - MAX_LISTED_NAMES} more._")
+        else:
+            lines.append(f"No {kind.plural} have been saved here yet.")
+
+        # Pictures shared by a linked server are listed under it, so their names
+        # are discoverable from either side of the link.
+        for source, found in linked:
+            lines.append("")
+            lines.append(f"**From {self.guild_label(source)}** (linked)")
+            lines.extend(entry_line(record) for record in found[:MAX_LISTED_NAMES])
+            if len(found) > MAX_LISTED_NAMES:
+                lines.append(f"> _...and {len(found) - MAX_LISTED_NAMES} more._")
 
         lines.append("")
         lines.append(
@@ -789,27 +995,46 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
         # Files that were already stacked under this name, which the new ones
         # land on top of instead of replacing.
         before_count = len(store.paths(previous)) if previous is not None else 0
-        record = store.append(
-            self.guild_id(ctx),
-            display,
-            accepted,
-            author_id=ctx.author.id,
-            author_name=ctx.author.display_name,
-            max_files=kind.max_files,
-        )
+        try:
+            record = store.append(
+                self.guild_id(ctx),
+                display,
+                accepted,
+                author_id=ctx.author.id,
+                author_name=ctx.author.display_name,
+                max_files=kind.max_files,
+            )
+        except NameFull as full:
+            # Nothing was saved, so the trigger message stays put: its
+            # attachments are still there to be saved under another name.
+            await ctx.send(
+                view=simple_view(
+                    f"❌ **{full.name}** is full — it holds {full.count} of "
+                    f"{full.max_files} {kind.plural}, and these {full.incoming} "
+                    "would not fit.\n"
+                    f"Save them under a different name instead: "
+                    f"`{prefix}{kind.save_command} <new name>`\n"
+                    "-# Nothing was deleted from the old name.",
+                    timeout=120,
+                )
+            )
+            return
 
         # The file lives on disk now, so the message it came in on can go.
         await self.delete_trigger(ctx)
 
         # Only the files this save added are echoed back; the rest of the stack
         # is already on the bot from earlier and does not need re-uploading.
-        files = self.upload_files(kind, {"files": record.get("added") or []})
+        added = store.files_for({"files": record.get("added") or []})
+        # The confirmation echoes the new files, and a stack can hold more than
+        # one message can carry, so the rest follow in their own messages.
+        batches = plan_batches(added)
+        files = build_upload_files(batches[0] if batches else [])
         total_files = len(store.paths(record))
-        dropped = record.get("dropped") or []
         total_bytes = sum(len(data) for _, _, data in accepted)
         body = (
             f"**Name:** `{record['name']}`\n"
-            f"**Files:** {len(files)} added · {total_files} total · "
+            f"**Files:** {len(added)} added · {total_files} total · "
             f"{format_size(total_bytes)}\n"
             f"-# Send it later with `{prefix}{kind.send_command} {record['key']}`"
         )
@@ -818,11 +1043,8 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
                 f"➕ Stacked on the {before_count} already saved under this name.\n"
                 + body
             )
-        if dropped:
-            body += (
-                f"\n-# Dropped the oldest {len(dropped)} to stay at "
-                f"{kind.max_files} per name."
-            )
+        if len(batches) > 1:
+            body += f"\n-# Sent across {len(batches)} messages."
         if skipped:
             body += "\n-# Skipped: " + ", ".join(skipped)
 
@@ -836,6 +1058,11 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
             files=files,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        for batch in batches[1:]:
+            await ctx.send(
+                files=build_upload_files(batch),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     # --------------------------------------------------------
     # Sending
@@ -855,36 +1082,87 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
                     guild_id,
                     prefix=prefix,
                     heading=f"# Command: {kind.send_command}",
+                    linked=self.picture_links(kind, guild_id),
                 )
             )
             return
 
+        # Pictures are shared with linked servers, so a name missing here may
+        # have been saved on the other side of the link.
+        linked_ids = self.links.linked(guild_id) if kind is PICTURES else []
         record = store.get(guild_id, display)
+        source_guild = guild_id
+        for other in linked_ids:
+            if record is not None:
+                break
+            record = store.get(other, display)
+            if record is not None:
+                source_guild = other
+
         if record is None:
-            suggestion = store.close_names(guild_id, display)
+            suggestion = list(store.close_names(guild_id, display))
+            for other in linked_ids:
+                suggestion.extend(store.close_names(other, display))
+            # Several servers can save the same name, so only list a name once.
+            suggestion = list(dict.fromkeys(suggestion))
             lines = [f"❌ Nothing is saved under **{display}**."]
             if suggestion:
                 lines.append("Did you mean: " + ", ".join(f"`{entry}`" for entry in suggestion))
             lines.append(
                 f"-# See everything saved here with `{prefix}{kind.list_command}`."
             )
+            if linked_ids:
+                lines.append(f"-# Also checked {len(linked_ids)} linked server(s).")
             await ctx.send(view=simple_view("\n".join(lines), timeout=120))
             return
 
-        files = self.upload_files(kind, record)
-        await ctx.send(
-            files=files,
-            allowed_mentions=discord.AllowedMentions.none(),
+        # A file that came from the other server says so, without wrapping it in
+        # an embed.
+        origin = (
+            f"-# From {self.guild_label(source_guild)}"
+            if source_guild != guild_id
+            else ""
         )
+
+        entries = store.files_for(record)
+        # A stack can hold far more files than one message can carry, so it goes
+        # out in batches instead of one upload that Discord rejects for size.
+        sent = 0
+        for batch in plan_batches(entries):
+            try:
+                await ctx.send(
+                    content=origin,
+                    files=build_upload_files(batch),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                # The note belongs on the first message only.
+                origin = ""
+            except discord.HTTPException:
+                logger.exception(
+                    "[SavedMedia] Could not send %s under %s", kind.plural, record["name"]
+                )
+                await ctx.send(
+                    view=simple_view(
+                        f"⚠️ Discord refused files {sent + 1}-{sent + len(batch)} "
+                        f"of {len(entries)} for **{record['name']}**.",
+                        timeout=120,
+                    )
+                )
+                return
+            sent += len(batch)
 
     # --------------------------------------------------------
     # Listing & deleting
     # --------------------------------------------------------
 
     async def list_media(self, ctx: commands.Context, kind: MediaKind) -> None:
+        guild_id = self.guild_id(ctx)
         await ctx.send(
             view=self.build_list_view(
-                kind, self.guild_id(ctx), prefix=await prefix_for(ctx)
+                kind,
+                guild_id,
+                prefix=await prefix_for(ctx),
+                linked=self.picture_links(kind, guild_id),
             )
         )
 
@@ -956,7 +1234,7 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
             "The image is stored on the bot's disk and the message you sent it in "
             "is deleted, then `{prefix}sendpic <name>` posts it again later.\n"
             "Saving under a name that is already taken stacks the new image on top "
-            "of the old ones instead of replacing them, up to 10 per name.\n"
+            "of the old ones instead of replacing them, up to 50 per name.\n"
             "Example: {prefix}ss frosty droppin a 2"
         ),
         extras={"example": "ss my picture  (with an image attached)"},
@@ -1129,6 +1407,166 @@ class SavedMedia(commands.Cog, name="SavedFiles"):
     @commands.cooldown(2, 15, commands.BucketType.user)
     async def delfile(self, ctx: commands.Context, *, name: str = "") -> None:
         await self.delete_media(ctx, AUDIO_FILES, name)
+
+    # --------------------------------------------------------
+    # ,linkpics / ,unlinkpics — share pictures between servers
+    # --------------------------------------------------------
+
+    def link_summary(self, guild_id: int, prefix: str) -> str:
+        """What this server is linked with, plus how to change it."""
+        linked = self.links.linked(guild_id)
+        if not linked:
+            return (
+                "This server is not linked with any other.\n"
+                f"**Usage:** `{prefix}linkpics <server id>` or "
+                f"`{prefix}linkpics <server id> <other server id>`\n"
+                f"-# Pictures saved with `{prefix}ss` in linked servers can be sent "
+                f"from both with `{prefix}sendpic <name>`."
+            )
+        lines = ["Linked with:"]
+        lines.extend(f"> {self.guild_label(other)} (`{other}`)" for other in linked)
+        lines.append("")
+        lines.append(f"-# Remove one with `{prefix}unlinkpics <server id>`.")
+        return "\n".join(lines)
+
+    async def is_bot_admin(self, ctx: commands.Context) -> bool:
+        admin_ids = getattr(ctx.bot, "bot_admin_ids", None) or set()
+        return ctx.author.id in admin_ids or await ctx.bot.is_owner(ctx.author)
+
+    @commands.command(
+        name="linkpics",
+        aliases=["linkpic", "sharepics"],
+        description="Share saved pictures between this server and another one.",
+        help=(
+            "Links this server with another one, so pictures saved with "
+            "`{prefix}ss` in either server can be sent from both with "
+            "`{prefix}sendpic <name>`.\n"
+            "With one id, this server is linked with that server; with two, those "
+            "two are linked and the command must come from one of them.\n"
+            "Run it with no arguments to see the current links.\n"
+            "Example: {prefix}linkpics 1554421630506115102 1463910314805297234"
+        ),
+        extras={"example": "linkpics 1554421630506115102 1463910314805297234"},
+    )
+    @_bot_admin_or_administrator()
+    @commands.guild_only()
+    @commands.cooldown(2, 15, commands.BucketType.user)
+    async def linkpics(self, ctx: commands.Context, first: str = "", second: str = "") -> None:
+        prefix = await prefix_for(ctx)
+        if not first:
+            await ctx.send(
+                view=simple_view(
+                    "# Command: linkpics\n" + self.link_summary(ctx.guild.id, prefix),
+                    timeout=180,
+                )
+            )
+            return
+
+        left = parse_guild_id(first)
+        right = parse_guild_id(second) if second else ctx.guild.id
+        if left is None or right is None:
+            await ctx.send(
+                view=simple_view(
+                    "❌ Those are not server ids.\n"
+                    f"**Usage:** `{prefix}linkpics <server id> [other server id]`"
+                )
+            )
+            return
+        if left == right:
+            await ctx.send(
+                view=simple_view("❌ A server cannot be linked with itself.")
+            )
+            return
+
+        # With two ids the command can be run from a third server, but only a
+        # bot admin may do that; otherwise it has to come from one of the two.
+        if ctx.guild.id not in (left, right) and not await self.is_bot_admin(ctx):
+            await ctx.send(
+                view=simple_view(
+                    "❌ Run this from one of the two servers being linked, or as a "
+                    "bot admin."
+                )
+            )
+            return
+
+        missing = [gid for gid in (left, right) if self.bot.get_guild(gid) is None]
+        if missing:
+            names = ", ".join(f"`{gid}`" for gid in missing)
+            await ctx.send(
+                view=simple_view(
+                    f"❌ I am not in {names}, so I cannot carry pictures there.\n"
+                    "-# Invite me to that server first, then run this again."
+                )
+            )
+            return
+
+        if not self.links.link(left, right):
+            await ctx.send(
+                view=simple_view(
+                    f"ℹ️ {self.guild_label(left)} and {self.guild_label(right)} are "
+                    "already linked."
+                )
+            )
+            return
+
+        await ctx.send(
+            view=simple_view(
+                f"🔗 Linked {self.guild_label(left)} with {self.guild_label(right)}.\n"
+                f"Pictures saved with `{prefix}ss` in either server can now be sent "
+                f"from both with `{prefix}sendpic <name>`.\n"
+                f"-# Undo it with `{prefix}unlinkpics <server id>`.",
+                timeout=180,
+            )
+        )
+
+    @commands.command(
+        name="unlinkpics",
+        aliases=["unlinkpic", "unsharepics"],
+        description="Stop sharing saved pictures with another server.",
+        help=(
+            "Removes the link between this server and the given one. The pictures "
+            "themselves stay where they were saved.\n"
+            "Example: {prefix}unlinkpics 1554421630506115102"
+        ),
+        extras={"example": "unlinkpics 1554421630506115102"},
+    )
+    @_bot_admin_or_administrator()
+    @commands.guild_only()
+    @commands.cooldown(2, 15, commands.BucketType.user)
+    async def unlinkpics(self, ctx: commands.Context, guild: str = "") -> None:
+        prefix = await prefix_for(ctx)
+        other = parse_guild_id(guild)
+        if other is None:
+            await ctx.send(
+                view=simple_view(
+                    "# Command: unlinkpics\n"
+                    + self.link_summary(ctx.guild.id, prefix)
+                    + f"\n**Usage:** `{prefix}unlinkpics <server id>`",
+                    timeout=180,
+                )
+            )
+            return
+        if other == ctx.guild.id:
+            await ctx.send(
+                view=simple_view("❌ A server cannot be linked with itself.")
+            )
+            return
+        if not self.links.unlink(ctx.guild.id, other):
+            await ctx.send(
+                view=simple_view(
+                    f"ℹ️ This server is not linked with {self.guild_label(other)} (`{other}`)."
+                )
+            )
+            return
+
+        await ctx.send(
+            view=simple_view(
+                f"🔗 Unlinked {self.guild_label(other)} (`{other}`).\n"
+                "-# Pictures that were shared stay saved in the server they were "
+                "saved in.",
+                timeout=180,
+            )
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

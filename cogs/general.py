@@ -19,6 +19,7 @@ from sqlalchemy import text
 from discord import ui, Interaction, SelectOption, ButtonStyle, app_commands
 from discord.ext import commands
 from utils.core.prefixes import render
+from utils.core.http_session import borrowed
 from utils.misc import MiscUtils
 from utils.cooldown import unified_cooldown
 from utils.core import mp3_buttons
@@ -54,6 +55,7 @@ COG_SELECT_LIMIT = 25
 #: feature rather than one entry per cog.
 CATEGORY_ORDER: tuple[str, ...] = (
     "🎵 Music & Media",
+    "🎧 Last.fm",
     "🎮 Games & Casino",
     "🕹️ Chat Games",
     "🎉 Fun",
@@ -71,7 +73,7 @@ CATEGORY_FOR_COG: dict[str, str] = {
     "Music": "🎵 Music & Media",
     "Mixtapes": "🎵 Music & Media",
     "Radio": "🎵 Music & Media",
-    "LastFM": "🎵 Music & Media",
+    "LastFM": "🎧 Last.fm",
     "SongInfo": "🎵 Music & Media",
     "SongOfTheDay": "🎵 Music & Media",
     "Covers": "🎵 Music & Media",
@@ -118,6 +120,7 @@ CATEGORY_FOR_COG: dict[str, str] = {
 
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "🎵 Music & Media": "Music, the mixtape library, radio, covers, remasters, stems and snippets.",
+    "🎧 Last.fm": "Listening stats, now playing, charts, crowns, who-knows and friends, in .fmbot's layout.",
     "🎮 Games & Casino": "Casino tables and the mini-game collection.",
     "🕹️ Chat Games": "Channel-wide games the whole server plays together in chat.",
     "🎉 Fun": "Fun, reaction counters and the meme TTS voices.",
@@ -636,11 +639,26 @@ class General(commands.Cog, name="General"):
         # No specific command requested — show interactive category menu.
         # Every cog is folded into a feature category, so related commands sit
         # together instead of one section per cog.
+        # A cog can attach commands to the bot after it has loaded - `cogs.lastfm`
+        # adds its Last.fm commands once the `lf` group exists - and those never
+        # appear in `cog.get_commands()`. Collect what the bot actually holds for
+        # each cog so a category can't go missing commands it really owns.
+        owned: dict[str, list] = {}
+        for command in self.bot.commands:
+            if command.cog is not None:
+                owned.setdefault(command.cog.qualified_name, []).append(command)
+
         grouped: dict[str, list] = {}
         for cog_name, cog in sorted(self.bot.cogs.items()):
             if cog_name in HIDDEN_COGS:
                 continue
-            cmds = [c for c in cog.get_commands() if not c.hidden]
+            cmds = []
+            seen: set[int] = set()
+            for command in (*cog.get_commands(), *owned.get(cog_name, ())):
+                if command.hidden or id(command) in seen:
+                    continue
+                seen.add(id(command))
+                cmds.append(command)
             if not cmds:
                 continue
             category = CATEGORY_FOR_COG.get(cog_name, "📁 Other")
@@ -1369,9 +1387,14 @@ class General(commands.Cog, name="General"):
     async def ping(self, ctx: commands.Context) -> None:
         websocket_latency = round(self.bot.latency * 1000, 2)
 
+        # Entering the typing context manager is exactly one POST to the typing
+        # endpoint, so timing the block measures that round trip. The previous
+        # version held the block open for a fixed 100ms and counted that sleep
+        # as latency, which reported ~100ms more than the call actually took.
+        # The indicator still shows for Discord's own ~10s either way.
         typing_start = discord.utils.utcnow()
         async with ctx.channel.typing():
-            await asyncio.sleep(0.1)
+            pass
         typing_end = discord.utils.utcnow()
         typing_latency = round((typing_end - typing_start).total_seconds() * 1000, 2)
 
@@ -1400,7 +1423,9 @@ class General(commands.Cog, name="General"):
         await ctx.reply(embed=embed)
 
     @commands.hybrid_command(
-        name="avatar", aliases=["av"], description="View the avatar of a user."
+        name="avatar",
+        aliases=["av", "pfp"],
+        description="View the avatar of a user -- yours when no one is given.",
     )
     @unified_cooldown(3)
     async def avatar(
@@ -1872,7 +1897,7 @@ class General(commands.Cog, name="General"):
     async def convert_currency(
         self, ctx: commands.Context, amount: float, from_currency: str, to_currency: str
     ):
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             try:
                 url = f"{self.currency_api}/{from_currency.lower()}.json"
                 async with session.get(url) as response:
@@ -2561,7 +2586,7 @@ class General(commands.Cog, name="General"):
             )
             return
 
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             coin = coin.upper()
             params = {
                 "symbol": coin,
@@ -2706,7 +2731,7 @@ class General(commands.Cog, name="General"):
             )
             return
 
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(f"https://ipapi.co/{ip_address}/json/") as response:
                 if response.status == 429:
                     await Embeds.warning(ctx, "⚠️ API Rate limit reached. Please try again later.", delete_after=10, reply=True)
@@ -2808,7 +2833,7 @@ class General(commands.Cog, name="General"):
             "Fetching NASA's Astronomy Picture of the Day...", delete_after=5
         )
         try:
-            async with aiohttp.ClientSession() as session:
+            async with borrowed() as session:
                 apod_url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
                 async with session.get(apod_url) as response:
                     rate_limit = response.headers.get("X-RateLimit-Limit")

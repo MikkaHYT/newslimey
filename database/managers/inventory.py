@@ -32,6 +32,7 @@ import discord
 import uuid
 import logging
 from utils.amount import AmountUtils
+from utils.core.http_session import borrowed
 
 logger = logging.getLogger("discord.client")
 
@@ -296,7 +297,7 @@ class InventoryMixin(BaseManager):
                 return price_record.price
 
             try:
-                async with aiohttp.ClientSession() as api_session:
+                async with borrowed() as api_session:
                     params = {"symbol": symbol.upper()}
                     headers = {
                         "Authorization": f"Bearer {os.getenv('FREECRYPTOAPI_API_KEY')}"

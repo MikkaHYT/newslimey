@@ -108,34 +108,41 @@ class ReactionRoleEntry:
 @dataclass
 class ReactionRoleDraft:
     title: str = ""
-    description: str = ""
     footer: str = ""
     color: int = field(default_factory=lambda: to_int_color(EMBED_COLOR))
     channel_id: Optional[int] = None
     entries: list[ReactionRoleEntry] = field(default_factory=list)
 
     def has_content(self) -> bool:
-        return bool(self.title or self.description)
+        return bool(self.title or self.entries)
+
+    def description(self) -> str:
+        """The generated emoji -> role list, one pairing per line."""
+        return "\n".join(
+            f"{entry.emoji}: <@&{entry.role_id}>" for entry in self.entries
+        )
 
     def preview(self) -> discord.Embed:
         """The plain embed that gets posted to the target channel."""
         embed = discord.Embed(color=self.color)
         if self.title:
             embed.title = self.title[:MAX_TITLE_LENGTH]
-        if self.description:
-            embed.description = self.description[:4096]
+        description = self.description()
+        if description:
+            embed.description = description[:4096]
         if self.footer:
             embed.set_footer(text=self.footer[:MAX_FOOTER_LENGTH])
         return embed
 
 
 def rr_preview_items(container: discord.ui.Container, draft: ReactionRoleDraft) -> None:
-    """Render the embed preview, then list the emoji/role pairings."""
+    """Render the embed preview, then say how many reactions are set."""
     lines = []
     if draft.title:
         lines.append(f"### **{draft.title}**")
-    if draft.description:
-        lines.append(draft.description[:MAX_DESCRIPTION_LENGTH])
+    description = draft.description()
+    if description:
+        lines.append(description[:MAX_DESCRIPTION_LENGTH])
     header_text = "\n".join(lines) if lines else "*Nothing set yet -- use Edit Text below.*"
     container.add_item(text_display(header_text))
 
@@ -143,16 +150,18 @@ def rr_preview_items(container: discord.ui.Container, draft: ReactionRoleDraft) 
         container.add_item(small_separator())
         container.add_item(text_display(f"-# {draft.footer}"))
 
+    container.add_item(small_separator())
     if draft.entries:
-        mapping = "\n".join(
-            f"{entry.emoji} → <@&{entry.role_id}>" for entry in draft.entries
+        container.add_item(
+            text_display(f"**Reactions** ({len(draft.entries)}/{MAX_REACTIONS})")
         )
     else:
-        mapping = "*No reactions added yet -- pick a role below.*"
-    container.add_item(small_separator())
-    container.add_item(
-        text_display(f"**Reactions** ({len(draft.entries)}/{MAX_REACTIONS})\n{mapping}")
-    )
+        container.add_item(
+            text_display(
+                f"**Reactions** (0/{MAX_REACTIONS})\n"
+                "*No reactions added yet -- pick a role below.*"
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -178,21 +187,15 @@ class ReactionRoleTextModal(discord.ui.Modal, title="Edit Text"):
             label="Title", style=discord.TextStyle.short, required=False,
             max_length=MAX_TITLE_LENGTH, default=draft.title,
         )
-        self.description_input = discord.ui.TextInput(
-            label="Description", style=discord.TextStyle.paragraph, required=False,
-            max_length=MAX_DESCRIPTION_LENGTH, default=draft.description,
-        )
         self.footer_input = discord.ui.TextInput(
             label="Footer", style=discord.TextStyle.short, required=False,
             max_length=MAX_FOOTER_LENGTH, default=draft.footer,
         )
         self.add_item(self.title_input)
-        self.add_item(self.description_input)
         self.add_item(self.footer_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         self.draft.title = self.title_input.value.strip()
-        self.draft.description = self.description_input.value.strip()
         self.draft.footer = self.footer_input.value.strip()
         self.parent_view.stop()
         new_view = ReactionRoleView(self.cog, self.author_id, self.draft)
@@ -443,7 +446,7 @@ class ReactionRoleView(discord.ui.LayoutView):
     async def post(self, interaction: discord.Interaction) -> None:
         if not self.draft.has_content():
             await interaction.response.send_message(
-                "❌ Add at least a title or description before posting.", ephemeral=True
+                "❌ Add a title or at least one reaction before posting.", ephemeral=True
             )
             return
         if not self.draft.channel_id or not interaction.guild:
@@ -777,10 +780,11 @@ class ReactionRole(commands.Cog, name="ReactionRole"):
     async def reactionrole(self, ctx: commands.Context) -> None:
         f"""Build an embed where reacting gives a role and unreacting removes it.
 
-        Set a title, description and footer if you want, then pick the role and
-        the emoji for each reaction (up to {MAX_REACTIONS} per message). When
-        someone reacts they get the role; when they remove the reaction the role
-        is taken back. Usage: `{PREFIX}reactionrole`
+        Set a title and footer if you want, then pick the role and the emoji for
+        each reaction (up to {MAX_REACTIONS} per message). The description is
+        built automatically as `emoji: @role` lines so members can see which role
+        each reaction gives. When someone reacts they get the role; when they
+        remove the reaction the role is taken back. Usage: `{PREFIX}reactionrole`
         """
         if ctx.guild is None:
             await ctx.send(

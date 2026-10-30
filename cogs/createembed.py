@@ -1182,6 +1182,10 @@ def build_script_embed(
     title = description = thumbnail = image = None
     footer_text: Optional[str] = None
     footer_icon: Optional[str] = None
+    author_name: Optional[str] = None
+    author_icon: Optional[str] = None
+    author_url: Optional[str] = None
+    embed_fields: list[tuple[str, str, bool]] = []
     buttons: list[discord.ui.Button] = []
     image_specs: list[ButtonSpec] = []
     image_ids: dict[str, str] = {}
@@ -1209,6 +1213,32 @@ def build_script_embed(
                 footer_icon = valid_http_url(parts[1])
                 if footer_icon is None:
                     warnings.append("footer icon URL")
+        elif key == "author":
+            parts = [part.strip() for part in value.split("&&")]
+            author_name = parts[0] if parts else ""
+            if len(parts) > 1 and parts[1]:
+                author_icon = valid_http_url(parts[1])
+                if author_icon is None:
+                    warnings.append("author icon URL")
+            if len(parts) > 2 and parts[2]:
+                author_url = valid_http_url(parts[2])
+                if author_url is None:
+                    warnings.append("author URL")
+        elif key == "field":
+            parts = [part.strip() for part in value.split("&&")]
+            field_name = parts[0] if parts else ""
+            field_value = parts[1] if len(parts) > 1 else ""
+            inline = False
+            if len(parts) > 2 and parts[2]:
+                inline = parts[2].strip().lower() in {"inline", "true", "yes", "1"}
+            if not (field_name or field_value):
+                warnings.append("field (needs a name or value)")
+            elif len(embed_fields) >= 25:
+                warnings.append("extra field (max 25)")
+            else:
+                embed_fields.append(
+                    (field_name[:MAX_TITLE_LENGTH], field_value[:1024], inline)
+                )
         elif key in ("thumbnail", "thumb"):
             thumbnail = valid_http_url(value)
             if value and thumbnail is None:
@@ -1248,6 +1278,14 @@ def build_script_embed(
         embed.title = title
     if description:
         embed.description = description
+    if author_name:
+        embed.set_author(
+            name=author_name[:MAX_TITLE_LENGTH],
+            icon_url=author_icon or None,
+            url=author_url or None,
+        )
+    for field_name, field_value, inline in embed_fields:
+        embed.add_field(name=field_name, value=field_value, inline=inline)
     if footer_text:
         embed.set_footer(text=footer_text[:2048], icon_url=footer_icon or None)
     if thumbnail:
@@ -1268,7 +1306,74 @@ def build_script_embed(
 
 
 def _embed_has_content(embed: discord.Embed) -> bool:
-    return bool(embed.title or embed.description or embed.image or embed.thumbnail)
+    return bool(
+        embed.title
+        or embed.description
+        or embed.image
+        or embed.thumbnail
+        or embed.fields
+    )
+
+
+#: Message link form: ``/channels/<guild>/<channel>/<message>``.
+MESSAGE_LINK_RE = re.compile(r"/channels/\d+/(\d+)/(\d+)")
+
+
+def _embed_script(embed: discord.Embed, message: discord.Message) -> str:
+    """Turn an existing embed back into a ``,ce {key: value}$v...`` script."""
+    fields: list[str] = []
+    author = getattr(embed, "author", None)
+    author_name = getattr(author, "name", None)
+    if author_name:
+        parts = [author_name]
+        if getattr(author, "icon_url", None):
+            parts.append(author.icon_url)
+        if getattr(author, "url", None):
+            parts.append(author.url)
+        fields.append("{{author: {}}}".format(" && ".join(parts)))
+    if embed.title:
+        fields.append("{{title: {}}}".format(embed.title))
+    if embed.description:
+        fields.append("{{description: {}}}".format(embed.description))
+    for field in getattr(embed, "fields", []):
+        parts = [field.name or "", field.value or ""]
+        if field.inline:
+            parts.append("inline")
+        fields.append("{{field: {}}}".format(" && ".join(parts)))
+    if embed.color is not None:
+        fields.append("{{color: #{:06X}}}".format(embed.color.value))
+
+    footer = getattr(embed, "footer", None)
+    footer_text = getattr(footer, "text", None)
+    if footer_text:
+        parts = [footer_text]
+        footer_icon = getattr(footer, "icon_url", None)
+        if footer_icon:
+            parts.append(footer_icon)
+        fields.append("{{footer: {}}}".format(" && ".join(parts)))
+
+    thumbnail = getattr(getattr(embed, "thumbnail", None), "url", None)
+    if thumbnail:
+        fields.append("{{thumbnail: {}}}".format(thumbnail))
+    image = getattr(getattr(embed, "image", None), "url", None)
+    if image:
+        fields.append("{{image: {}}}".format(image))
+
+    for row in message.components:
+        for child in getattr(row, "children", []):
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.style is not discord.ButtonStyle.link or not child.url:
+                continue
+            label = child.label
+            if not label:
+                label = str(child.emoji) if child.emoji else "Button"
+            state = "disabled" if child.disabled else "enabled"
+            fields.append(
+                "{{button: {} && {} && {}}}".format(child.url, label, state)
+            )
+
+    return SCRIPT_FIELD_SEP.join(fields)
 
 
 # ---------------------------------------------------------------------------
@@ -1457,6 +1562,102 @@ class CreateEmbed(commands.Cog, name="CreateEmbed"):
         draft = EmbedDraft()
         view = CreateEmbedView(self, ctx.author.id, draft)
         view.message = await ctx.send(view=view)
+
+    @commands.command(
+        name="embedcode",
+        aliases=["embedscript", "cecode"],
+        help="Get the script that rebuilds an existing embed with ,ce.",
+    )
+    @commands.has_permissions(manage_messages=True)
+    async def embedcode(
+        self, ctx: commands.Context, *, message: Optional[str] = None
+    ) -> None:
+        """Print the ``,ce`` script for an embed so it can be sent again.
+
+        Reply to a message containing an embed, or pass its id/link. The script
+        can be edited before it is used, then sent with ``,ce <script>``.
+        """
+        target: Optional[discord.Message] = None
+        try:
+            if message is None or not message.strip():
+                reference = ctx.message.reference
+                if reference is None:
+                    await ctx.send(
+                        view=simple_view(
+                            "❌ Reply to a message with an embed, or give me its id/link."
+                        )
+                    )
+                    return
+                resolved = reference.resolved
+                if isinstance(resolved, discord.Message):
+                    target = resolved
+                elif resolved is None and reference.message_id:
+                    target = await ctx.channel.fetch_message(reference.message_id)
+            else:
+                raw = message.strip()
+                match = MESSAGE_LINK_RE.search(raw)
+                if match:
+                    channel_id, message_id = int(match.group(1)), int(match.group(2))
+                    channel = self.bot.get_channel(channel_id)
+                    if channel is None:
+                        channel = await self.bot.fetch_channel(channel_id)
+                    target = await channel.fetch_message(message_id)
+                elif raw.isdigit():
+                    target = await ctx.channel.fetch_message(int(raw))
+                else:
+                    await ctx.send(
+                        view=simple_view("❌ Give me a message id or a message link.")
+                    )
+                    return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            await ctx.send(
+                view=simple_view("❌ I couldn't find that message in this channel.")
+            )
+            return
+
+        if target is None or not target.embeds:
+            await ctx.send(
+                view=simple_view("❌ That message doesn't have an embed I can copy.")
+            )
+            return
+
+        try:
+            scripts = [_embed_script(embed, target) for embed in target.embeds]
+        except Exception:
+            logger.exception("Could not turn an embed into a script")
+            await ctx.send(view=simple_view("❌ I couldn't read that embed."))
+            return
+        scripts = [script for script in scripts if script]
+        if not scripts:
+            await ctx.send(
+                view=simple_view("❌ That embed doesn't have anything I can copy.")
+            )
+            return
+
+        try:
+            prefix = await self.bot.get_prefix(ctx.message)
+        except Exception:
+            prefix = PREFIX
+        if isinstance(prefix, (list, tuple)):
+            prefix = prefix[0] if prefix else PREFIX
+        prefix = prefix or PREFIX
+
+        code = "\n".join(f"{prefix}ce {script}" for script in scripts)
+        if len(code) <= 1900:
+            note = ""
+            if len(scripts) > 1:
+                note = f"\n-# {len(scripts)} embeds: one command per line."
+            await ctx.reply(
+                f"```\n{code}\n```\n-# Edit it, then send it to post the embed again.{note}"
+            )
+            return
+
+        # Too long for a single message (a long description will do it), so
+        # hand it over as a file the code can be copied out of.
+        await ctx.reply(
+            "The script is too long for one message, so here it is as a file.",
+            file=discord.File(io.BytesIO(code.encode()), filename="embedcode.txt"),
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

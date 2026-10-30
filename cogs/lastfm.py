@@ -37,6 +37,9 @@ logger = logging.getLogger("discord.client")
 
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "f63c88e0962384991836abffb7957c30")
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+#: Accent for every Last.fm card. .fmbot uses a purple, and keeping it in one
+#: constant means the whole set can be retinted from here.
+LASTFM_ACCENT = 0x5B5BD6
 #: Only needed for the OAuth (scrobbling) half. Without it every write command
 #: reports that scrobbling isn't set up instead of failing opaquely.
 LASTFM_API_SECRET = os.getenv("LASTFM_API_SECRET", "").strip()
@@ -319,6 +322,22 @@ def parse_query_and_artist(raw_query: str) -> tuple[str, str]:
     return query, ""
 
 
+def split_title_and_artist(raw: str) -> tuple[str, str]:
+    """Split ``artist | track`` into its two halves, .fmbot's order.
+
+    Returns ``("", "")`` when no separator is present, so a caller can tell a
+    single value (a bare track name) apart from a pair. Unlike
+    :func:`parse_query_and_artist` this never guesses by splitting on a space,
+    which would turn "heart racing" into two names.
+    """
+    query = raw.strip()
+    for separator in ("|", " - ", ","):
+        if separator in query:
+            first, second = query.split(separator, 1)
+            return first.strip(), second.strip()
+    return "", ""
+
+
 # Markdown characters that would otherwise break out of a bold link label.
 _MARKDOWN_ESCAPES = str.maketrans({char: f"\\{char}" for char in "\\*_~`|[]"})
 
@@ -386,9 +405,10 @@ class LastFMView(discord.ui.LayoutView):
         thumbnail_index: Optional[int] = None,
         buttons: Optional[list[discord.ui.Button]] = None,
         media: Optional[str] = None,
+        footer: Optional[str] = None,
     ):
         super().__init__(timeout=180)
-        container = discord.ui.Container(accent_color=EMBED_COLOR)
+        container = discord.ui.Container(accent_color=LASTFM_ACCENT)
 
         blocks = [str(section).strip() for section in sections if str(section).strip()]
         container.add_item(discord.ui.TextDisplay(f"### {title}"))
@@ -420,6 +440,11 @@ class LastFMView(discord.ui.LayoutView):
                 )
             except Exception:
                 logger.warning("[LASTFM] Could not attach the rendered image", exc_info=True)
+
+        # .fmbot closes every card with a dim, small-text strip rather than a
+        # full embed footer, so the same line is available to every command here.
+        if footer:
+            container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
 
         if buttons:
             container.add_item(discord.ui.ActionRow(*buttons))
@@ -457,7 +482,7 @@ class PaginationView(discord.ui.LayoutView):
         self.total = max(total, 0)
         self.message: Optional[discord.Message] = None
 
-        self.container = discord.ui.Container(accent_color=EMBED_COLOR)
+        self.container = discord.ui.Container(accent_color=LASTFM_ACCENT)
         self.header = discord.ui.TextDisplay(f"### {title}")
         self.body = discord.ui.TextDisplay(body)
         self.footer = discord.ui.TextDisplay(self._footer_text())
@@ -483,7 +508,7 @@ class PaginationView(discord.ui.LayoutView):
         noun = {"artists": "artists", "tracks": "tracks", "albums": "albums"}.get(
             self.mode, "entries"
         )
-        return f"Page {self.page}/{self.total_pages} - {self.total:,} different {noun}"
+        return f"-# Page {self.page}/{self.total_pages} · {self.total:,} different {noun}"
 
     def update_buttons(self) -> None:
         at_start = self.page <= 1
@@ -571,6 +596,57 @@ def lf_sub(name: str, aliases: tuple[str, ...] = ()) -> Callable:
     return decorator
 
 
+#: .fmbot's top-level command names, keyed by the ``lf`` subcommand that already
+#: implements the feature. Every one of these is registered both as
+#: ``!lf <key>`` and as ``!<name>`` so the bot reads like .fmbot without taking
+#: the old spelling away. A name that is already taken on the bot is skipped
+#: rather than overriding whatever answered to it first.
+FMBOT_COMMANDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "profile": ("profile", ("stats",)),
+    "charts": ("chart", ("c",)),
+    "toptracks": ("toptracks", ("tt",)),
+    "topalbums": ("topalbums", ("talbums",)),
+    "recent": ("recent", ("rt",)),
+    "artist": ("artist", ("a",)),
+    "album": ("album", ("ab",)),
+    "track": ("track", ("t",)),
+    "loved": ("loved", ("loves",)),
+    "tags": ("tags",),
+    "similar": ("similar",),
+    "compare": ("taste", ("compare",)),
+    "streak": ("streak", ("str",)),
+    "topgenres": ("genres", ("topgenres",)),
+    "overview": ("overview", ("ov",)),
+    "scrobbles": ("scrobbles",),
+    "cover": ("cover",),
+    "genre": ("genre",),
+    "crowns": ("crowns", ("cw",)),
+    "crown": ("crown",),
+    "trackcrowns": ("trackcrowns", ("tcrowns",)),
+    "whoknows": ("whoknows", ("wk", "w")),
+    "gwk": ("globalwhoknows", ("gwk", "gw")),
+    "wktrack": ("whoknowstrack", ("wt", "wkt")),
+    "gwktrack": ("globalwhoknowstrack", ("gwt", "gwkt")),
+    "fwk": ("friendwhoknows", ("fwk", "fw")),
+    "fwktrack": ("friendwhoknowstrack", ("fwt", "fwkt")),
+    "friends": ("friends", ("f",)),
+    "addfriend": ("addfriend", ("af",)),
+    "removefriend": ("removefriend",),
+    "friendrequests": ("friendrequests",),
+    "milestone": ("milestone",),
+    "topcountries": ("topcountries",),
+    "artisttracks": ("artisttracks", ("at",)),
+    "artistalbums": ("artistalbums", ("aa",)),
+    "trackplays": ("trackplays", ("tp",)),
+    "albumplays": ("albumplays",),
+    "artistplays": ("artistplays",),
+    "auth": ("login", ("auth",)),
+    "logout": ("logout",),
+    "scrobble": ("scrobble",),
+    "judge": ("judge",),
+}
+
+
 # ============================================================
 # COG
 # ============================================================
@@ -600,6 +676,8 @@ class LastFM(commands.Cog):
         #: Set once the commands have been added to the main bot's `lf` group.
         self._attached: Optional[commands.Group] = None
         self._attach_task: Optional[asyncio.Task] = None
+        #: Top-level .fmbot-style commands added to the bot (removed on unload).
+        self._top_level: list[commands.Command] = []
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession(
@@ -678,12 +756,73 @@ class LastFM(commands.Cog):
             taken.update(kept)
             added += 1
 
+        added_top = 0
+        skipped_top: list[str] = []
+        for name, aliases, func in self.command_specs():
+            mapped = FMBOT_COMMANDS.get(name)
+            if mapped is None:
+                continue
+            if self._register_top_level(name, aliases, func):
+                added_top += 1
+            else:
+                skipped_top.append(mapped[0])
+
         self._attached = group
-        logger.info(f"[LASTFM] Added {added} subcommand(s) to the `lf` group.")
+        logger.info(
+            f"[LASTFM] Added {added} subcommand(s) to the `lf` group and "
+            f"{added_top} top-level .fmbot-style command(s)."
+        )
+        if skipped_top:
+            # Still reachable as `lf <sub>`; something else owns the short name.
+            logger.info(
+                "[LASTFM] Kept the existing command instead of overriding these "
+                f"short names: {', '.join(sorted(skipped_top))}"
+            )
+        return True
+
+    def _register_top_level(
+        self, name: str, aliases: tuple[str, ...], func: Callable
+    ) -> bool:
+        """Expose ``lf <name>`` as the .fmbot spelling, e.g. ``!chart``.
+
+        Names the bot already answers are left alone: something beat us to it
+        and silently replacing it would change an unrelated command's meaning.
+        """
+        mapped = FMBOT_COMMANDS.get(name)
+        if mapped is None:
+            return False
+        top_name = mapped[0]
+        top_aliases = mapped[1] if len(mapped) > 1 else ()
+        if self.bot.get_command(top_name) is not None:
+            return False
+        kept = tuple(a for a in top_aliases if self.bot.get_command(a) is None)
+        # Prefix-only, like the group children: the slash tree already synced
+        # and doesn't need forty more entries.
+        command = commands.HybridCommand(
+            func,
+            name=top_name,
+            aliases=kept,
+            help=inspect.cleandoc(func.__doc__ or "").strip() or None,
+            with_app_command=False,
+        )
+        command.cog = self  # type: ignore[assignment]
+        try:
+            self.bot.add_command(command)
+        except Exception as exc:
+            logger.warning(f"[LASTFM] Could not add `{top_name}`: {exc}")
+            return False
+        self._top_level.append(command)
         return True
 
     def detach_commands(self) -> None:
-        """Take this cog's commands back off the `lf` group (on reload)."""
+        """Take this cog's commands back off the bot (on reload)."""
+        for command in self._top_level:
+            try:
+                self.bot.remove_command(command.name)
+            except Exception:
+                pass
+        self._top_level.clear()
+
         group = self._attached
         if group is None:
             return
@@ -937,7 +1076,10 @@ class LastFM(commands.Cog):
     # NOW PLAYING (any music app)
     # ========================================================
 
-    @commands.command(name="applemusic", aliases=("am", "amnp", "wmp", "spotify"))
+    @commands.command(
+        name="applemusic",
+        aliases=("snp", "am"),
+    )
     async def applemusic(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
         """Show what a member is listening to on Apple Music, Spotify or WMP.
 
@@ -1186,6 +1328,9 @@ class LastFM(commands.Cog):
 
     @lf_sub(name="artist")
     async def lf_artist(self, ctx: commands.Context, *, artist: str = "") -> None:
+        artist = artist.strip()
+        if not artist:
+            artist, _track = await self._listening(ctx)
         if not artist:
             return await ctx.send(view=self.error_view("Usage: `!lf artist <artist>`"))
 
@@ -1218,7 +1363,11 @@ class LastFM(commands.Cog):
 
     @lf_sub(name="album")
     async def lf_album(self, ctx: commands.Context, *, query: str = "") -> None:
-        if not query:
+        if not query.strip():
+            album, artist = await self._listening_album(ctx)
+            if album:
+                query = f"{album} | {artist}"
+        if not query.strip():
             return await ctx.send(view=self.error_view("Usage: `!lf album <album> | <artist>`"))
 
         album, artist = parse_query_and_artist(query)
@@ -1251,8 +1400,12 @@ class LastFM(commands.Cog):
 
     @lf_sub(name="track")
     async def lf_track(self, ctx: commands.Context, *, query: str = "") -> None:
-        if not query:
-            return await ctx.send(view=self.error_view("Usage: `!lf track <track> | <artist>`"))
+        if not query.strip():
+            artist, track = await self._listening(ctx)
+            if track:
+                query = f"{track} | {artist}"
+        if not query.strip():
+            return await ctx.send(view=self.error_view("Usage: `!lf track <artist> | <track>`"))
 
         track, artist = parse_query_and_artist(query)
         try:
@@ -1317,6 +1470,9 @@ class LastFM(commands.Cog):
 
     @lf_sub(name="tags")
     async def lf_tags(self, ctx: commands.Context, *, artist: str = "") -> None:
+        artist = artist.strip()
+        if not artist:
+            artist, _track = await self._listening(ctx)
         if not artist:
             return await ctx.send(view=self.error_view("Usage: `!lf tags <artist>`"))
 
@@ -1339,6 +1495,9 @@ class LastFM(commands.Cog):
 
     @lf_sub(name="similar")
     async def lf_similar(self, ctx: commands.Context, *, artist: str = "") -> None:
+        artist = artist.strip()
+        if not artist:
+            artist, _track = await self._listening(ctx)
         if not artist:
             return await ctx.send(view=self.error_view("Usage: `!lf similar <artist>`"))
 
@@ -1541,7 +1700,7 @@ class LastFM(commands.Cog):
                 view=self.error_view("Custom commands can only contain letters and numbers.")
             )
 
-        if command_name in {"lf", "np", "fm", "help"}:
+        if command_name in {"lf", "np", "snp", "applemusic", "help"}:
             return await ctx.send(view=self.error_view(f"`!{command_name}` is already reserved."))
 
         account["custom_command"] = command_name
@@ -1593,6 +1752,55 @@ class LastFM(commands.Cog):
             else artist_data
         )
         return text(first.get("name")), artist
+
+    async def _listening(self, ctx: commands.Context) -> tuple[str, str]:
+        """What the caller is scrobbling right now, as ``(artist, track)``.
+
+        Commands fall back to this when they are called without a name, so
+        ``!artist`` or ``!whoknows`` answer for whatever is playing.
+        """
+        username = await self.username_for(ctx.author.id)
+        if not username:
+            return "", ""
+        track, artist = await self._now_playing(username)
+        return artist, track
+
+    async def _listening_album(self, ctx: commands.Context) -> tuple[str, str]:
+        """The album of whatever the caller is playing, as ``(album, artist)``."""
+        username = await self.username_for(ctx.author.id)
+        if not username:
+            return "", ""
+        track, artist = await self._now_playing(username)
+        if not track or not artist:
+            return "", ""
+        try:
+            data = await self.api("track.getInfo", track=track, artist=artist)
+        except Exception:
+            return "", ""
+        info = data.get("track", {})
+        album_data = info.get("album", {})
+        album = text(album_data.get("title")) if isinstance(album_data, dict) else ""
+        return album, artist
+
+    async def _track_candidates(
+        self, ctx: commands.Context, query: str
+    ) -> list[tuple[str, str]]:
+        """``(artist, track)`` pairs to try for a "who knows this track" query.
+
+        .fmbot writes ``artist | track``; the older ``track | artist`` order is
+        kept as a fallback and the store decides which reading has any plays.
+        With no argument the track the caller is playing right now is used.
+        """
+        first, second = split_title_and_artist(query) if query.strip() else ("", "")
+        if first and second:
+            pairs = [(first, second), (second, first)]
+        elif query.strip():
+            artist, _track = await self._listening(ctx)
+            pairs = [(artist, query.strip())]
+        else:
+            artist, track = await self._listening(ctx)
+            pairs = [(artist, track)]
+        return [(a, t) for a, t in pairs if a and t]
 
     async def _artist_tags(self, artist: str, limit: int = 10) -> list[str]:
         try:
@@ -1675,6 +1883,7 @@ class LastFM(commands.Cog):
         if guild is None:
             return []
         found: list[tuple[discord.Member, str]] = []
+        unlinked = 0
         for member in guild.members:
             if member.bot:
                 continue
@@ -1683,6 +1892,16 @@ class LastFM(commands.Cog):
                 found.append((member, username))
                 if len(found) >= SERVER_MEMBER_LIMIT:
                     break
+            else:
+                unlinked += 1
+        if unlinked:
+            # One line for the whole sweep rather than one per unlinked member.
+            logger.debug(
+                "[LASTFM] Guild %s: %s linked, %s without a Last.fm link",
+                guild.id,
+                len(found),
+                unlinked,
+            )
         return found
 
     async def _member_chart(
@@ -2102,6 +2321,10 @@ class LastFM(commands.Cog):
     @lf_sub(name="albumtracks", aliases=("alt",))
     async def lf_albumtracks(self, ctx: commands.Context, *, query: str = "") -> None:
         """The tracklist for an album, with each track's length."""
+        if not query.strip():
+            album, artist = await self._listening_album(ctx)
+            if album:
+                query = f"{album} | {artist}"
         if not query.strip():
             return await ctx.send(
                 view=self.error_view("Usage: `!lf albumtracks <album> | <artist>`")
@@ -2564,7 +2787,10 @@ class LastFM(commands.Cog):
         """Who holds the server crown for an artist, and can you steal it."""
         if ctx.guild is None:
             return await ctx.send(view=self.error_view("That only works inside a server."))
-        if not artist.strip():
+        artist = artist.strip()
+        if not artist:
+            artist, _track = await self._listening(ctx)
+        if not artist:
             return await ctx.send(view=self.error_view("Usage: `!lf crown <artist>`"))
         rows = await store.artist_plays_by_user(
             self.bot.db, await self._linked_ids(ctx.guild), artist
@@ -2653,8 +2879,14 @@ class LastFM(commands.Cog):
     async def _who_knows(
         self, ctx: commands.Context, artist: str, *, everywhere: bool
     ) -> None:
-        if not artist.strip():
-            return await ctx.send(view=self.error_view("Give me an artist to look up."))
+        artist = artist.strip()
+        if not artist:
+            # Called without a name: answer for what the caller is playing now.
+            artist, _track = await self._listening(ctx)
+        if not artist:
+            return await ctx.send(
+                view=self.error_view("Give me an artist, or start scrobbling something.")
+            )
         if everywhere:
             ids, guild, scope = await self._all_linked_ids(), None, "bot-wide"
         else:
@@ -2675,10 +2907,10 @@ class LastFM(commands.Cog):
     async def _who_knows_track(
         self, ctx: commands.Context, query: str, *, everywhere: bool
     ) -> None:
-        track, artist = parse_query_and_artist(query) if query.strip() else ("", "")
-        if not track or not artist:
+        candidates = await self._track_candidates(ctx, query)
+        if not candidates:
             return await ctx.send(
-                view=self.error_view("Usage: `!lf wktrack <track> | <artist>`")
+                view=self.error_view("Usage: `!lf wktrack <artist> | <track>`")
             )
         if everywhere:
             ids, guild, scope = await self._all_linked_ids(), None, "bot-wide"
@@ -2686,7 +2918,13 @@ class LastFM(commands.Cog):
             if ctx.guild is None:
                 return await ctx.send(view=self.error_view("That only works inside a server."))
             ids, guild, scope = await self._linked_ids(ctx.guild), ctx.guild, "this server"
-        rows = await store.track_plays_by_user(self.bot.db, ids, artist, track)
+        artist, track = candidates[0]
+        rows = []
+        for candidate in candidates:
+            rows = await store.track_plays_by_user(self.bot.db, ids, *candidate)
+            if rows:
+                artist, track = candidate
+                break
         await ctx.send(
             view=LastFMView(
                 title=f"Who knows {shorten(track)}",
@@ -2704,9 +2942,14 @@ class LastFM(commands.Cog):
         """Who across every server the bot shares listens to an artist."""
         await self._who_knows(ctx, artist, everywhere=True)
 
+    @lf_sub(name="whoknows", aliases=("wk", "w"))
+    async def lf_whoknows(self, ctx: commands.Context, *, artist: str = "") -> None:
+        """Who in this server listens to an artist, or to what you're playing."""
+        await self._who_knows(ctx, artist, everywhere=False)
+
     @lf_sub(name="wktrack")
     async def lf_wktrack(self, ctx: commands.Context, *, query: str = "") -> None:
-        """Who in this server listens to a track."""
+        """Who in this server listens to a track, as `artist | track`."""
         await self._who_knows_track(ctx, query, everywhere=False)
 
     @lf_sub(name="gwktrack")
@@ -2737,18 +2980,24 @@ class LastFM(commands.Cog):
 
     @lf_sub(name="fwktrack")
     async def lf_fwktrack(self, ctx: commands.Context, *, query: str = "") -> None:
-        """Which of your friends listen to a track."""
-        track, artist = parse_query_and_artist(query) if query.strip() else ("", "")
-        if not track or not artist:
+        """Which of your friends listen to a track, as `artist | track`."""
+        candidates = await self._track_candidates(ctx, query)
+        if not candidates:
             return await ctx.send(
-                view=self.error_view("Usage: `!lf fwktrack <track> | <artist>`")
+                view=self.error_view("Usage: `!lf fwktrack <artist> | <track>`")
             )
         friends = await store.friend_ids(self.bot.db, ctx.author.id)
         if not friends:
             return await ctx.send(
                 view=self.error_view(f"You have no friends added yet - try `!lf addfriend @member`.")
             )
-        rows = await store.track_plays_by_user(self.bot.db, friends, artist, track)
+        artist, track = candidates[0]
+        rows = []
+        for candidate in candidates:
+            rows = await store.track_plays_by_user(self.bot.db, friends, *candidate)
+            if rows:
+                artist, track = candidate
+                break
         await ctx.send(
             view=LastFMView(
                 title=f"Friends who know {shorten(track)}",
@@ -3383,7 +3632,7 @@ class LastFM(commands.Cog):
             return
 
         command_name = parts[0].lower()
-        if command_name in {"lf", "np", "fm", "help"}:
+        if command_name in {"lf", "np", "snp", "applemusic", "help"}:
             return
 
         account = self.data.get(str(message.author.id), {})

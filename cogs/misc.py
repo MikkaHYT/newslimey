@@ -11,6 +11,7 @@ from typing import Union
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 from utils.misc import MiscUtils
+from utils.core.http_session import borrowed
 from utils.cooldown import unified_cooldown
 from utils.embeds import Embeds
 from utils.guardrails import check_slash_guardrails
@@ -1371,7 +1372,7 @@ class Misc(commands.Cog, name="Misc"):
 
         url = f"https://api.weatherapi.com/v1/current.json?key={WEATHER_API_KEY}&q={location}&aqi=no"
 
-        async with aiohttp.ClientSession() as session:
+        async with borrowed() as session:
             async with session.get(url) as response:
                 if response.status != 200:
                     await Embeds.error(ctx, f"🚫 Couldn't retrieve weather data from API. Try again later. (HTTP {response.status})", reply=False)

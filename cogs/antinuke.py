@@ -10,19 +10,34 @@ time window.
     ,antinuke enable             turn protection on for this server
     ,antinuke disable            turn it off
     ,antinuke status             show every switch and threshold
+    ,antinuke config             same, for whoever manages the server
+    ,antinuke channel [on|off]   prevent mass channel create/delete
+    ,antinuke role [on|off]      prevent mass role create/delete
+    ,antinuke permissions [on|off]  watch dangerous permission grants
+    ,antinuke ban [on|off]       prevent mass member bans
+    ,antinuke kick [on|off]      prevent mass member kicks
+    ,antinuke webhook [on|off]   prevent mass webhook creation
+    ,antinuke vanity [on|off]    punish vanity / server profile edits
+    ,antinuke botadd [on|off]    punish new bot additions
+    ,antinuke emoji [on|off]     prevent mass emoji deletion
+    ,antinuke list               armed modules and the whitelist
     ,antinuke log #channel       where incidents are posted
     ,antinuke punishment ban     what happens to a nuker (ban/kick/strip)
     ,antinuke threshold ban 5    max actions allowed in the window
     ,antinuke window 10          length of the sliding window, seconds
+    ,antinuke admin @user        let a user edit these settings (owner only)
+    ,antinuke admins             who can edit these settings
+    ,antinuke whitelist @user    exempt a member (or bot) from protection
     ,antinuke trust add @user    exempt a user from protection
     ,antinuke trust role add @r  exempt everyone holding a role
     ,antinuke trustlist          show the exempt users
 
 Honeypot channels bait bots and scripts that blindly post into every channel
 they can see. Anybody who is not a configured honeypot moderator and posts in a
-honeypot channel is removed from the server, and the catch is logged in the
-honeypot channel itself with a running ``USERS CAUGHT`` counter and DM'd to the
-honeypot moderators.
+honeypot channel is removed from the server. The honeypot channel only ever
+holds one message: a bait card whose punishment and ``Accounts Caught`` counter
+are edited in place after every catch, so the channel never fills up. Catches
+are DM'd to the honeypot moderators and mirrored into the server logs.
 
     ,honeypot create             make (or adopt) a honeypot channel
     ,honeypot mod add @user      receive honeypot catch notifications
@@ -41,6 +56,7 @@ into the server-logs ``moderation`` feed when that cog is set up.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -62,10 +78,13 @@ LOG_CHANNEL_KEY = "antinuke_log_channel"
 PUNISHMENT_KEY = "antinuke_punishment"
 TRUSTED_USERS_KEY = "antinuke_trusted_users"
 TRUSTED_ROLES_KEY = "antinuke_trusted_roles"
+ADMINS_KEY = "antinuke_admins"
 WINDOW_KEY = "antinuke_window"
 THRESHOLD_KEY = "antinuke_threshold_{action}"
+MODULE_KEY = "antinuke_module_{module}"
 
 HONEYPOT_CHANNEL_KEY = "honeypot_channel"
+HONEYPOT_MESSAGE_KEY = "honeypot_message"
 HONEYPOT_MODS_KEY = "honeypot_mods"
 HONEYPOT_CAUGHT_KEY = "honeypot_caught"
 HONEYPOT_ACTION_KEY = "honeypot_action"
@@ -83,6 +102,9 @@ DEFAULT_THRESHOLDS: dict[str, int] = {
     "webhook_create": 2,
     "guild_update": 2,
     "member_role_update": 3,
+    "vanity": 0,
+    "bot_add": 0,
+    "emoji_delete": 3,
 }
 
 ACTION_LABELS: dict[str, str] = {
@@ -96,10 +118,83 @@ ACTION_LABELS: dict[str, str] = {
     "webhook_create": "Webhooks created",
     "guild_update": "Server edits",
     "member_role_update": "Dangerous roles given",
+    "vanity": "Vanity URL changes",
+    "bot_add": "Bots added",
+    "emoji_delete": "Emojis deleted",
 }
+
+#: Protection modules, the switches ``antinuke <module>`` flips. Order is the
+#: order they are listed in help/config output.
+MODULES: dict[str, dict[str, Any]] = {
+    "channel": {
+        "label": "Channels",
+        "help": "Prevent mass channel creation and deletion",
+        "actions": ("channel_create", "channel_delete"),
+    },
+    "role": {
+        "label": "Roles",
+        "help": "Prevent mass role creation and deletion",
+        "actions": ("role_create", "role_delete"),
+    },
+    "permissions": {
+        "label": "Permissions",
+        "help": "Watch dangerous permissions being granted",
+        "actions": ("role_update", "member_role_update"),
+    },
+    "ban": {
+        "label": "Bans",
+        "help": "Prevent mass member bans",
+        "actions": ("ban",),
+    },
+    "kick": {
+        "label": "Kicks",
+        "help": "Prevent mass member kicks",
+        "actions": ("kick",),
+    },
+    "webhook": {
+        "label": "Webhooks",
+        "help": "Prevent mass webhook creation",
+        "actions": ("webhook_create",),
+    },
+    "vanity": {
+        "label": "Vanity",
+        "help": "Punish users that change the server vanity or profile",
+        "actions": ("vanity", "guild_update"),
+    },
+    "botadd": {
+        "label": "Bot additions",
+        "help": "Prevent new bot additions",
+        "actions": ("bot_add",),
+    },
+    "emoji": {
+        "label": "Emojis",
+        "help": "Prevent mass emoji deletion",
+        "actions": ("emoji_delete",),
+    },
+}
+
+#: action key -> module that has to be armed for it to be enforced.
+ACTION_MODULE: dict[str, str] = {
+    action: module
+    for module, _spec in MODULES.items()
+    for action in _spec["actions"]
+}
+
+#: Words accepted by the ``antinuke <module>`` switches.
+ON_WORDS = frozenset({"on", "enable", "enabled", "true", "yes", "1"})
+OFF_WORDS = frozenset({"off", "disable", "disabled", "false", "no", "0"})
 
 PUNISHMENTS = ("ban", "kick", "strip")
 HONEYPOT_ACTIONS = ("ban", "kick", "timeout", "jail", "none")
+
+#: honeypot action -> how the bait card words the punishment.
+HONEYPOT_ACTION_TEXT: dict[str, str] = {
+    "ban": "a **ban**",
+    "kick": "a **kick**",
+    "timeout": "a **10 minute timeout**",
+    "jail": "a **jail**",
+    "none": "being **logged**",
+}
 
 #: Permissions that make a role dangerous to hand out or newly grant.
 DANGEROUS_PERMISSIONS: tuple[tuple[str, str], ...] = (
@@ -134,6 +229,37 @@ def _dedup_int(value: Any) -> Optional[int]:
         return None
 
 
+def _antinuke_admin_only() -> Any:
+    """Server owner, a stored anti-nuke admin, or anyone with Administrator.
+
+    ``antinuke admin @user`` hands out settings access without needing the
+    Administrator permission, mirroring Bleed's antinuke admin list.
+    """
+
+    async def predicate(ctx: commands.Context) -> bool:
+        cog = ctx.bot.get_cog("AntiNuke")
+        if cog is not None and cog.is_settings_admin(ctx):
+            return True
+        raise commands.MissingPermissions(["administrator"])
+
+    return commands.check(predicate)
+
+
+def _guild_owner_only() -> Any:
+    """Only the server owner (or a bot owner) may hand out anti-nuke admin."""
+
+    async def predicate(ctx: commands.Context) -> bool:
+        guild = getattr(ctx, "guild", None)
+        author = getattr(ctx, "author", None)
+        if guild is not None and getattr(author, "id", None) == guild.owner_id:
+            return True
+        if author is not None and await ctx.bot.is_owner(author):
+            return True
+        raise commands.CheckFailure("Only the server owner can do that.")
+
+    return commands.check(predicate)
+
+
 class AntiNuke(commands.Cog, name="AntiNuke"):
     """Threshold-based anti-nuke protection and honeypot channel bait."""
 
@@ -161,6 +287,31 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
             return False
         return self.settings.flag(ENABLED_KEY, False, guild_id=guild_id)
 
+    def _module_enabled(self, module: str, guild_id: int) -> bool:
+        """Whether one protection module is armed (they default to on)."""
+        if self.settings is None:
+            return False
+        return self.settings.flag(
+            MODULE_KEY.format(module=module), True, guild_id=guild_id
+        )
+
+    def _action_enabled(self, action: str, guild_id: int) -> bool:
+        module = ACTION_MODULE.get(action)
+        return module is None or self._module_enabled(module, guild_id)
+
+    def is_settings_admin(self, ctx: commands.Context) -> bool:
+        """Owner, a stored anti-nuke admin, or anyone with Administrator."""
+        guild = ctx.guild
+        author = ctx.author
+        if guild is None or getattr(author, "id", None) is None:
+            return False
+        if author.id == guild.owner_id:
+            return True
+        if author.id in self._stored_list(ADMINS_KEY, guild.id):
+            return True
+        permissions = getattr(author, "guild_permissions", None)
+        return bool(permissions and permissions.administrator)
+
     def _stored_int(self, key: str, guild_id: int) -> Optional[int]:
         if self.settings is None:
             return None
@@ -183,7 +334,8 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         value = self._stored_int(THRESHOLD_KEY.format(action=action), guild_id)
         if value is None:
             return DEFAULT_THRESHOLDS.get(action, 3)
-        return max(1, value)
+        # 0 is meaningful: the very first action crosses the threshold.
+        return max(0, value)
 
     def _window(self, guild_id: int) -> float:
         value = self._stored_int(WINDOW_KEY, guild_id)
@@ -372,6 +524,8 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         """Attribute an event to its actor and punish at most once per window."""
         if guild is None or not self._enabled(guild.id):
             return
+        if not self._action_enabled(action, guild.id):
+            return
         actor = await self._recent_audit(guild, audit_action, target_id)
         actor_user = getattr(actor, "user", None) if actor is not None else None
         if actor_user is None or self._is_exempt(guild, actor_user):
@@ -491,6 +645,8 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         guild = channel.guild
         if guild is None or not self._enabled(guild.id):
             return
+        if not self._action_enabled("webhook_create", guild.id):
+            return
         entry = await self._recent_audit(
             guild, discord.AuditLogAction.webhook_create, None
         )
@@ -521,11 +677,22 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
 
     @commands.Cog.listener()
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild) -> None:
+        if before.vanity_url_code != after.vanity_url_code:
+            await self._enforce(
+                after,
+                "vanity",
+                after,
+                discord.AuditLogAction.guild_update,
+                None,
+                detail=(
+                    f"Vanity URL changed from `{before.vanity_url_code or 'none'}` "
+                    f"to `{after.vanity_url_code or 'none'}`."
+                ),
+            )
+            return
         changes: list[str] = []
         if before.name != after.name:
             changes.append(f"name `{before.name}` → `{after.name}`")
-        if before.vanity_url_code != after.vanity_url_code:
-            changes.append("vanity URL changed")
         if not changes:
             return
         await self._enforce(
@@ -535,6 +702,43 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
             discord.AuditLogAction.guild_update,
             None,
             detail=f"{after.name} was edited: {', '.join(changes)}.",
+        )
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        """Punish whoever invited a bot when the botadd module is armed."""
+        if not member.bot or member.guild is None:
+            return
+        # A whitelisted bot may be invited without punishing the inviter.
+        if member.id in self._stored_list(TRUSTED_USERS_KEY, member.guild.id):
+            return
+        await self._enforce(
+            member.guild,
+            "bot_add",
+            member,
+            discord.AuditLogAction.bot_add,
+            member.id,
+            detail=f"Bot {member.mention} (`{member.id}`) was added to the server.",
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_emojis_update(
+        self, guild: discord.Guild, before: Any, after: Any
+    ) -> None:
+        remaining = {getattr(emoji, "id", None) for emoji in after}
+        removed = [emoji for emoji in before if getattr(emoji, "id", None) not in remaining]
+        if not removed:
+            return
+        first = removed[0]
+        names = ", ".join(f"`{emoji.name}`" for emoji in removed[:5])
+        extra = "" if len(removed) <= 5 else f" and {len(removed) - 5} more"
+        await self._enforce(
+            guild,
+            "emoji_delete",
+            first,
+            discord.AuditLogAction.emoji_delete,
+            getattr(first, "id", None),
+            detail=f"Emojis deleted: {names}{extra}.",
         )
 
     @commands.Cog.listener()
@@ -586,6 +790,75 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
 
     def _honeypot_caught(self, guild_id: int) -> int:
         return self._stored_int(HONEYPOT_CAUGHT_KEY, guild_id) or 0
+
+    def _honeypot_message_id(self, guild_id: int) -> Optional[int]:
+        return self._stored_int(HONEYPOT_MESSAGE_KEY, guild_id)
+
+    def _honeypot_bait_embed(self, guild_id: int) -> discord.Embed:
+        """The one message the honeypot channel holds, kept current in place."""
+        punishment = HONEYPOT_ACTION_TEXT.get(
+            self._honeypot_action(guild_id), "a **punishment**"
+        )
+        return discord.Embed(
+            title="⚠️ DO NOT SEND MESSAGES HERE! ⚠️",
+            color=GOLD,
+            description=(
+                "> This channel is a trap for compromised accounts.\n"
+                f"> Sending any message here will result in {punishment}.\n"
+                "\n"
+                f"🍯 Accounts Caught: **{self._honeypot_caught(guild_id)}**"
+            ),
+        )
+
+    async def _honeypot_sync_card(
+        self, guild: discord.Guild
+    ) -> Optional[discord.Message]:
+        """Edit the honeypot's single card; only post when it is genuinely gone.
+
+        Nothing else may be sent into a honeypot channel, so this is the only
+        place in the cog that writes there outside of the initial setup.
+        """
+        channel_id = self._honeypot_channel_id(guild.id)
+        if channel_id is None:
+            return None
+
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        if not isinstance(channel, discord.abc.Messageable):
+            return None
+
+        card = self._honeypot_bait_embed(guild.id)
+        message_id = self._honeypot_message_id(guild.id)
+        if message_id is not None:
+            try:
+                if hasattr(channel, "get_partial_message"):
+                    return await channel.get_partial_message(message_id).edit(embed=card)
+                stored = await channel.fetch_message(message_id)
+                return await stored.edit(embed=card)
+            except discord.NotFound:
+                pass
+            except (discord.Forbidden, discord.HTTPException):
+                logger.debug("Could not edit the honeypot card in %s", guild.id)
+                return None
+
+        # First setup, or an admin deleted the card. Post it once and remember it.
+        try:
+            message = await channel.send(embed=card)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.debug("Could not post the honeypot card in %s", guild.id)
+            return None
+        if self.settings is not None:
+            try:
+                await self.settings.set_value(
+                    HONEYPOT_MESSAGE_KEY, message.id, guild_id=guild.id
+                )
+            except Exception:
+                logger.debug("Could not persist the honeypot card id", exc_info=True)
+        return message
 
     def _honeypot_embed(
         self, member: Any, count: int, action: str, channel_id: int
@@ -709,17 +982,16 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
 
         card = self._honeypot_embed(message.author, count, applied, channel_id)
 
-        channel = guild.get_channel(channel_id)
-        if isinstance(channel, discord.abc.Messageable):
-            try:
-                await channel.send(embed=card)
-            except (discord.Forbidden, discord.HTTPException):
-                logger.debug("Could not post a honeypot catch in %s", guild.id)
+        # The channel keeps exactly one message: edit its counter in place rather
+        # than posting a catch card into the bait channel.
+        await self._honeypot_sync_card(guild)
         await self._honeypot_notify_mods(guild, card)
-        await self._mirror_to_serverlogs(guild, card)
 
         if action != "none":
+            # _log_incident already mirrors into the server-logs feed.
             await self._log_incident(guild, card)
+        else:
+            await self._mirror_to_serverlogs(guild, card)
 
     # ==================================================================
     # Anti-nuke commands
@@ -731,7 +1003,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         description="Threshold-based server protection.",
     )
     @commands.guild_only()
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke(self, ctx: commands.Context) -> None:
         """Show the anti-nuke command overview."""
@@ -741,14 +1013,28 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
             prefix = raw[0] if isinstance(raw, list) else raw
         lines = [
             f"`{prefix}antinuke enable|disable` — toggle protection",
-            f"`{prefix}antinuke status` — show every switch and threshold",
-            f"`{prefix}antinuke log #channel` — where incidents are posted",
+            f"`{prefix}antinuke status` · `config` — every switch and threshold",
+            "",
+            "**Modules** — `on`/`off`, or nothing to see the state",
+            f"`{prefix}antinuke channel [on|off]` — channel create and delete",
+            f"`{prefix}antinuke role [on|off]` — role create and delete",
+            f"`{prefix}antinuke permissions [on|off]` — dangerous grants",
+            f"`{prefix}antinuke ban [on|off]` · `kick [on|off]`",
+            f"`{prefix}antinuke webhook [on|off]` — mass webhook creation",
+            f"`{prefix}antinuke vanity [on|off]` — vanity and profile edits",
+            f"`{prefix}antinuke botadd [on|off]` — new bot additions",
+            f"`{prefix}antinuke emoji [on|off]` — mass emoji deletion",
+            f"`{prefix}antinuke list` — armed modules and the whitelist",
+            "",
+            "**Punishment**",
             f"`{prefix}antinuke punishment ban|kick|strip`",
-            f"`{prefix}antinuke threshold <action> <count>`",
-            f"`{prefix}antinuke window <seconds>`",
-            f"`{prefix}antinuke trust add|remove <user>`",
-            f"`{prefix}antinuke trust role add|remove <role>`",
-            f"`{prefix}antinuke trustlist`",
+            f"`{prefix}antinuke threshold <action> <count>` · `window <seconds>`",
+            f"`{prefix}antinuke log #channel` — where incidents are posted",
+            "",
+            "**Access and exemptions**",
+            f"`{prefix}antinuke admin @user` · `admins` — who may edit settings",
+            f"`{prefix}antinuke whitelist @user` — exempt a member or bot",
+            f"`{prefix}antinuke trust role add|remove <role>` · `trustlist`",
             f"`{prefix}antinuke reset` — clear counters and the trusted list",
         ]
         await Embeds.blurple(
@@ -759,7 +1045,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke.command(name="enable")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_enable(self, ctx: commands.Context) -> None:
         """Turn anti-nuke protection on for this server."""
@@ -771,7 +1057,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke.command(name="disable")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_disable(self, ctx: commands.Context) -> None:
         """Turn anti-nuke protection off for this server."""
@@ -783,7 +1069,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke.command(name="log", aliases=["logchannel"])
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_log(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Set the channel anti-nuke incidents are posted to."""
@@ -795,7 +1081,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke.command(name="punishment")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_punishment(
         self, ctx: commands.Context, punishment: str
@@ -816,7 +1102,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke.command(name="threshold")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_threshold(
         self, ctx: commands.Context, action: str, count: int
@@ -829,8 +1115,13 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
                 "Valid actions: " + ", ".join(f"`{a}`" for a in DEFAULT_THRESHOLDS),
                 delete_after=15,
             )
-        if count < 1:
-            return await Embeds.error(ctx, "The threshold must be at least 1.", delete_after=10)
+        if count < 0:
+            return await Embeds.error(
+                ctx,
+                "The threshold can't be negative — use `0` to punish the very "
+                "first action.",
+                delete_after=10,
+            )
         if self.settings is None:
             return await Embeds.error(ctx, "The settings store isn't ready yet.", delete_after=10)
         await self.settings.set_value(
@@ -843,7 +1134,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke.command(name="window")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_window(self, ctx: commands.Context, seconds: int) -> None:
         """Set the length of the sliding window, in seconds."""
@@ -856,29 +1147,37 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
             ctx, f"Protection window set to **{seconds}s**.", delete_after=10
         )
 
-    @antinuke.command(name="trustlist", aliases=["whitelist"])
-    @commands.has_permissions(administrator=True)
+    @antinuke.command(name="trustlist")
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_trustlist(self, ctx: commands.Context) -> None:
         """Show the users and roles exempt from anti-nuke protection."""
+        await self._send_trustlist(ctx)
+
+    async def _send_trustlist(self, ctx: commands.Context) -> None:
         guild = ctx.guild
         users = self._stored_list(TRUSTED_USERS_KEY, guild.id)
         roles = self._stored_list(TRUSTED_ROLES_KEY, guild.id)
         user_text = (
-            "\n".join(f"• <@{uid}> (`{uid}`)" for uid in users) if users else "*none*"
+            "\n".join(self._user_line(guild, uid) for uid in users) if users else "*none*"
         )
         role_text = (
             "\n".join(f"• <@&{rid}> (`{rid}`)" for rid in roles) if roles else "*none*"
         )
         await Embeds.info(
             ctx,
-            f"**Trusted users**\n{user_text}\n\n**Trusted roles**\n{role_text}",
-            title="🛡️ AntiNuke trust list",
+            f"**Whitelisted members and bots**\n{user_text}\n\n**Trusted roles**\n{role_text}",
+            title="🛡️ AntiNuke whitelist",
             delete_after=None,
         )
 
+    def _user_line(self, guild: discord.Guild, user_id: int) -> str:
+        member = guild.get_member(user_id) if guild is not None else None
+        bot = " 🤖" if getattr(member, "bot", False) else ""
+        return f"• <@{user_id}> (`{user_id}`){bot}"
+
     @antinuke.command(name="reset")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_reset(self, ctx: commands.Context) -> None:
         """Clear the sliding-window counters and trusted lists."""
@@ -890,11 +1189,20 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         await Embeds.success(ctx, "AntiNuke counters and trust list cleared.", delete_after=10)
 
     @antinuke.command(name="status")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_status(self, ctx: commands.Context) -> None:
         """Show the current anti-nuke configuration."""
-        guild = ctx.guild
+        await ctx.send(embed=self._status_embed(ctx.guild))
+
+    @antinuke.command(name="config")
+    @commands.has_permissions(manage_guild=True)
+    @discord.app_commands.default_permissions(manage_guild=True)
+    async def antinuke_config(self, ctx: commands.Context) -> None:
+        """View this server's antinuke configuration."""
+        await ctx.send(embed=self._status_embed(ctx.guild))
+
+    def _status_embed(self, guild: discord.Guild) -> discord.Embed:
         enabled = self._enabled(guild.id)
         log_id = self._stored_int(LOG_CHANNEL_KEY, guild.id)
         log_text = f"<#{log_id}>" if log_id else "*using server logs*"
@@ -910,7 +1218,9 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
             if honeypot_channel
             else "*not set up*"
         )
-        card = self._card(
+        admins = self._stored_list(ADMINS_KEY, guild.id)
+        admin_text = f"{len(admins)} configured" if admins else "*owner only*"
+        return self._card(
             "🛡️ AntiNuke Status",
             GREEN if enabled else RED,
             fields=[
@@ -919,14 +1229,262 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
                 ("Window", f"{self._window(guild.id):.0f}s", True),
                 ("Log channel", log_text, True),
                 ("Honeypot", honeypot_text, True),
+                ("Admins", admin_text, True),
+                ("Modules", self._module_lines(guild.id), False),
                 ("Thresholds", "\n".join(threshold_lines), False),
             ],
         )
-        await ctx.send(embed=card)
+
+    # -- modules ---------------------------------------------------------
+    def _module_lines(self, guild_id: int) -> str:
+        lines = []
+        for module, spec in MODULES.items():
+            mark = "✅" if self._module_enabled(module, guild_id) else "❌"
+            lines.append(f"{mark} **{spec['label']}** — {spec['help']}")
+        return "\n".join(lines)
+
+    async def _module_switch(
+        self, ctx: commands.Context, module: str, status: str
+    ) -> None:
+        spec = MODULES[module]
+        if self.settings is None:
+            return await Embeds.error(ctx, "The settings store isn't ready yet.", delete_after=10)
+        value = (status or "").strip().lower()
+        prefix = await _prefix(self.bot, ctx)
+        if not value:
+            armed = self._module_enabled(module, ctx.guild.id)
+            flip = "off" if armed else "on"
+            return await Embeds.info(
+                ctx,
+                f"**{spec['help']}**\n"
+                f"Status: {'✅ enabled' if armed else '❌ disabled'}\n"
+                f"-# Toggle with `{prefix}antinuke {module} {flip}`.",
+                title=f"🛡️ Antinuke · {spec['label']}",
+                delete_after=None,
+            )
+        if value not in ON_WORDS and value not in OFF_WORDS:
+            return await Embeds.error(
+                ctx, "Use `on` or `off`.", delete_after=10
+            )
+        armed = value in ON_WORDS
+        await self.settings.set_flag(
+            MODULE_KEY.format(module=module), armed, guild_id=ctx.guild.id
+        )
+        await Embeds.success(
+            ctx,
+            f"🛡️ **{spec['label']}** protection is now "
+            f"**{'enabled' if armed else 'disabled'}**.",
+            delete_after=10,
+        )
+
+    @antinuke.command(name="webhook")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_webhook(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent mass webhook creation."""
+        await self._module_switch(ctx, "webhook", status)
+
+    @antinuke.command(name="channel")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_channel(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent mass channel creation and deletion."""
+        await self._module_switch(ctx, "channel", status)
+
+    @antinuke.command(name="role")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_role(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent mass role creation and deletion."""
+        await self._module_switch(ctx, "role", status)
+
+    @antinuke.command(name="ban")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_ban(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent mass member bans."""
+        await self._module_switch(ctx, "ban", status)
+
+    @antinuke.command(name="kick")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_kick(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent mass member kicks."""
+        await self._module_switch(ctx, "kick", status)
+
+    @antinuke.command(name="vanity")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_vanity(self, ctx: commands.Context, status: str = "") -> None:
+        """Punish users that change the server vanity or profile."""
+        await self._module_switch(ctx, "vanity", status)
+
+    @antinuke.command(name="botadd", aliases=["bot"])
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_botadd(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent new bot additions."""
+        await self._module_switch(ctx, "botadd", status)
+
+    @antinuke.command(name="emoji", aliases=["emojis"])
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_emoji(self, ctx: commands.Context, status: str = "") -> None:
+        """Prevent mass emoji deletion."""
+        await self._module_switch(ctx, "emoji", status)
+
+    @antinuke.command(name="permissions", aliases=["perms"])
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_permissions(self, ctx: commands.Context, status: str = "") -> None:
+        """Watch dangerous permissions being granted."""
+        if (status or "").strip():
+            return await self._module_switch(ctx, "permissions", status)
+        watched = "\n".join(f"• {label}" for _attr, label in DANGEROUS_PERMISSIONS)
+        armed = self._module_enabled("permissions", ctx.guild.id)
+        prefix = await _prefix(self.bot, ctx)
+        await Embeds.info(
+            ctx,
+            f"**Watched permissions**\n{watched}\n\n"
+            f"Status: {'✅ enabled' if armed else '❌ disabled'}\n"
+            f"-# Toggle with `{prefix}antinuke permissions "
+            f"{'off' if armed else 'on'}`.",
+            title="🛡️ Antinuke · Permissions",
+            delete_after=None,
+        )
+
+    @antinuke.command(name="list")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_list(self, ctx: commands.Context) -> None:
+        """View all modules and whitelisted members and bots."""
+        guild = ctx.guild
+        users = self._stored_list(TRUSTED_USERS_KEY, guild.id)
+        whitelisted = (
+            "\n".join(self._user_line(guild, uid) for uid in users) if users else "*none*"
+        )
+        await Embeds.info(
+            ctx,
+            f"**Modules**\n{self._module_lines(guild.id)}\n\n"
+            f"**Whitelisted members and bots**\n{whitelisted}",
+            title="🛡️ Antinuke modules",
+            delete_after=None,
+        )
+
+    @antinuke.command(name="admin")
+    @_guild_owner_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_admin(self, ctx: commands.Context, *, member: str = "") -> None:
+        """Give a user access to the antinuke settings (owner only).
+
+        Run it as `antinuke admin @user`, `antinuke admin remove @user`, or with
+        no arguments to see who currently has access.
+        """
+        tokens = (member or "").split()
+        action = "add"
+        if tokens and tokens[0].lower() in ("remove", "revoke", "del", "delete"):
+            action = "remove"
+            tokens = tokens[1:]
+        elif tokens and tokens[0].lower() in ("add", "allow"):
+            tokens = tokens[1:]
+        if not tokens:
+            return await self._send_admins(ctx)
+        user = await self._resolve_user(ctx, " ".join(tokens))
+        if user is None:
+            return await Embeds.error(
+                ctx, "Mention the user or paste their id.", delete_after=10
+            )
+        if self.settings is None:
+            return await Embeds.error(ctx, "The settings store isn't ready yet.", delete_after=10)
+        admins = self._stored_list(ADMINS_KEY, ctx.guild.id)
+        if action == "add":
+            if user.id == ctx.guild.owner_id:
+                return await Embeds.info(
+                    ctx,
+                    "The server owner already has full access.",
+                    delete_after=10,
+                )
+            if user.id not in admins:
+                admins.append(user.id)
+            message = f"🛡️ <@{user.id}> can now edit the antinuke settings."
+        else:
+            admins = [uid for uid in admins if uid != user.id]
+            message = f"🛡️ <@{user.id}> can no longer edit the antinuke settings."
+        await self.settings.set_value(ADMINS_KEY, admins, guild_id=ctx.guild.id)
+        await Embeds.success(ctx, message, delete_after=10)
+
+    @antinuke.command(name="admins")
+    @commands.has_permissions(manage_guild=True)
+    @discord.app_commands.default_permissions(manage_guild=True)
+    async def antinuke_admins(self, ctx: commands.Context) -> None:
+        """View all antinuke admins."""
+        await self._send_admins(ctx)
+
+    async def _send_admins(self, ctx: commands.Context) -> None:
+        admins = self._stored_list(ADMINS_KEY, ctx.guild.id)
+        text = (
+            "\n".join(self._user_line(ctx.guild, uid) for uid in admins)
+            if admins
+            else "*none besides the server owner*"
+        )
+        prefix = await _prefix(self.bot, ctx)
+        await Embeds.info(
+            ctx,
+            f"**Owner**\n• <@{ctx.guild.owner_id}>\n\n"
+            f"**Antinuke admins**\n{text}\n\n"
+            f"-# Add one with `{prefix}antinuke admin @user`.",
+            title="🛡️ Antinuke admins",
+            delete_after=None,
+        )
+
+    @antinuke.command(name="whitelist")
+    @_antinuke_admin_only()
+    @discord.app_commands.default_permissions(administrator=True)
+    async def antinuke_whitelist(self, ctx: commands.Context, *, member: str = "") -> None:
+        """Whitelist a member (or a bot, so it may join) from antinuke.
+
+        Run it as `antinuke whitelist @user`, `antinuke whitelist remove
+        @user`, or with no arguments to see the list.
+        """
+        tokens = (member or "").split()
+        action = "add"
+        if tokens and tokens[0].lower() in ("remove", "revoke", "del", "delete"):
+            action = "remove"
+            tokens = tokens[1:]
+        elif tokens and tokens[0].lower() in ("add", "allow"):
+            tokens = tokens[1:]
+        if not tokens:
+            return await self._send_trustlist(ctx)
+        user = await self._resolve_user(ctx, " ".join(tokens))
+        if user is None:
+            return await Embeds.error(
+                ctx, "Mention the user or paste their id.", delete_after=10
+            )
+        await self._trust_change(ctx, user.id, add=action == "add")
+
+    async def _resolve_user(
+        self, ctx: commands.Context, text: str
+    ) -> Optional[discord.abc.User]:
+        """Resolve a mention or raw id, working for prefix and slash alike."""
+        match = re.search(r"\d{15,20}", text or "")
+        if match is None:
+            return None
+        user_id = int(match.group(0))
+        guild = getattr(ctx, "guild", None)
+        member = guild.get_member(user_id) if guild is not None else None
+        if member is not None:
+            return member
+        cached = ctx.bot.get_user(user_id)
+        if cached is not None:
+            return cached
+        try:
+            return await ctx.bot.fetch_user(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return None
 
     # -- trust (users) ---------------------------------------------------
     @antinuke.group(name="trust", invoke_without_command=True)
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_trust(self, ctx: commands.Context) -> None:
         """Manage users exempt from anti-nuke punishment."""
@@ -936,21 +1494,21 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         )
 
     @antinuke_trust.command(name="add")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_trust_add(self, ctx: commands.Context, user: discord.User) -> None:
         """Exempt a user from anti-nuke punishment."""
         await self._trust_change(ctx, user.id, add=True)
 
     @antinuke_trust.command(name="remove")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_trust_remove(self, ctx: commands.Context, user: discord.User) -> None:
         """Remove a user's exemption."""
         await self._trust_change(ctx, user.id, add=False)
 
     @antinuke_trust.command(name="role")
-    @commands.has_permissions(administrator=True)
+    @_antinuke_admin_only()
     @discord.app_commands.default_permissions(administrator=True)
     async def antinuke_trust_role(
         self, ctx: commands.Context, action: str, role: discord.Role
@@ -1058,7 +1616,13 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
                     delete_after=15,
                 )
 
+        previous_channel = self._honeypot_channel_id(guild.id)
         await self.settings.set_value(HONEYPOT_CHANNEL_KEY, channel.id, guild_id=guild.id)
+        if previous_channel != channel.id:
+            # A different channel means the stored card id belongs to the old one.
+            await self.settings.set_value(
+                HONEYPOT_MESSAGE_KEY, None, guild_id=guild.id
+            )
         await self.settings.set_flag(HONEYPOT_ENABLED_KEY, True, guild_id=guild.id)
         if self._stored_int(HONEYPOT_CAUGHT_KEY, guild.id) is None:
             await self.settings.set_value(HONEYPOT_CAUGHT_KEY, 0, guild_id=guild.id)
@@ -1072,21 +1636,13 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
                     HONEYPOT_MODS_KEY, mods, guild_id=guild.id
                 )
 
-        card = self._card(
-            "⚠️ Honeypot Channel",
-            ORANGE,
-            description=(
-                "**If you send a message here you will be banned.**\n\n"
-                "This channel exists to catch bots and scripts that post into "
-                "every channel they can see. Real members: do not type here."
-            ),
-            footer="Messages here are removed and the sender is punished.",
-        )
-        try:
-            warning = await channel.send(embed=card)
-            await warning.pin(reason="Honeypot warning")
-        except (discord.Forbidden, discord.HTTPException):
-            logger.debug("Could not post the honeypot warning in %s", guild.id)
+        warning = await self._honeypot_sync_card(guild)
+        if warning is not None:
+            try:
+                if not warning.pinned:
+                    await warning.pin(reason="Honeypot warning")
+            except (discord.Forbidden, discord.HTTPException):
+                logger.debug("Could not pin the honeypot warning in %s", guild.id)
 
         verb = "created" if created else "adopted"
         await Embeds.success(
@@ -1109,6 +1665,8 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         if self.settings is None:
             return await Embeds.error(ctx, "The settings store isn't ready yet.", delete_after=10)
         await self.settings.set_value(HONEYPOT_ACTION_KEY, choice, guild_id=ctx.guild.id)
+        # Keep the bait card's stated punishment in step right away.
+        await self._honeypot_sync_card(ctx.guild)
         await Embeds.success(
             ctx, f"Honeypot action set to **{choice}**.", delete_after=10
         )
@@ -1144,6 +1702,7 @@ class AntiNuke(commands.Cog, name="AntiNuke"):
         self._honeypot_seen = {
             key: value for key, value in self._honeypot_seen.items() if key[0] != ctx.guild.id
         }
+        await self._honeypot_sync_card(ctx.guild)
         await Embeds.success(ctx, "Honeypot counter reset to **0**.", delete_after=10)
 
     @honeypot.command(name="status")

@@ -1,4 +1,4 @@
-from .base import BaseManager
+from .base import BaseManager, _CACHE_MISS
 
 from sqlalchemy.future import select
 from sqlalchemy import delete, exists, update, func
@@ -77,25 +77,39 @@ class UserMixin(BaseManager):
                 await session.commit()
         except SQLAlchemyError as e:
             logging.error(f"Error adding to blacklist: {str(e)}")
+        self._cache_invalidate("blacklist")
 
     async def remove_from_blacklist(self, user_id: str) -> None:
         user_id = self.hash_user_id(user_id)
         async with self.async_sessionmaker() as session:
             await session.execute(delete(Blacklist).where(Blacklist.user_id == user_id))
             await session.commit()
+        self._cache_invalidate("blacklist")
 
     async def clear_blacklist(self) -> None:
         """Clear the entire blacklist."""
         async with self.async_sessionmaker() as session:
-            for entry in await session.execute(select(Blacklist)):
-                await session.delete(entry)
+            await session.execute(delete(Blacklist))
             await session.commit()
+        self._cache_invalidate("blacklist")
 
     async def is_user_blacklisted(self, user_id: str) -> bool:
+        """Whether a user is blacklisted.
+
+        Checked by every command, so the answer is memoised and dropped by the
+        three methods that change the list.
+        """
         user_id = self.hash_user_id(user_id)
+        cache_key = ("blacklist", user_id)
+        cached = self._cache_get(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
         async with self.async_sessionmaker() as session:
             result = await session.execute(select(Blacklist).filter_by(user_id=user_id))
-            return result.scalar_one_or_none() is not None
+            is_blacklisted = result.scalar_one_or_none() is not None
+        self._cache_set(cache_key, is_blacklisted)
+        return is_blacklisted
 
     async def get_blacklisted_users(self) -> list:
         async with self.async_sessionmaker() as session:
@@ -649,3 +663,5 @@ class UserMixin(BaseManager):
                     .where(Juul.holder_id == user_hash)
                     .values(holder_id=None)
                 )
+        # Their cooldown rows are gone; drop the memoised expiries with them.
+        self._cache_invalidate("cooldown")
