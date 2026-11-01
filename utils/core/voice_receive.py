@@ -60,6 +60,22 @@ except Exception:  # pragma: no cover - only if davey is missing
 _OPUS_LOAD_TRIED = False
 
 
+def _aes256gcm_decrypt(
+    ciphertext: bytes, aad: bytes, nonce: bytes, key: bytes
+) -> bytes:
+    """AES-256-GCM open, with libsodium when it has AES and ``cryptography`` otherwise.
+
+    Discord lists ``aead_aes256_gcm_rtpsize`` as a transport mode, but discord.py
+    never negotiates it, so nothing in this project opened one — which is one of
+    the few ways a live channel decrypts under *no* supported mode.
+    """
+    if getattr(bindings, "crypto_aead_aes256gcm_is_available", lambda: False)():
+        return bindings.crypto_aead_aes256gcm_decrypt(ciphertext, aad, nonce, key)
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    return AESGCM(key).decrypt(nonce, ciphertext, aad)
+
+
 def ensure_opus() -> bool:
     """Load libopus for decoding, returning whether it is usable.
 
@@ -175,14 +191,54 @@ class VoiceReceiver:
         #: Decoders are expensive to build, so one per speaker is kept warm.
         self._decoders: "OrderedDict[int, Any]" = OrderedDict()
         self._attached = False
+        #: RTP packets that reached the decrypt stage. This separates "nothing
+        #: is arriving" from "packets arrive and fail", which look identical
+        #: on a status card that only shows a decode count.
+        self.packets = 0
         self.dropped = 0
         self.decoded = 0
         #: Frames whose audio arrived without a SPEAKING event naming it.
         self.unidentified = 0
+        #: Drop counts by stage, so the status card can name where audio stops.
+        self.drop_reasons: dict[str, int] = {}
+        #: The transport mode that actually authenticated inbound audio.
+        self.working_mode: Optional[str] = None
+        #: The mode the voice connection negotiated, for comparison in status.
+        self.negotiated_mode: Optional[str] = None
+        #: Shape of the packets that failed to decrypt, for the status card, so
+        #: a key problem is visible without digging through the log.
+        self.decrypt_detail: Optional[str] = None
+        #: The layout variant that authenticated last, tried first next time.
+        self._preferred: Optional[str] = None
+        #: How many undecryptable packets have been dumped to the log, so the
+        #: raw bytes are captured without flooding it.
+        self._probe_logs = 0
+        #: How many Opus decode failures have been dumped, and whether a good
+        #: frame has been reported yet.
+        self._opus_probe = 0
+        self._opus_ok = False
+        self._dave_strip_logged = False
+        #: Stages of the last packet, kept for the one-shot debug dump.
+        self._stage_transport: Optional[bytes] = None
+        self._stage_dave: Optional[bytes] = None
+        self._debug_left = 3
+        #: Leading bytes that had to be skipped before Opus accepted a frame.
+        self._frame_skip = 0
+        #: One-shot logs for the DAVE path.
+        self._dave_ready_logged = False
+        self._dave_error_logged = False
+        #: Whether the "DAVE is negotiated but this speaker is unnamed" note has
+        #: been logged, so it appears once rather than on every frame.
+        self._dave_unknown_logged = False
+        #: One-shot capture of raw datagrams and decrypted frames, so the exact
+        #: layout of what Discord sends can be inspected offline.
+        self._raw_dumps_left = 4
+        self._frame_dumps_left = 4
         self._last_error: Optional[str] = None
         #: Encryption modes already reported, so an unknown one is logged once
         #: instead of on every packet.
         self._warned_modes: set[str] = set()
+        self._warned_unmapped = False
 
     # -- lifecycle -----------------------------------------------------
     @property
@@ -216,6 +272,18 @@ class VoiceReceiver:
     def last_error(self) -> Optional[str]:
         """Why the last packet was dropped, for the session's status card."""
         return self._last_error
+
+    def _fail(self, reason: str) -> None:
+        """Record a drop against the stage that caused it.
+
+        The error is the *latest* one rather than the first: a card that keeps
+        reporting the first failure of the session points at the wrong stage
+        once the pipeline moves on, which is exactly how "nothing heard yet"
+        became unreadable.
+        """
+        self.dropped += 1
+        self.drop_reasons[reason] = self.drop_reasons.get(reason, 0) + 1
+        self._last_error = reason
 
     def detach(self) -> None:
         if self._state is not None and self._attached:
@@ -262,7 +330,49 @@ class VoiceReceiver:
         return decoder
 
     # -- packet handling -----------------------------------------------
+    def _current_state(self) -> Optional[VoiceConnectionState]:
+        """Follow the connection when it is rebuilt, or audio can't decrypt.
+
+        A reconnect creates a new connection state with a new ``secret_key``.
+        A receiver still pointing at the old one decrypts with a dead key, so
+        every packet fails authentication and the bot looks deaf while packets
+        keep arriving. Rebinding also re-registers this callback, since the
+        reader belongs to the new state.
+        """
+        state = getattr(self.voice_client, "_connection", None)
+        if state is None or state is self._state:
+            return self._state
+        logger.info("Voice connection was rebuilt; rebinding the receiver")
+        self._state = state
+        try:
+            state.add_socket_listener(self._on_datagram)
+            reader = getattr(state, "_socket_reader", None)
+            if reader is not None:
+                reader.resume()
+        except Exception:
+            logger.debug("Could not rebind to the new voice state", exc_info=True)
+        return state
+
+    def _dump_stage(self, label: str, payload: bytes) -> None:
+        """Append one hex stage of a packet to ``data/voice_debug.txt``."""
+        try:
+            from pathlib import Path
+
+            path = Path("data/voice_debug.txt")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{label} ({len(payload)}B) {payload.hex()}\n")
+        except Exception:
+            logger.debug("Could not write the packet dump", exc_info=True)
+
     def _on_datagram(self, data: bytes) -> None:
+        if self._raw_dumps_left > 0:
+            self._raw_dumps_left -= 1
+            self._dump_stage("datagram", data)
+        try:
+            self._current_state()
+        except Exception:
+            logger.debug("Could not refresh the voice state", exc_info=True)
         try:
             decoded = self._handle(data)
         except Exception:
@@ -307,6 +417,7 @@ class VoiceReceiver:
             return None
 
         ssrc = struct.unpack_from(">I", packet, 8)[0]
+        self.packets += 1
         user_id = self.ssrc_users.get(ssrc)
         if user_id is None:
             # No SPEAKING event has named this voice. Decode it anyway under a
@@ -314,8 +425,8 @@ class VoiceReceiver:
             # it was speech, whatever the missing event would have called it.
             user_id = -int(ssrc) or -1
             self.unidentified += 1
-            if self._last_error != "unknown speaker":
-                self._last_error = "unknown speaker"
+            if not self._warned_unmapped:
+                self._warned_unmapped = True
                 logger.warning(
                     "Voice from ssrc %s has no SPEAKING event; transcribing it "
                     "as an unnamed speaker",
@@ -324,21 +435,92 @@ class VoiceReceiver:
 
         header = packet[:header_len]
         payload = packet[header_len:]
+        if self._frame_dumps_left > 0:
+            self._dump_stage(
+                f"header_len={header_len} mode={getattr(state, 'mode', '')!r} header",
+                header,
+            )
+            self._dump_stage("payload", payload)
         frame = self._decrypt(state, header, payload, bytes(secret), user_id)
         if frame is None:
-            self.dropped += 1
+            # `_decrypt` already recorded the stage that refused the packet.
             return None
+        if self._frame_dumps_left > 0:
+            self._frame_dumps_left -= 1
+            self._dump_stage("frame", frame)
+            try:
+                count = discord.opus.Decoder.packet_get_nb_frames(frame)
+                per = discord.opus.Decoder.packet_get_samples_per_frame(frame)
+                shape = (
+                    f"nb_frames={count} samples_per_frame={per} "
+                    f"total_ms={count * per / 48:.1f}"
+                )
+            except Exception as error:
+                shape = f"opus_parse_error={type(error).__name__}"
+            session = getattr(state, "dave_session", None)
+            try:
+                group = session.get_user_ids() if session is not None else None
+            except Exception:
+                group = "?"
+            try:
+                passthrough = (
+                    session.can_passthrough(user_id)
+                    if session is not None and user_id > 0
+                    else None
+                )
+            except Exception:
+                passthrough = "?"
+            logger.warning(
+                "Frame shape: %s | dave ready=%s version=%s group=%s passthrough=%s "
+                "| first12=%s",
+                shape,
+                getattr(session, "ready", None),
+                getattr(state, "dave_protocol_version", None),
+                group,
+                passthrough,
+                frame[:12].hex(" "),
+            )
         decoder = self._decoder_for(ssrc)
         if decoder is None:
+            self._fail("opus bindings")
             return None
         try:
-            pcm48 = decoder.decode(frame)
-        except Exception:
-            self._last_error = "opus"
-            logger.debug("Opus decode failed for ssrc %s", ssrc, exc_info=True)
+            pcm48 = self._decode(decoder, frame)
+        except Exception as error:
+            # A frame Opus rejects may still be valid a couple of bytes in: the
+            # DAVE envelope and RTP framing differ between implementations.
+            # Trying the offsets is cheap and the decoder rejects anything that
+            # is not a parseable packet.
+            self._fail("opus")
+            self._dump_frame(ssrc, frame, error)
+            if self._opus_probe < 3:
+                self._opus_probe += 1
+                session = getattr(state, "dave_session", None)
+                logger.warning(
+                    "Opus decode failed for ssrc %s (%s): frame(%d)=%s | "
+                    "dave=%s ready=%s version=%s",
+                    ssrc,
+                    type(error).__name__,
+                    len(frame),
+                    bytes(frame[:10]).hex(" "),
+                    session is not None,
+                    getattr(session, "ready", None),
+                    getattr(state, "dave_protocol_version", None),
+                )
             return None
+        if not self._opus_ok:
+            self._opus_ok = True
+            logger.info(
+                "First voice frame decoded: ssrc=%s frame(%d)=%s",
+                ssrc,
+                len(frame),
+                bytes(frame[:10]).hex(" "),
+            )
         if not pcm48:
             return None
+        # Audio came through end to end, so an earlier stage's complaint is no
+        # longer the state of the pipeline.
+        self._last_error = None
         return user_id, self._resample(pcm48)
 
     def _decrypt(
@@ -354,78 +536,366 @@ class VoiceReceiver:
         frame = self._decrypt_transport(mode, header, payload, key)
         if frame is None:
             return None
+        self._stage_transport = frame
+
+        if self._plaintext:
+            # Audio that arrived with no transport encryption at all: it is
+            # already decoded-ready Opus behind DAVE's passthrough marker, so
+            # running it through the E2EE layer again would corrupt it.
+            if frame.startswith(DAVE_MAGIC):
+                frame = frame[len(DAVE_MAGIC):]
+            if not frame:
+                self._fail("empty frame")
+                return None
+            self._stage_dave = frame
+            return frame
 
         session = getattr(state, "dave_session", None)
-        if frame.startswith(DAVE_MAGIC):
-            if session is not None and _DAVE_READY:
-                try:
-                    frame = session.decrypt(user_id, _DAVE_AUDIO, frame)
-                    if frame.startswith(DAVE_MAGIC):
-                        # Passthrough answers can keep the marker; the decoder
-                        # cannot take it either way.
-                        frame = frame[len(DAVE_MAGIC):]
-                except Exception as error:
-                    if self._last_error != "dave":
-                        logger.warning(
-                            "DAVE decrypt failed for user %s: %s", user_id, error
-                        )
-                    self._last_error = "dave"
-                    return None
-            else:
+        ready = bool(
+            session is not None
+            and _DAVE_READY
+            and getattr(session, "ready", False)
+        )
+        # davey keys every frame by the sender's user id and takes it as an
+        # unsigned integer. Audio whose ssrc no SPEAKING event named is tracked
+        # under a negative placeholder, which davey rejects before touching the
+        # frame — so the call achieved nothing while logging a failure that
+        # looked like the audio itself was unreadable.
+        if ready and user_id < 0:
+            if not self._dave_unknown_logged:
+                self._dave_unknown_logged = True
+                logger.info(
+                    "DAVE is negotiated but ssrc %s has no SPEAKING event, so "
+                    "its audio is passed through without per-user decryption",
+                    -user_id,
+                )
+            ready = False
+        if ready:
+            # A ready group decrypts *every* frame, not only the ones carrying
+            # the passthrough marker: davey hands plaintext frames back
+            # unchanged for speakers still in passthrough and decrypts the rest.
+            # Checking the marker first skipped exactly the encrypted frames,
+            # so ciphertext reached the Opus decoder and came out as static.
+            try:
+                plain = session.decrypt(user_id, _DAVE_AUDIO, frame)
+            except Exception as error:
+                plain = None
+                unencrypted = "Unencrypted" in type(error).__name__ or "Unencrypted" in str(
+                    error
+                )
+                if not self._dave_error_logged:
+                    self._dave_error_logged = True
+                    # "UnencryptedWhenPassthroughDisabled" just means davey saw
+                    # no DAVE magic on the frame, i.e. this speaker's audio is
+                    # plaintext. That is information, not a failure.
+                    logger.log(
+                        logging.INFO if unencrypted else logging.WARNING,
+                        "DAVE decrypt for user %s: %s (frame head %s, version=%s)",
+                        user_id,
+                        error,
+                        bytes(frame[:8]).hex(" "),
+                        getattr(state, "dave_protocol_version", None),
+                    )
+            if plain:
+                frame = plain
+                if frame.startswith(DAVE_MAGIC):
+                    frame = frame[len(DAVE_MAGIC):]
+                if not self._dave_ready_logged:
+                    self._dave_ready_logged = True
+                    logger.info(
+                        "DAVE decrypt is working: frame(%d) head %s",
+                        len(frame),
+                        bytes(frame[:8]).hex(" "),
+                    )
+        elif frame.startswith(DAVE_MAGIC):
                 # Passthrough mode leaves the Opus frame unencrypted behind the
                 # marker; with no session those two bytes are all that stands
-                # between the packet and the decoder.
+                # between the packet and the decoder. If the frame is really
+                # E2EE and we have no session, the decoder is about to reject
+                # ciphertext, so say which case this is.
+                if not self._dave_strip_logged:
+                    self._dave_strip_logged = True
+                    logger.warning(
+                        "Voice frame carries DAVE's %s marker but there is no "
+                        "usable DAVE session (version=%s); passing it to the "
+                        "Opus decoder as passthrough",
+                        DAVE_MAGIC.hex(),
+                        getattr(state, "dave_protocol_version", None),
+                    )
                 frame = frame[len(DAVE_MAGIC):]
-        return frame or None
+        if not frame:
+            self._fail("empty frame")
+            return None
+        self._stage_dave = frame
+        return frame
+
+    def _dump_frame(self, ssrc: int, frame: bytes, error: Exception) -> None:
+        """Write one undecodable frame, stage by stage, for offline analysis."""
+        if self._debug_left <= 0:
+            return
+        self._debug_left -= 1
+
+        def describe(data: bytes) -> str:
+            try:
+                frames = discord.opus.Decoder.packet_get_nb_frames(data)
+                per = discord.opus.Decoder.packet_get_samples_per_frame(data)
+                return f"nb_frames={frames} samples_per_frame={per}"
+            except Exception as problem:  # not a parseable Opus packet
+                return f"parse_error={type(problem).__name__}"
+
+        try:
+            from pathlib import Path
+
+            path = Path("data/voice_debug.txt")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"ssrc={ssrc} error={type(error).__name__} len={len(frame)}\n"
+                    f"  input      {frame.hex()}\n"
+                    f"  input      {describe(frame)}\n"
+                    f"  skip2      {frame[2:].hex()}  ({describe(frame[2:])})\n"
+                    f"  skip4      {frame[4:].hex()}  ({describe(frame[4:])})\n"
+                    f"  transport  {self._stage_transport.hex() if self._stage_transport else ''}\n"
+                    f"  dave       {self._stage_dave.hex() if self._stage_dave else ''}\n"
+                )
+        except Exception:
+            logger.debug("Could not write the voice debug dump", exc_info=True)
+
+    @staticmethod
+    def _decode(decoder: Any, frame: bytes) -> bytes:
+        """Decode one Opus frame from the start of the packet.
+
+        After transport (and DAVE) decryption the payload *is* the Opus packet,
+        TOC byte first, so it is decoded as-is. An earlier version scanned
+        offsets 0-8 on the connection's first frame and remembered whichever
+        one scored "most like speech"; that first frame is usually a tiny
+        silence packet, the scan picked offset 4, and every real frame after it
+        had its header cut off — which libopus happily turned into broadband
+        noise, so the transcriber heard static instead of the speaker.
+
+        Short prefixes are only tried when the frame genuinely will not parse
+        at zero, and only for that frame: no offset is carried over.
+        """
+        try:
+            return decoder.decode(frame)
+        except Exception:
+            for offset in (2, 4):
+                if len(frame) <= offset + 2:
+                    continue
+                try:
+                    return decoder.decode(frame[offset:])
+                except Exception:
+                    continue
+            raise
+
+    #: Transport modes this receiver can undo, tried in turn when the one the
+    #: connection negotiated does not authenticate. Every one of these is a MAC
+    #: or AEAD, so a candidate can only succeed on the frame the sender really
+    #: wrote: a wrong key, nonce or mode raises instead of returning garbage.
+    _MODES = (
+        "aeadxchacha20poly1305rtpsize",
+        "aeadaes256gcmrtpsize",
+        "xsalsa20poly1305lite",
+        "xsalsa20poly1305suffix",
+        "xsalsa20poly1305",
+    )
 
     def _decrypt_transport(
         self, mode: str, header: bytes, payload: bytes, key: bytes
     ) -> Optional[bytes]:
-        """Mirror discord.py's encryption for each transport mode it negotiates.
+        """Undo the transport encryption, discovering the mode if need be.
 
-        The mode is compared with its underscores stripped. discord.py names the
-        live mode ``aead_xchacha20_poly1305_rtpsize`` while this check used to
-        expect ``aead_xchacha20poly1305_rtpsize``, so no branch matched, every
-        packet was decrypted to ``None`` and nothing was ever transcribed.
+        The negotiated mode is tried first, then the others. Discord negotiates
+        one mode per connection, but when the name this build reports is not the
+        encryption actually on the wire every packet fails its authentication
+        and the receiver looks deaf. Falling back costs nothing in correctness
+        because each candidate is authenticated — the first success is proof.
         """
+        self.negotiated_mode = mode
+        self._plaintext = False
         normalised = (mode or "").replace("_", "").lower()
-        try:
-            if normalised == "aeadxchacha20poly1305rtpsize":
-                if len(payload) < 5:
-                    return None
-                # discord.py appends the 32-bit counter to the payload, and the
-                # 24-byte AEAD nonce is that counter followed by zeros.
-                nonce = bytes(payload[-4:]) + b"\x00" * 20
-                return bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
-                    bytes(payload[:-4]), header, nonce, key
+
+        # The negotiated mode first, then the other standard modes, then the
+        # layout variants that differ only in where the nonce counter sits or
+        # whether the RTP header is authenticated. Every candidate is a MAC or
+        # AEAD, so it can only succeed on the frame the sender really wrote: a
+        # wrong key, nonce, AAD or mode raises instead of returning garbage.
+        attempts: list[tuple[str, Callable[[], Optional[bytes]]]] = [
+            (name, lambda n=name: self._decrypt_as(n, header, payload, key))
+            for name in [normalised] + [m for m in self._MODES if m != normalised]
+        ]
+        attempts += self._layout_fns(header, payload, key)
+        if self._preferred:
+            attempts.sort(key=lambda item: item[0] != self._preferred)
+
+        failures: list[str] = []
+        for name, thunk in attempts:
+            try:
+                frame = thunk()
+            except Exception as error:
+                failures.append(f"{name}:{type(error).__name__}")
+                continue
+            if not frame:
+                continue
+            if self.working_mode != name:
+                if name != normalised:
+                    logger.warning(
+                        "Voice audio decrypts as %s, not the negotiated %r; "
+                        "using %s for this connection",
+                        name,
+                        mode,
+                        name,
+                    )
+                self.working_mode = name
+                self._preferred = name
+            return frame
+
+        if payload[: len(DAVE_MAGIC)] == DAVE_MAGIC:
+            # No cipher can authenticate this because it was never encrypted:
+            # Discord sends some audio as plaintext Opus behind DAVE's
+            # passthrough marker. Handing it on is safe — the marker is an
+            # explicit signal and the Opus decoder rejects anything else.
+            if self.working_mode != "plaintext (dave)":
+                self.working_mode = "plaintext (dave)"
+                logger.warning(
+                    "Voice audio is arriving unencrypted behind DAVE's %s marker; "
+                    "using it as-is",
+                    DAVE_MAGIC.hex(),
                 )
-            if normalised == "xsalsa20poly1305":
-                nonce = header + b"\x00" * 12
-                return bindings.crypto_secretbox_open(bytes(payload), nonce, key)
-            if normalised == "xsalsa20poly1305suffix":
-                if len(payload) < 25:
-                    return None
-                nonce = bytes(payload[-24:])
-                return bindings.crypto_secretbox_open(bytes(payload[:-24]), nonce, key)
-            if normalised == "xsalsa20poly1305lite":
-                if len(payload) < 5:
-                    return None
-                nonce = bytes(payload[-4:]) + b"\x00" * 20
-                return bindings.crypto_secretbox_open(bytes(payload[:-4]), nonce, key)
-        except Exception:
-            self._last_error = "decrypt"
-            logger.debug("Could not decrypt a voice packet (%s)", mode, exc_info=True)
-            return None
-        # A mode this receiver does not know: say so once, by name, rather than
-        # dropping every frame in silence.
-        if mode not in self._warned_modes:
-            self._warned_modes.add(mode)
-            self._last_error = f"unsupported encryption mode {mode!r}"
+            self._plaintext = True
+            return bytes(payload)
+
+        self._fail("decrypt")
+        self.decrypt_detail = (
+            f"negotiated {mode or 'nothing'}, {len(key)}-byte key, "
+            f"{len(payload)}-byte payload starting {bytes(payload[:6]).hex(' ')}"
+        )
+        # Nothing authenticated. Capture the raw packet once or twice: the hex
+        # of a real datagram is what settles whether the counter is a suffix, a
+        # prefix or absent, which no amount of guessing at cipher names does.
+        if self._probe_logs < 3:
+            self._probe_logs += 1
             logger.warning(
-                "Voice packets use encryption mode %r, which is not supported; "
-                "audio cannot be decoded",
+                "Voice packet did not authenticate: header=%s payload(%d)=%s "
+                "key=%d bytes mode=%r tried=%s",
+                header.hex(" "),
+                len(payload),
+                bytes(payload).hex(" "),
+                len(key),
                 mode,
+                ", ".join(failures[:10]),
             )
+        elif mode not in self._warned_modes:
+            self._warned_modes.add(mode)
+            logger.warning(
+                "No transport mode could decrypt a voice packet (negotiated %r, "
+                "key %d bytes, payload %d bytes): %s",
+                mode,
+                len(key),
+                len(payload),
+                ", ".join(failures[:10]),
+            )
+        return None
+
+    #: Where the authenticated part of the datagram ends. 24 is the header this
+    #: receiver parses (12-byte RTP header plus a 0xbede extension); 12 is the
+    #: case where the extension bit is set but nothing follows it; 20 and 16
+    #: cover an extension whose declared length is off by a word.
+    _SPLITS = (24, 12, 20, 16)
+
+    def _layout_fns(
+        self, header: bytes, payload: bytes, key: bytes
+    ) -> list[tuple[str, Callable[[], Optional[bytes]]]]:
+        """Every plausible split, counter order and AAD, with its cipher.
+
+        A captured packet ended `... 02 00 00 00`, `03`, `04` — a 32-bit counter
+        written little-endian, where discord.py writes it big-endian — and its
+        header set the RTP extension bit. Candidates therefore differ in three
+        things that no single guess can settle. All of them are authenticated,
+        so the first one that returns a frame is the layout the sender used.
+        """
+        attempts: list[tuple[str, Callable[[], Optional[bytes]]]] = []
+        for split in self._SPLITS:
+            if split > len(header):
+                continue
+            stream = bytes(header[split:]) + bytes(payload)
+            if len(stream) < 21:
+                continue
+            body, raw = stream[:-4], stream[-4:]
+            for order in ("le", "be"):
+                counter = raw if order == "le" else raw[::-1]
+                for aad_name, aad in (
+                    (f"h{split}", bytes(header[:split])),
+                    ("h12", bytes(header[:12])),
+                    ("none", b""),
+                ):
+                    attempts.append(
+                        (
+                            f"xchacha-{order}-{aad_name}-s{split}",
+                            lambda aad=aad, counter=counter, body=body: (
+                                bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                                    body, aad, counter + b"\x00" * 20, key
+                                )
+                            ),
+                        )
+                    )
+                    attempts.append(
+                        (
+                            f"aesgcm-{order}-{aad_name}-s{split}",
+                            lambda aad=aad, counter=counter, body=body: (
+                                _aes256gcm_decrypt(
+                                    body, aad, counter + b"\x00" * 8, key
+                                )
+                            ),
+                        )
+                    )
+                attempts.append(
+                    (
+                        f"xsalsa-{order}-s{split}",
+                        lambda counter=counter, body=body: (
+                            bindings.crypto_secretbox_open(
+                                body, counter + b"\x00" * 20, key
+                            )
+                        ),
+                    )
+                )
+        return attempts
+
+    @staticmethod
+    def _decrypt_as(
+        name: str, header: bytes, payload: bytes, key: bytes
+    ) -> Optional[bytes]:
+        """Decrypt one payload as a single named transport mode."""
+        if name == "aeadxchacha20poly1305rtpsize":
+            if len(payload) < 5:
+                return None
+            # discord.py appends the 32-bit counter to the payload, and the
+            # 24-byte AEAD nonce is that counter followed by zeros (verified
+            # against `VoiceClient._encrypt_aead_xchacha20_poly1305_rtpsize`).
+            nonce = bytes(payload[-4:]) + b"\x00" * 20
+            return bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                bytes(payload[:-4]), header, nonce, key
+            )
+        if name == "aeadaes256gcmrtpsize":
+            if len(payload) < 5:
+                return None
+            # Same rtpsize layout as xchacha, but the GCM nonce is 12 bytes.
+            nonce = bytes(payload[-4:]) + b"\x00" * 8
+            return _aes256gcm_decrypt(bytes(payload[:-4]), header, nonce, key)
+        if name == "xsalsa20poly1305":
+            nonce = header + b"\x00" * 12
+            return bindings.crypto_secretbox_open(bytes(payload), nonce, key)
+        if name == "xsalsa20poly1305suffix":
+            if len(payload) < 25:
+                return None
+            return bindings.crypto_secretbox_open(
+                bytes(payload[:-24]), bytes(payload[-24:]), key
+            )
+        if name == "xsalsa20poly1305lite":
+            if len(payload) < 5:
+                return None
+            nonce = bytes(payload[-4:]) + b"\x00" * 20
+            return bindings.crypto_secretbox_open(bytes(payload[:-4]), nonce, key)
         return None
 
     def _resample(self, pcm48: bytes) -> bytes:

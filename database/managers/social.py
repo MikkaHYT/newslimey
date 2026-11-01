@@ -4,6 +4,7 @@ from sqlalchemy.future import select
 from sqlalchemy import update, func
 from sqlalchemy.exc import SQLAlchemyError
 from ..models import (
+    Friend,
     Reputation,
     Skulls,
     Flames,
@@ -99,6 +100,68 @@ class SocialMixin(BaseManager):
                 if rep.discord_id == discord_id:
                     return rank
             return -1
+
+    # ------------------------------------------------------------------
+    # Friends list
+    # ------------------------------------------------------------------
+
+    async def add_friend(
+        self, guild_id: int, user_id: int, friend_id: int
+    ) -> bool | None:
+        """Add ``friend_id`` to ``user_id``'s friends list in ``guild_id``.
+
+        Returns ``True`` when the row was written, ``False`` when they are
+        already listed in that server, and ``None`` when the database refused
+        the write, so the command can tell those cases apart instead of
+        guessing.
+        """
+        await self.ensure_user_identity(user_id)
+        await self.ensure_user_identity(friend_id)
+        user_hash = self.hash_user_id(user_id)
+        friend_hash = self.hash_user_id(friend_id)
+        try:
+            async with self.async_sessionmaker() as session:
+                async with session.begin():
+                    existing = await session.execute(
+                        select(Friend.id).filter_by(
+                            guild_id=guild_id,
+                            user_id=user_hash,
+                            friend_id=friend_hash,
+                        )
+                    )
+                    if existing.scalar_one_or_none() is not None:
+                        return False
+                    session.add(
+                        Friend(
+                            guild_id=guild_id,
+                            user_id=user_hash,
+                            friend_id=friend_hash,
+                        )
+                    )
+            return True
+        except SQLAlchemyError as e:
+            logger.error(f"Error adding friend: {str(e)}")
+            return None
+
+    async def get_friends(self, guild_id: int, user_id: int) -> list[int]:
+        """Raw Discord IDs on ``user_id``'s list in ``guild_id``, oldest first."""
+        user_hash = self.hash_user_id(user_id)
+        try:
+            async with self.async_sessionmaker() as session:
+                result = await session.execute(
+                    select(Friend.friend_id)
+                    .filter_by(guild_id=guild_id, user_id=user_hash)
+                    .order_by(Friend.created_at, Friend.id)
+                )
+                hashes = [row[0] for row in result.all()]
+        except SQLAlchemyError as e:
+            logger.error(f"Error retrieving friends: {str(e)}")
+            return []
+
+        if not hashes:
+            return []
+        mapping = await self.resolve_user_hashes(hashes)
+        return [raw for raw in (mapping.get(h) for h in hashes) if raw]
 
     # ------------------------------------------------------------------
     # Unified reputation/karma score

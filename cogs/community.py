@@ -323,6 +323,94 @@ class Community(commands.Cog, name="Community"):
             delete_after=None,
         )
 
+    @commands.command(
+        name="friend",
+        aliases=["befriend"],
+        description="Add someone to your friends list in this server.",
+    )
+    @commands.guild_only()
+    @unified_cooldown(5)
+    async def friend(self, ctx: Context, member: discord.Member):
+        """Add ``member`` to your friends list in this server."""
+        if member.id == ctx.author.id:
+            await Embeds.error(
+                ctx, "You can't add yourself as a friend.", delete_after=None
+            )
+            return
+
+        added = await self.bot.database.add_friend(
+            ctx.guild.id, ctx.author.id, member.id
+        )
+        if added is None:
+            await Embeds.error(
+                ctx,
+                "Couldn't save that right now - please try again in a moment.",
+                delete_after=None,
+            )
+            return
+        if not added:
+            await Embeds.warning(
+                ctx,
+                f"{member.mention} is already on your friends list.",
+                delete_after=None,
+            )
+            return
+
+        await Embeds.success(
+            ctx,
+            f"Added {member.mention} to your friends list.",
+            title="Friend Added",
+            delete_after=None,
+        )
+
+    @commands.command(
+        name="friends", description="Show your friends list in this server."
+    )
+    @commands.guild_only()
+    @unified_cooldown(5)
+    async def friends(self, ctx: Context):
+        """List everyone on your friends list in this server."""
+        friend_ids = await self.bot.database.get_friends(
+            ctx.guild.id, ctx.author.id
+        )
+        if not friend_ids:
+            await Embeds.info(
+                ctx,
+                f"You don't have any friends in this server yet. Add one with "
+                f"`{ctx.prefix}friend @user`. Your list in other servers is "
+                f"separate.",
+                delete_after=None,
+            )
+            return
+
+        # A mention is the only reliable way to show someone who has since
+        # left the server, and the embed description has a hard 4096 limit, so
+        # the list is cut short rather than the whole message being rejected.
+        description = ""
+        shown = 0
+        for friend_id in friend_ids:
+            line = f"• <@{friend_id}>\n"
+            if len(description) + len(line) > 3900:
+                break
+            description += line
+            shown += 1
+        if shown < len(friend_ids):
+            description += f"…and **{len(friend_ids) - shown}** more."
+
+        embed = discord.Embed(
+            title=f"{ctx.author.display_name}'s Friends",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+        embed.set_author(
+            name=ctx.author.display_name,
+            icon_url=self.utils.get_avatar_url(ctx.author),
+        )
+        embed.set_footer(
+            text=f"{len(friend_ids)} friend{'s' if len(friend_ids) != 1 else ''}"
+        )
+        await ctx.send(embed=embed)
+
     @commands.hybrid_command(
         name="setspamchannel",
         aliases=["setspam"],

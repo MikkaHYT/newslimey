@@ -50,6 +50,28 @@ BOT_ADMINS_KEY = "bot_admins"
 #: logged, which is the default. Managed with `!admin logs exclude|include`.
 COMMAND_LOG_EXCLUDED_KEY = "command_log_excluded_guilds"
 
+#: Bot-wide: whether small servers are gated. While on, every server the bot
+#: joins that is below :data:`MEMBER_GATING_THRESHOLD_KEY` is warned and then
+#: left, unless the owner approved it by hand. Managed with `!membergating`.
+MEMBER_GATING_KEY = "member_gating"
+
+#: Bot-wide: the member count below which a server counts as small. Missing or
+#: unreadable means the built-in default (100, see ``cogs.membergating``).
+MEMBER_GATING_THRESHOLD_KEY = "member_gating_threshold"
+
+#: Bot-wide: guild ids the owner let through by hand, as a JSON list of ids.
+#: These are never warned or removed, whatever their size.
+MEMBER_GATING_APPROVED_KEY = "member_gating_approved_guilds"
+
+#: Bot-wide: custom title/description/colour for the warning card a gated server
+#: gets before the bot leaves, as a JSON object. Missing fields use the built-in
+#: default. Managed with `!membergating`.
+MEMBER_GATING_WARN_EMBED_KEY = "member_gating_warn_embed"
+
+#: Bot-wide: the same, for the farewell card posted immediately before the bot
+#: leaves a gated server.
+MEMBER_GATING_LEAVE_EMBED_KEY = "member_gating_leave_embed"
+
 #: Per-server: whether this server keeps its own economy instead of sharing the
 #: bot-wide one. Missing means OFF (managed with `!guildeconomy on|off`).
 GUILD_ECONOMY_KEY = "guild_economy"

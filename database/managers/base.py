@@ -1,4 +1,4 @@
-from sqlalchemy import text, event
+from sqlalchemy import text, event, inspect
 # The bot runs on a local SQLite database, so upserts use the SQLite dialect's
 # INSERT ... ON CONFLICT support (PostgreSQL's pg_insert is no longer used).
 from sqlalchemy.dialects.sqlite import insert as pg_insert
@@ -519,6 +519,7 @@ class BaseManager:
             await self._repair_game_history_columns()
             await self._repair_server_settings_columns()
             await self._repair_command_status_columns()
+            await self._repair_friends_guild_scope()
 
         try:
             await self._db_retry(_init, retries=self._db_retry_count, base_delay=2.0)
@@ -812,6 +813,45 @@ class BaseManager:
                     f"Schema repair for command_status.guild_id failed: {e}"
                 )
             logger.info("Repaired command_status guild_id column")
+
+    async def _repair_friends_guild_scope(self):
+        """Rebuild ``friends`` as a per-server table on the older global schema.
+
+        The first version of the table had no guild column, so its unique
+        constraint also spanned servers. The table is recreated with the same
+        name and the old rows are kept under the sentinel guild ``0``, which no
+        real server can match: they stay recoverable but are no longer visible
+        in anyone's list.
+        """
+        try:
+            async with self.engine.begin() as conn:
+                columns = await conn.run_sync(
+                    lambda sync_conn: {
+                        column["name"]
+                        for column in inspect(sync_conn).get_columns("friends")
+                    }
+                )
+        except SQLAlchemyError as e:
+            logger.debug(f"Could not inspect friends table: {e}")
+            return
+
+        if "guild_id" in columns:
+            return
+
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(text("ALTER TABLE friends RENAME TO friends_legacy"))
+                await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(
+                    text(
+                        "INSERT INTO friends (guild_id, user_id, friend_id, created_at) "
+                        "SELECT 0, user_id, friend_id, created_at FROM friends_legacy"
+                    )
+                )
+                await conn.execute(text("DROP TABLE friends_legacy"))
+            logger.info("Rebuilt friends table with per-server scoping")
+        except SQLAlchemyError as e:
+            logger.warning(f"Schema repair for friends.guild_id failed: {e}")
 
     def get_session(self):
         """Provide a transactional scope around a series of operations."""

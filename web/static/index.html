@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0d12" />
+    <title>Slimey · Dashboard</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/css/app.css" />
+  </head>
+  <body>
+    <div id="boot" class="boot">
+      <div class="boot-mark"></div>
+      <p>Waking the dashboard up…</p>
+    </div>
+
+    <section id="login" class="login hidden">
+      <form id="login-form" class="login-card" autocomplete="on">
+        <div class="login-logo" aria-hidden="true">
+          <svg viewBox="0 0 48 48" width="48" height="48">
+            <path d="M10 15c0-4 3-7 7-7h14c4 0 7 3 7 7v13c0 4-3 7-7 7h-8l-7 6v-6h-2c-4 0-7-3-7-7Z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+            <circle cx="19" cy="21" r="2.2" fill="currentColor"/>
+            <circle cx="29" cy="21" r="2.2" fill="currentColor"/>
+            <path d="M19 27c2 1.6 8 1.6 10 0" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <h1>Slimey dashboard</h1>
+        <p class="muted">Everything the bot can do, in one place.</p>
+        <label class="field">
+          <span>Password</span>
+          <input id="login-password" type="password" autocomplete="current-password" required />
+        </label>
+        <button class="btn primary wide" id="login-submit" type="submit">Unlock</button>
+        <p id="login-error" class="error" role="alert"></p>
+        <p class="tiny muted">The password is <code>DASHBOARD_PASSWORD</code> from the bot's environment.</p>
+      </form>
+    </section>
+
+    <div id="app" class="app hidden">
+      <aside class="rail">
+        <a class="rail-home" id="rail-home" href="#/overview" title="Overview" aria-label="Overview">
+          <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+            <path d="M4 12a8 8 0 1 1 16 0 8 8 0 0 1-16 0Z" fill="none" stroke="currentColor" stroke-width="2"/>
+            <path d="M8.5 13.5c1.8 1.6 5.2 1.6 7 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            <circle cx="9.4" cy="10.2" r="1.2" fill="currentColor"/>
+            <circle cx="14.6" cy="10.2" r="1.2" fill="currentColor"/>
+          </svg>
+        </a>
+        <div class="rail-divider"></div>
+        <div id="guild-rail" class="rail-guilds"></div>
+      </aside>
+
+      <nav class="sidebar">
+        <header class="brand">
+          <div>
+            <div class="brand-name">Slimey</div>
+            <div class="brand-sub" id="bot-tag">dashboard</div>
+          </div>
+          <span class="pill" id="latency-pill">—</span>
+        </header>
+
+        <div id="guild-header" class="guild-header"></div>
+        <div id="nav" class="nav"></div>
+
+        <footer class="sidebar-foot">
+          <div class="status-line">
+            <span class="dot" id="ws-dot"></span>
+            <span id="ws-label">Connecting…</span>
+          </div>
+          <button class="btn ghost small" id="logout" type="button">Sign out</button>
+        </footer>
+      </nav>
+
+      <main class="main">
+        <header class="topbar" id="topbar"></header>
+        <section class="view" id="view" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <div id="toasts" class="toasts" role="status"></div>
+    <div id="modal" class="modal hidden" role="dialog" aria-modal="true"></div>
+
+    <script type="module" src="/static/js/app.js"></script>
+  </body>
+</html>

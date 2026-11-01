@@ -262,6 +262,9 @@ class DiscordBot(commands.Bot):
         #: the process restarts. Deliberately in-memory: it does not outlive a
         #: restart, when `status_task` takes the presence back on its own.
         self.custom_status: str | None = None
+        #: Hybrid commands that fell back to prefix-only because Discord caps
+        #: global application commands at 100. Logged once loading finishes.
+        self._prefix_only_commands: list[str] = []
         self.version = "2026824"
         self.cool_guys = None
         #: Extra user IDs granted the owner/admin commands, on top of the
@@ -602,6 +605,28 @@ class DiscordBot(commands.Bot):
             return "!"
         return await self.database.get_prefix(message.guild.id) or "!"
 
+    def add_command(self, command: commands.Command, /) -> None:  # type: ignore[override]
+        """Register a command, dropping its slash form if Discord's tree is full.
+
+        A hybrid command lives in two registries: the prefix one is populated
+        first and always succeeds, while the slash tree raises
+        ``CommandLimitReached`` once 100 global application commands exist.
+        Letting that propagate aborts the whole extension, losing every command
+        in the cog, so the text command is kept and the slash form is dropped.
+        """
+        try:
+            super().add_command(command)
+        except app_commands.CommandLimitReached:
+            if not isinstance(command, (commands.HybridCommand, commands.HybridGroup)):
+                raise
+            command.with_app_command = False  # type: ignore[attr-defined]
+            command.app_command = None  # type: ignore[attr-defined]
+            self._prefix_only_commands.append(command.qualified_name)
+            self.logger.warning(
+                "Discord's 100 application command limit is full; registered "
+                f"`{command.qualified_name}` as prefix-only."
+            )
+
     async def load_cogs(self) -> None:
         cogs_path = Path(__file__).parent / "cogs"
         config = self.config
@@ -636,6 +661,15 @@ class DiscordBot(commands.Bot):
                 self.logger.error(
                     f"Failed to load extension {extension}\n{type(e).__name__}: {e}"
                 )
+
+        if self._prefix_only_commands:
+            shown = sorted(self._prefix_only_commands)
+            extra = f" (+{len(shown) - 25} more)" if len(shown) > 25 else ""
+            self.logger.warning(
+                f"{len(shown)} commands work with a prefix but have no slash form "
+                f"because Discord caps global application commands at 100: "
+                f"{', '.join(shown[:25])}{extra}"
+            )
 
     @tasks.loop(hours=1)
     async def cache_songs(self):

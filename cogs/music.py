@@ -75,7 +75,10 @@ HEARDLE_TOURNAMENT_JOIN_DURATION = 30
 #: Upper bound so a tournament can't run indefinitely.
 HEARDLE_TOURNAMENT_MAX_ROUNDS = 20
 HEARDLE_TOURNAMENT_MIN_PLAYERS = 2
-DEFAULT_SNIPPET_DURATION = 15
+#: How long the round's answer stays on screen before the next clip is posted.
+HEARDLE_TOURNAMENT_ROUND_DELAY = 2.5
+#: Length of a `!makesnip` clip, in seconds.
+DEFAULT_SNIPPET_DURATION = 30
 #: How many covers `!relapse` puts in its picker. Discord galleries hold ten.
 RELAPSE_MAX_COVERS = 10
 #: How long a member has to pick a song or reply with a cover number.
@@ -86,6 +89,14 @@ RELAPSE_VIDEO_SIZE = 720
 #: The frame rate of a `!relapse` video. The background never moves, so a low
 #: rate is visually identical and several times quicker to encode.
 RELAPSE_VIDEO_FPS = 10
+#: x264 options shared by `!relapse` and `!makesnip`. The background never
+#: moves, so the stillimage tuning plus the fastest preset gives the same
+#: picture for a fraction of the encode time.
+STILL_VIDEO_X264 = [
+    "-tune", "stillimage",
+    "-crf", "20",
+    "-pix_fmt", "yuv420p",
+]
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 MAX_NAME_TRANSFORMATIONS = 6
 GENIUS_API_TOKEN = os.getenv("GENIUS_API_KEY")
@@ -324,6 +335,8 @@ async def _render_relapse_video(
     audio_path: str,
     output_path: str,
     duration: float,
+    *,
+    start: float = 0.0,
 ) -> None:
     """Render the whole track over the cover, with no blur and no bars.
 
@@ -335,14 +348,15 @@ async def _render_relapse_video(
     # Decode the cover once per second and stretch that to the output rate.
     # Re-reading a large image 30 times a second was most of the render time.
     cmd += ["-loop", "1", "-framerate", "1", "-i", cover_path]
+    if start > 0:
+        # Input seeking: only the requested part of the track is decoded.
+        cmd += ["-ss", f"{start:.3f}"]
     cmd += ["-i", audio_path]
 
     cmd += [
         "-c:v", "libx264",
-        "-tune", "stillimage",
+        *STILL_VIDEO_X264,
         "-preset", "ultrafast",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
         "-r", str(RELAPSE_VIDEO_FPS),
         "-c:a", "aac",
         "-b:a", "192k",
@@ -359,7 +373,7 @@ async def _render_relapse_video(
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=900.0)
     except asyncio.TimeoutError:
         proc.kill()
-        raise TimeoutError("ffmpeg timed out while rendering the full track") from None
+        raise TimeoutError("ffmpeg timed out while rendering the video") from None
 
     if proc.returncode != 0:
         logger.error(
@@ -367,7 +381,45 @@ async def _render_relapse_video(
             proc.returncode,
             stderr.decode(errors="replace"),
         )
-        raise RuntimeError("ffmpeg failed to render the full track")
+        raise RuntimeError("ffmpeg failed to render the video")
+
+
+def _write_still_frame(image_path: str, frame_path: str) -> None:
+    """Scale a cover to the square `!relapse` renders at and save one frame."""
+    with Image.open(image_path) as loaded:
+        frame = loaded.convert("RGB")
+    frame.thumbnail((RELAPSE_VIDEO_SIZE, RELAPSE_VIDEO_SIZE), Image.LANCZOS)
+    width, height = frame.size
+    # yuv420p needs even dimensions.
+    frame = frame.crop((0, 0, width - width % 2, height - height % 2))
+    frame.save(frame_path)
+
+
+async def _render_snippet_video(
+    image_path: str,
+    audio_path: str,
+    output_path: str,
+    duration: float,
+    *,
+    start: float = 0.0,
+    frame_path: str,
+) -> None:
+    """Render a still cover over a slice of audio with the `!relapse` encoder.
+
+    moviepy used to do this through its pipe writer, which spent most of the
+    render re-encoding pixels frame by frame. Handing one still frame and the
+    audio straight to ffmpeg gives the same picture in a fraction of the time.
+    """
+    try:
+        await asyncio.to_thread(_write_still_frame, image_path, frame_path)
+        await _render_relapse_video(
+            frame_path, audio_path, output_path, duration, start=start
+        )
+    finally:
+        try:
+            os.remove(frame_path)
+        except OSError:
+            pass
 
 
 class Music(commands.Cog, name="Music"):
@@ -3993,6 +4045,101 @@ class Music(commands.Cog, name="Music"):
         text = re.sub(r"[^\w\s]", " ", text)
         return re.sub(r"\s+", " ", text).strip()
 
+    def _discard_tournament_round(self, prepared: Optional[dict]) -> None:
+        """Delete the files one prepared tournament round owns."""
+        if not prepared:
+            return
+        self.remove_file(prepared.get("payload"))
+        self.remove_file(prepared.get("image"))
+
+    async def _prepare_tournament_round(
+        self,
+        author_id: int,
+        round_number: int,
+        used_songs: set,
+    ) -> Optional[dict]:
+        """Pick an unused song and render its clip for one tournament round.
+
+        Called as a background task while the previous round is being guessed,
+        so the next clip is already on disk when the round ends. Ownership of
+        the rendered files passes to the caller; a failure cleans up after
+        itself.
+        """
+        data = None
+        for _ in range(3):
+            candidate = await self.fetch_random_playable_song()
+            if not candidate or not candidate.get("song"):
+                continue
+            song = candidate["song"]
+            key = song.get("id") or song.get("name") or candidate.get("path")
+            if key in used_songs:
+                continue
+            used_songs.add(key)
+            data = candidate
+            break
+
+        if data is None:
+            return None
+
+        song_data = data["song"]
+        path = data.get("path", "")
+        raw_track_title = song_data.get("name", "Unknown Title")
+        best_track_title = self.get_most_acceptable_track_name(raw_track_title)
+
+        acceptable_answers = {
+            self._normalize_heardle_guess(name)
+            for name in self.get_acceptable_track_names(raw_track_title)
+        }
+        for title in song_data.get("track_titles") or []:
+            acceptable_answers.update(
+                self._normalize_heardle_guess(name)
+                for name in self.get_acceptable_track_names(title)
+            )
+        acceptable_answers.discard("")
+
+        prepared = {
+            "image": (
+                f"{DOWNLOAD_CACHE_FOLDER_NAME}/"
+                f"{author_id}_temp_image_tournament_{round_number}.png"
+            ),
+            "payload": None,
+            "best_track_title": best_track_title,
+            "raw_track_title": raw_track_title,
+            "acceptable_answers": acceptable_answers,
+        }
+
+        try:
+            cover_slug = best_track_title.lower().replace(" ", "")
+            await self._fetch_best_cover(
+                cover_url=f"{JUICEWRLD_API}/juicewrld/cover/{cover_slug}.png",
+                album_art_url=f"{JUICEWRLD_API}/juicewrld/files/cover-art/",
+                album_art_params={"path": path},
+                avatar_url=self.default_avatar_url,
+                target_path=prepared["image"],
+            )
+            success, payload = await self.make_snippet(
+                prepared["image"],
+                f"{JUICEWRLD_API}/juicewrld/files/download-compressed/",
+                f"{author_id}_tournament_{round_number}",
+                HEARDLE_CLIP_DURATION,
+                path=path,
+            )
+            if not success:
+                self._discard_tournament_round(prepared)
+                return None
+        except asyncio.CancelledError:
+            self._discard_tournament_round(prepared)
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prepare tournament round %s", round_number
+            )
+            self._discard_tournament_round(prepared)
+            return None
+
+        prepared["payload"] = payload
+        return prepared
+
     def handle_user_done_snippet(self, user_id: int):
         self.snippet_debounce[user_id] = False
 
@@ -4010,7 +4157,8 @@ class Music(commands.Cog, name="Music"):
         """Create a short mp4 snippet from a static image and a downloaded audio file.
 
         Downloads the audio once, picks a random start point if none is provided,
-        and does the heavy moviepy work in a thread so the bot stays responsive.
+        and renders it with the same ffmpeg call as `!relapse`, so the clip comes
+        back without moviepy's pipe writer in the way.
         """
         temp_file_path = None
         output_path = None
@@ -4029,33 +4177,31 @@ class Music(commands.Cog, name="Music"):
                 # the default executor.
                 await asyncio.to_thread(_write_bytes, temp_file_path, song_bytes)
 
-            def _build():
-                orig_clip = AudioFileClip(temp_file_path)
-                actual_start = start_point
-                if actual_start is None:
-                    max_start = max(0, int(orig_clip.duration) - duration * 2)
-                    actual_start = random.randint(0, max_start)
+            try:
+                track_length = await _probe_audio_duration(temp_file_path)
+            except Exception:
+                logger.exception("Could not read the snippet's source audio")
+                return False, 500
 
-                sub_clip = orig_clip.subclipped(actual_start, actual_start + duration)
-                out = f"{DOWNLOAD_CACHE_FOLDER_NAME}/{file_name}.mp4"
-                final_clip = ImageClip(image_path).with_audio(sub_clip)
-                final_clip.duration = duration
-                final_clip.fps = 1
-                final_clip.write_videofile(
-                    out,
-                    codec="libx264",
-                    audio_codec="aac",
-                    logger=None,
-                    threads=2,
-                    preset="ultrafast",
-                    ffmpeg_params=["-tune", "stillimage", "-pix_fmt", "yuv420p"],
+            actual_start = start_point
+            if actual_start is None:
+                max_start = max(0, int(track_length) - duration * 2)
+                actual_start = random.randint(0, max_start)
+
+            output_path = f"{DOWNLOAD_CACHE_FOLDER_NAME}/{file_name}.mp4"
+
+            try:
+                await _render_snippet_video(
+                    image_path,
+                    temp_file_path,
+                    output_path,
+                    duration,
+                    start=actual_start,
+                    frame_path=f"{DOWNLOAD_CACHE_FOLDER_NAME}/{file_name}_frame.png",
                 )
-                final_clip.close()
-                sub_clip.close()
-                orig_clip.close()
-                return out
-
-            output_path = await asyncio.to_thread(_build)
+            except Exception:
+                logger.exception("ffmpeg could not render the snippet")
+                return False, 500
 
         finally:
             if temp_file_path:
@@ -4645,6 +4791,7 @@ class Music(commands.Cog, name="Music"):
         self.ongoing_heardle.append(ctx.channel.id)
         join_message = None
         round_message = None
+        prefetch: Optional[asyncio.Task] = None
         try:
             join_embed = discord.Embed(
                 title="🎧 Heardle Tournament",
@@ -4653,9 +4800,10 @@ class Music(commands.Cog, name="Music"):
                     f"The tournament starts in **{HEARDLE_TOURNAMENT_JOIN_DURATION} "
                     f"seconds** and runs for **{rounds}** "
                     f"round{'s' if rounds != 1 else ''}.\n"
-                    "Each round plays a short Juice WRLD clip — everyone who "
-                    "names the song before the timer runs out scores a point. "
-                    "Most points at the end wins."
+                    "Each round plays a short Juice WRLD clip — the first "
+                    "person to name the song scores a point and the next round "
+                    "follows a couple of seconds later. Most points at the end "
+                    "wins."
                 ),
                 color=discord.Color.blurple(),
             )
@@ -4683,87 +4831,49 @@ class Music(commands.Cog, name="Music"):
             await ctx.send(
                 f"🎧 **Heardle Tournament** — **{len(players)}** players, "
                 f"**{rounds}** round{'s' if rounds != 1 else ''}. "
-                "Everyone who gets a round right scores a point!"
+                "The first correct guess each round scores a point!"
             )
 
             used_songs = set()
 
-            for round_number in range(1, rounds + 1):
-                data = None
-                for _ in range(3):
-                    candidate = await self.fetch_random_playable_song()
-                    if not candidate or not candidate.get("song"):
-                        continue
-                    song = candidate["song"]
-                    key = (
-                        song.get("id")
-                        or song.get("name")
-                        or candidate.get("path")
-                    )
-                    if key in used_songs:
-                        continue
-                    used_songs.add(key)
-                    data = candidate
-                    break
+            prepared: Optional[dict] = None
 
-                if data is None:
+            async def prepare_round(round_number: int) -> Optional[dict]:
+                return await self._prepare_tournament_round(
+                    ctx.author.id, round_number, used_songs
+                )
+
+            for round_number in range(1, rounds + 1):
+                # The next round's clip is rendered while the previous one is
+                # being guessed, so there is no render wait between songs.
+                if prepared is None:
+                    if prefetch is None:
+                        prefetch = asyncio.create_task(
+                            prepare_round(round_number)
+                        )
+                    if round_number == 1:
+                        # Show activity while the opening clip renders.
+                        async with ctx.typing():
+                            prepared = await prefetch
+                    else:
+                        prepared = await prefetch
+                    prefetch = None
+
+                if prepared is None:
                     await Embeds.warning(
                         ctx,
-                        f"⚠️ Could not load a song for round {round_number} — skipping.",
+                        f"⚠️ Could not load audio for round {round_number} — skipping.",
                     )
                     continue
 
-                song_data = data["song"]
-                path = data.get("path", "")
-                raw_track_title = song_data.get("name", "Unknown Title")
-                best_track_title = self.get_most_acceptable_track_name(
-                    raw_track_title
-                )
-
-                acceptable_answers = {
-                    self._normalize_heardle_guess(name)
-                    for name in self.get_acceptable_track_names(raw_track_title)
-                }
-                for title in song_data.get("track_titles") or []:
-                    acceptable_answers.update(
-                        self._normalize_heardle_guess(name)
-                        for name in self.get_acceptable_track_names(title)
-                    )
-                acceptable_answers.discard("")
-
-                image_file_name = (
-                    f"{DOWNLOAD_CACHE_FOLDER_NAME}/"
-                    f"{ctx.author.id}_temp_image_tournament_{round_number}.png"
-                )
-                clip_name = f"{ctx.author.id}_tournament_{round_number}"
+                best_track_title = prepared["best_track_title"]
+                raw_track_title = prepared["raw_track_title"]
+                acceptable_answers = prepared["acceptable_answers"]
                 update_task = None
-                payload = None
+                round_message = None
+                payload = prepared["payload"]
 
                 try:
-                    async with ctx.typing():
-                        cover_slug = best_track_title.lower().replace(" ", "")
-                        await self._fetch_best_cover(
-                            cover_url=f"{JUICEWRLD_API}/juicewrld/cover/{cover_slug}.png",
-                            album_art_url=f"{JUICEWRLD_API}/juicewrld/files/cover-art/",
-                            album_art_params={"path": path},
-                            avatar_url=self.default_avatar_url,
-                            target_path=image_file_name,
-                        )
-                        success, payload = await self.make_snippet(
-                            image_file_name,
-                            f"{JUICEWRLD_API}/juicewrld/files/download-compressed/",
-                            clip_name,
-                            HEARDLE_CLIP_DURATION,
-                            path=path,
-                        )
-
-                    if not success:
-                        await Embeds.warning(
-                            ctx,
-                            f"⚠️ Could not load audio for round {round_number} — skipping.",
-                        )
-                        continue
-
                     round_message = await ctx.send(
                         embed=discord.Embed(
                             title=(
@@ -4771,8 +4881,8 @@ class Music(commands.Cog, name="Music"):
                                 f"{round_number}/{rounds}"
                             ),
                             description=(
-                                "Name this Juice WRLD song! Everyone who gets it "
-                                "right before the timer ends scores a point.\n\n"
+                                "Name this Juice WRLD song! The first correct "
+                                "guess scores a point and starts the next round.\n\n"
                                 "*Hint appears after a few seconds.*"
                             ),
                             color=discord.Color.blurple(),
@@ -4781,6 +4891,12 @@ class Music(commands.Cog, name="Music"):
                     )
                     self.remove_file(payload)
                     payload = None
+                    prepared["payload"] = None
+                    if round_number < rounds:
+                        # Render the next song while this round is guessed.
+                        prefetch = asyncio.create_task(
+                            prepare_round(round_number + 1)
+                        )
 
                     start_time = asyncio.get_event_loop().time()
                     last_hint = None
@@ -4813,7 +4929,7 @@ class Music(commands.Cog, name="Music"):
                                             ),
                                             description=(
                                                 f"Hint ({hint_chars}/3): `{hint}`\n\n"
-                                                "Everyone who gets it right scores a point!"
+                                                "First correct guess takes the round!"
                                             ),
                                             color=discord.Color.blurple(),
                                         )
@@ -4830,18 +4946,18 @@ class Music(commands.Cog, name="Music"):
                         )
                     )
 
+                    # The first correct guess takes the round: nothing else is
+                    # read, and the next song follows a couple of seconds later.
                     round_scorers: list[discord.User] = []
-                    round_scorer_ids: set[int] = set()
 
                     def check_guess(m: discord.Message) -> bool:
                         return (
                             m.channel == ctx.channel
                             and not m.author.bot
                             and m.author.id in scores
-                            and m.author.id not in round_scorer_ids
                         )
 
-                    while len(round_scorer_ids) < len(scores):
+                    while True:
                         remaining_time = HEARDLE_GAME_DURATION - (
                             asyncio.get_event_loop().time() - start_time
                         )
@@ -4862,24 +4978,22 @@ class Music(commands.Cog, name="Music"):
                         if normalized_guess not in acceptable_answers:
                             continue
 
-                        round_scorer_ids.add(guess_message.author.id)
                         round_scorers.append(guess_message.author)
                         scores[guess_message.author.id] += 1
                         try:
                             await guess_message.add_reaction("✅")
                         except discord.DiscordException:
                             pass
+                        break
 
                     if round_scorers:
+                        round_winner = round_scorers[0]
                         await Embeds.success(
                             ctx,
                             f"Round {round_number} — the song was "
                             f"**{best_track_title}** [{raw_track_title}].\n"
-                            f"Point{'s' if len(round_scorers) != 1 else ''} to: "
-                            + ", ".join(
-                                f"{member.mention} (**{scores[member.id]}**)"
-                                for member in round_scorers
-                            ),
+                            f"Point to {round_winner.mention} "
+                            f"(**{scores[round_winner.id]}**).",
                         )
                         for member in round_scorers:
                             try:
@@ -4899,6 +5013,10 @@ class Music(commands.Cog, name="Music"):
                             f"Round {round_number} over! Nobody guessed "
                             f"**{best_track_title}** [{raw_track_title}].",
                         )
+                    if round_number < rounds:
+                        # A beat on the answer rather than snapping straight to
+                        # the next clip.
+                        await asyncio.sleep(HEARDLE_TOURNAMENT_ROUND_DELAY)
                 finally:
                     if update_task is not None:
                         update_task.cancel()
@@ -4908,7 +5026,8 @@ class Music(commands.Cog, name="Music"):
                             pass
                     if payload:
                         self.remove_file(payload)
-                    self.remove_file(image_file_name)
+                    self._discard_tournament_round(prepared)
+                    prepared = None
                     await self._safe_delete(round_message)
                     round_message = None
 
@@ -4967,6 +5086,19 @@ class Music(commands.Cog, name="Music"):
             )
             await ctx.send(embed=leaderboard)
         finally:
+            if prefetch is not None:
+                # A round that was rendered but never played still owns files.
+                if not prefetch.done():
+                    prefetch.cancel()
+                try:
+                    leftover = await prefetch
+                except asyncio.CancelledError:
+                    leftover = None
+                except Exception:
+                    logger.exception("Tournament round prefetch failed")
+                    leftover = None
+                self._discard_tournament_round(leftover)
+                prefetch = None
             await self._safe_delete(join_message)
             await self._safe_delete(round_message)
             self.clear_user_cache(ctx.author.id, ["_tournament"])

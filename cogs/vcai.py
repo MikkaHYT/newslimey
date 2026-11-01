@@ -130,6 +130,12 @@ class VoiceSession:
         self._reply_task: Optional[asyncio.Task] = None
         self._frame_gap: dict[int, float] = {}
         self._speech_run: dict[int, float] = {}
+        #: Frames delivered per speaker, for the loudness probe below.
+        self._frames_seen: dict[int, int] = {}
+        #: First five seconds per speaker, written to disk so the audio the bot
+        #: actually hears can be transcribed offline and compared with the
+        #: stream. Nothing else in the pipeline can be blamed before that.
+        self._pcm_sample: dict[int, bytearray] = {}
         self._closed = False
 
     # -- names it answers to -------------------------------------------
@@ -216,6 +222,41 @@ class VoiceSession:
         if self.playing and self._speech_run[user_id] >= BARGE_IN_SECONDS:
             self._cut_playback()
             self._speech_run[user_id] = 0.0
+
+        # Once a second, report how loud the decoded audio actually is. Silence
+        # (peak 0-40) and speech (peak in the thousands) look identical on the
+        # status card, and only one of them can ever produce a transcript.
+        sample = self._pcm_sample.get(user_id)
+        if sample is None:
+            sample = self._pcm_sample[user_id] = bytearray()
+        if len(sample) < 16000 * 2 * 5:
+            sample.extend(pcm)
+            if len(sample) >= 16000 * 2 * 5:
+                try:
+                    with open(f"data/voice_sample_{user_id}.pcm", "wb") as handle:
+                        handle.write(sample)
+                    logger.info(
+                        "Wrote five seconds of %s's audio to data/voice_sample_%s.pcm",
+                        user_id,
+                        user_id,
+                    )
+                except OSError:
+                    logger.debug("Could not write the voice sample", exc_info=True)
+
+        frames = self._frames_seen.get(user_id, 0) + 1
+        self._frames_seen[user_id] = frames
+        if frames % 50 == 0:
+            peak = 0
+            for index in range(0, len(pcm) - 1, 2):
+                value = int.from_bytes(pcm[index : index + 2], "little", signed=True)
+                if abs(value) > peak:
+                    peak = abs(value)
+            logger.info(
+                "VC audio for %s: %d frames, peak amplitude %d of 32767",
+                user_id,
+                frames,
+                peak,
+            )
 
         stream = self.streams.get(user_id)
         if stream is None:
@@ -694,25 +735,65 @@ class VoiceAI(commands.Cog, name="VoiceAI"):
         receiver = session.receiver
         if receiver is not None:
             live = sum(1 for stream in session.streams.values() if stream.connected)
+            # Read everything defensively: reloading this cog re-imports it but
+            # not the already-cached `utils.core.voice_receive`, whose older
+            # receiver has no `last_error` property or counters — so a reload
+            # can never break this card.
+            packets = getattr(receiver, "packets", None)
+            arrived = "" if packets is None else f" of {packets} voice packets"
             lines.append(
                 f"**Audio:** {receiver.decoded} frames decoded · "
-                f"{receiver.dropped} dropped · {live}/{len(session.streams)} live "
-                "transcription streams"
+                f"{receiver.dropped} dropped{arrived} · {live}/{len(session.streams)} "
+                "live transcription streams"
             )
-            # Read defensively: reloading this cog re-imports it but not the
-            # already-cached `utils.core.voice_receive`, whose older receiver
-            # has no `last_error` property — the raw attribute is there either
-            # way, so a reload can never break this card.
+            reasons = getattr(receiver, "drop_reasons", None)
+            if reasons:
+                breakdown = " · ".join(
+                    f"{name} {count}"
+                    for name, count in sorted(
+                        reasons.items(), key=lambda item: -item[1]
+                    )
+                )
+                lines.append(f"**Where it stops:** {breakdown}")
+            speaker_map = getattr(receiver, "ssrc_users", None)
+            if speaker_map is not None:
+                lines.append(
+                    f"**Speaker map:** {len(speaker_map)} ssrc named by SPEAKING "
+                    "events"
+                )
+            modes = []
+            negotiated = getattr(receiver, "negotiated_mode", None)
+            working = getattr(receiver, "working_mode", None)
+            if negotiated:
+                modes.append(f"negotiated `{negotiated}`")
+            if working:
+                modes.append(f"decrypted as `{working}`")
+            if modes:
+                lines.append(f"**Encryption:** {' · '.join(modes)}")
             problem = getattr(receiver, "last_error", None) or getattr(
                 receiver, "_last_error", None
             )
             if problem:
                 lines.append(f"**Last audio problem:** {problem}")
+            detail = getattr(receiver, "decrypt_detail", None)
+            if detail and problem == "decrypt":
+                lines.append(f"**Decrypt detail:** {detail}")
             if receiver.decoded == 0:
-                lines.append(
-                    "-# No audio decoded yet: no voice packets are arriving, so "
-                    "this is not a wake word or model problem."
-                )
+                if packets:
+                    lines.append(
+                        f"-# {packets} voice packets reached the bot but none "
+                        "decoded — the stage above is where audio stops."
+                    )
+                elif packets == 0:
+                    lines.append(
+                        "-# No voice packets are arriving at all, so this is not "
+                        "a wake word or model problem."
+                    )
+                else:
+                    lines.append(
+                        "-# No audio decoded yet: no voice packets are arriving, so "
+                        "this is not a wake word or model problem."
+                    )
         if session.last_latency is not None:
             lines.append(
                 f"**Last reply:** {session.last_latency:.2f}s to first audio"

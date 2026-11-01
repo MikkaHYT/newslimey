@@ -833,6 +833,32 @@ class FavoriteSongs(Base):
     song_title = Column(String, nullable=False)
 
 
+class Friend(Base):
+    """One row per person on a member's friends list in one server.
+
+    Each server keeps its own list, so ``guild_id`` is part of the pair and a
+    member can have different friends in different servers. ``user_id`` and
+    ``friend_id`` are hashed Discord IDs; the unique constraint keeps a person
+    from being added twice to the same server's list.
+    """
+
+    __tablename__ = "friends"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(BigInteger, nullable=False)
+    user_id = Column(String(64), nullable=False)
+    friend_id = Column(String(64), nullable=False)
+    created_at = Column(
+        UTCDateTime(), default=discord.utils.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id", "user_id", "friend_id", name="uq_friends_pair"
+        ),
+    )
+
+
 class UserTimezone(Base):
     __tablename__ = "user_timezones"
 

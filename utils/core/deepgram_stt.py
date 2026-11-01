@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Callable, Optional
 
 import aiohttp
@@ -31,6 +32,11 @@ FRAME_BYTES = SAMPLE_RATE * 2 // 50
 #: is plenty of slack before frames start being dropped.
 MAX_QUEUED_FRAMES = 100
 KEEPALIVE_SECONDS = 8.0
+#: Deepgram marks the end of speech itself, but only when its voice activity
+#: detector finds a pause. Audio that never goes quiet keeps it "speaking"
+#: forever, so a final segment that has been sitting unanswered for this long
+#: while no new audio arrives is treated as the end of the utterance.
+UTTERANCE_IDLE_SECONDS = 0.6
 
 
 class DeepgramStream:
@@ -80,9 +86,17 @@ class DeepgramStream:
         self._closing = False
         self._connected = False
         self._final_text = ""
+        self._last_text = ""
+        self._last_audio_at = time.monotonic()
         #: Utterances delivered, for the session's stats card.
         self.utterances = 0
         self.dropped_frames = 0
+        #: Audio actually handed to Deepgram, so a stream that is connected but
+        #: transmitting nothing is visible.
+        self.sent_frames = 0
+        self.sent_bytes = 0
+        #: Results frames Deepgram returned with no text in them.
+        self.empty_results = 0
 
     # -- lifecycle -----------------------------------------------------
     @property
@@ -116,6 +130,7 @@ class DeepgramStream:
                 asyncio.create_task(self._sender(), name="stt-sender"),
                 asyncio.create_task(self._keeper(), name="stt-keepalive"),
                 asyncio.create_task(self._receiver(), name="stt-receiver"),
+                asyncio.create_task(self._flusher(), name="stt-flusher"),
             ]
         return ok
 
@@ -142,6 +157,7 @@ class DeepgramStream:
         """Queue a chunk of audio. Synchronous: callers are on the event loop."""
         if not pcm or self._closing:
             return
+        self._last_audio_at = time.monotonic()
         if self._queue.full():
             try:
                 self._queue.get_nowait()
@@ -173,6 +189,14 @@ class DeepgramStream:
         except Exception:
             logger.debug("Deepgram send failed", exc_info=True)
             return False
+        self.sent_frames += 1
+        self.sent_bytes += len(frame)
+        if self.sent_frames % 250 == 0:
+            logger.info(
+                "Transcription stream sent %d frames (%d bytes) without an utterance",
+                self.sent_frames,
+                self.sent_bytes,
+            )
         return True
 
     async def _keeper(self) -> None:
@@ -230,14 +254,24 @@ class DeepgramStream:
             channel = data.get("channel") or {}
             alternatives = channel.get("alternatives") or []
             text = (alternatives[0].get("transcript") or "").strip() if alternatives else ""
-            if text:
-                self._final_text = text
-                if self.on_partial is not None:
-                    self.on_partial(text)
-            if text and data.get("is_final"):
+            if not text:
+                self.empty_results += 1
+                if self.empty_results == 1:
+                    logger.info(
+                        "Deepgram returned an empty result: audio is arriving but "
+                        "sits below its speech threshold"
+                    )
+                return
+            self._last_text = text
+            if self.on_partial is not None:
+                self.on_partial(text)
+            # Only a final segment is worth speaking: interim results are
+            # rewritten as more audio arrives, so delivering one would repeat
+            # half a sentence every time the room paused.
+            if data.get("is_final"):
                 self._final_text = text
             if data.get("speech_final"):
-                self._flush()
+                self._flush(fallback=text)
         elif kind == "UtteranceEnd":
             self._flush()
         elif kind == "Error":
@@ -246,8 +280,26 @@ class DeepgramStream:
             if self.on_error is not None:
                 self.on_error(str(description))
 
-    def _flush(self) -> None:
-        text = self._final_text.strip()
+    async def _flusher(self) -> None:
+        """Deliver a final segment when Deepgram never signals an endpoint.
+
+        ``speech_final`` and ``UtteranceEnd`` both come from the service's voice
+        activity detector, which stays in "speech" for as long as it hears
+        something. A hot mic, clipping or a noisy room can hold it there, and in
+        that state every final transcript used to be overwritten in
+        ``_final_text`` and never spoken. The audio arriving here is the ground
+        truth: a final segment plus silence in the stream is the end of an
+        utterance, whatever the detector thinks.
+        """
+        while not self._closing:
+            await asyncio.sleep(0.2)
+            if not self._final_text:
+                continue
+            if time.monotonic() - self._last_audio_at >= UTTERANCE_IDLE_SECONDS:
+                self._flush()
+
+    def _flush(self, fallback: str = "") -> None:
+        text = (self._final_text or fallback).strip()
         self._final_text = ""
         if not text:
             return

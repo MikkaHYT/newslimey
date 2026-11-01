@@ -220,6 +220,27 @@ class Fun(commands.Cog, name="Fun"):
                 else:
                     await Embeds.error(ctx, "There was a problem contacting the Cat API. Please try again later.", title="Error!", reply=True)
 
+    @commands.hybrid_command(
+        name="bunny",
+        aliases=["rabbit"],
+        description="Get a random bunny photo.",
+    )
+    @unified_cooldown(10)
+    async def bunny(self, ctx: commands.Context):
+        """Get a random bunny photo."""
+        url = "https://rabbit-api-two.vercel.app/api/random"
+        async with borrowed() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    image = data.get("url")
+                    if image:
+                        await ctx.reply(image)
+                    else:
+                        await Embeds.error(ctx, "The Bunny API sent back nothing to show. Please try again later.", title="Error!", reply=True)
+                else:
+                    await Embeds.error(ctx, "There was a problem contacting the Bunny API. Please try again later.", title="Error!", reply=True)
+
     @commands.hybrid_command(name="fox", description="Get a random fox photo.")
     @unified_cooldown(10)
     async def fox(self, ctx: commands.Context):
